@@ -1,0 +1,23 @@
+[package]
+name = "r36s-studio"
+version = "0.1.0"
+edition = "2021"
+authors = ["DevBridge Team"]
+description = "Desktop Developer Studio for R36S ArkOS (Telemetry, 640x480 Viewport, Deploy and Logs)"
+
+[dependencies]
+eframe = { version = "0.29", default-features = false, features = ["default", "glow"] }
+egui = "0.29"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+lz4_flex = "0.11"
+sha2 = "0.10"
+rfd = "0.15"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
