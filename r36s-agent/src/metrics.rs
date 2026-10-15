@@ -222,6 +222,11 @@ impl MetricsCollector {
                             continue;
                         }
 
+                        let page_size_kb = unsafe {
+                            let ps = libc::sysconf(libc::_SC_PAGESIZE);
+                            if ps > 0 { (ps as u64) / 1024 } else { 4 }
+                        };
+
                         let memory_mb = fs::read_to_string(statm_path)
                             .ok()
                             .and_then(|s| {
@@ -229,7 +234,7 @@ impl MetricsCollector {
                                     .nth(1)
                                     .and_then(|rss| rss.parse::<u64>().ok())
                             })
-                            .map(|pages| (pages * 4) / 1024)
+                            .map(|pages| (pages * page_size_kb) / 1024)
                             .unwrap_or(0);
 
                         let proc_name = cmdline
@@ -256,8 +261,11 @@ impl MetricsCollector {
                                         let tick_diff = total_ticks.saturating_sub(prev_ticks);
                                         let time_diff = now.duration_since(prev_time).as_secs_f32();
                                         if time_diff > 0.05 {
-                                            // 100 ticks por segundo no Linux ARM padrão
-                                            cpu_percent = ((tick_diff as f32 / 100.0) / time_diff) * 100.0;
+                                            let clk_tck = unsafe {
+                                                let tck = libc::sysconf(libc::_SC_CLK_TCK);
+                                                if tck > 0 { tck as f32 } else { 100.0 }
+                                            };
+                                            cpu_percent = ((tick_diff as f32 / clk_tck) / time_diff) * 100.0;
                                             cpu_percent = cpu_percent.clamp(0.0, 400.0);
                                         }
                                     }

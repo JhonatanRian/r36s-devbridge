@@ -17,7 +17,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("R36S DevBridge Studio")
             .with_inner_size([1180.0, 740.0])
-            .with_min_inner_size([800.0, 560.0]),
+            .with_min_inner_size([760.0, 480.0]),
         ..Default::default()
     };
 

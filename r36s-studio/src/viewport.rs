@@ -33,6 +33,11 @@ impl ViewportRenderer {
 
     pub fn update_frame(&mut self, ctx: &Context, frame_opt: Option<&DecodedFrame>) {
         if let Some(frame) = frame_opt {
+            let expected_len = (frame.width as usize) * (frame.height as usize) * 4;
+            if frame.rgba_data.len() != expected_len {
+                return;
+            }
+
             if frame.frame_index != self.last_frame_index {
                 self.last_frame_index = frame.frame_index;
 
@@ -110,14 +115,17 @@ impl ViewportRenderer {
 
             ui.separator();
 
-            // Área de exibição do Framebuffer com ajuste 4:3 ou scroll em escalas fixas
+            // Área de exibição do Framebuffer com ajuste dinâmico ou scroll em escalas fixas
             let available = ui.available_size();
+            let frame_w = frame_opt.map(|f| f.width as f32).unwrap_or(640.0);
+            let frame_h = frame_opt.map(|f| f.height as f32).unwrap_or(480.0);
+            let aspect = frame_w / frame_h;
+
             let (target_w, target_h) = match self.scale_mode {
-                ViewportScale::Scale1x => (640.0, 480.0),
-                ViewportScale::Scale1_5x => (960.0, 720.0),
-                ViewportScale::Scale2x => (1280.0, 960.0),
+                ViewportScale::Scale1x => (frame_w, frame_h),
+                ViewportScale::Scale1_5x => (frame_w * 1.5, frame_h * 1.5),
+                ViewportScale::Scale2x => (frame_w * 2.0, frame_h * 2.0),
                 ViewportScale::Fit => {
-                    let aspect = 640.0 / 480.0;
                     let avail_w = available.x.max(160.0);
                     let avail_h = available.y.max(120.0);
                     let mut w = avail_w;
@@ -176,20 +184,33 @@ impl ViewportRenderer {
     fn save_screenshot(&mut self, frame: &DecodedFrame) {
         let timestamp = chrono_or_fallback_timestamp();
         let shots_dir = PathBuf::from("screenshots");
-        let _ = std::fs::create_dir_all(&shots_dir);
-        let path = shots_dir.join(format!("r36s_screenshot_{}.ppm", timestamp));
+        if let Err(e) = std::fs::create_dir_all(&shots_dir) {
+            self.screenshot_notice = Some((format!("Erro ao criar pasta screenshots: {}", e), Instant::now()));
+            return;
+        }
+        let final_path = shots_dir.join(format!("r36s_screenshot_{}.ppm", timestamp));
+        let tmp_path = shots_dir.join(format!(".r36s_screenshot_{}.tmp", timestamp));
 
-        match File::create(&path) {
-            Ok(mut file) => {
-                use std::io::Write;
-                let _ = writeln!(file, "P6\n{} {}\n255", frame.width, frame.height);
-                for chunk in frame.rgba_data.chunks_exact(4) {
-                    let _ = file.write_all(&[chunk[0], chunk[1], chunk[2]]);
-                }
-                let _ = file.flush();
-                self.screenshot_notice = Some((format!("Screenshot salva em: {}", path.display()), Instant::now()));
+        let write_res = (|| -> Result<(), std::io::Error> {
+            use std::io::Write;
+            let mut file = File::create(&tmp_path)?;
+            writeln!(file, "P6\n{} {}\n255", frame.width, frame.height)?;
+            for chunk in frame.rgba_data.chunks_exact(4) {
+                file.write_all(&[chunk[0], chunk[1], chunk[2]])?;
+            }
+            file.flush()?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&tmp_path, &final_path)?;
+            Ok(())
+        })();
+
+        match write_res {
+            Ok(()) => {
+                self.screenshot_notice = Some((format!("Screenshot salva em: {}", final_path.display()), Instant::now()));
             }
             Err(e) => {
+                let _ = std::fs::remove_file(&tmp_path);
                 self.screenshot_notice = Some((format!("Erro ao salvar screenshot: {}", e), Instant::now()));
             }
         }

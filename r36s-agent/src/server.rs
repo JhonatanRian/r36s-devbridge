@@ -19,6 +19,7 @@ pub struct AgentServer {
 
 impl AgentServer {
     pub fn new() -> Self {
+        eprintln!("[r36s-agent] Inicializando estruturas do agente...");
         let reader = FramebufferReader::new();
         let metrics = Arc::new(MetricsCollector::new());
         metrics.set_fb_info(reader.width, reader.height, reader.bpp, reader.format);
@@ -44,24 +45,35 @@ impl AgentServer {
             Self::video_stream_worker(streaming_flag, target_fps, fb_reader_cl);
         });
 
-        // Watchdog leve para manter interface usb0 UP com IP estático 192.168.7.2
+        // Watchdog seguro para manter interface usb0 UP com IP estático 192.168.7.2 sem overhead
         thread::spawn(|| {
             loop {
-                if std::path::Path::new("/sys/class/net/usb0").exists() {
-                    let _ = std::process::Command::new("/sbin/ip")
-                        .args(["link", "set", "dev", "usb0", "up"])
-                        .output();
-                    let _ = std::process::Command::new("/sbin/ip")
-                        .args(["-4", "address", "replace", "192.168.7.2/24", "dev", "usb0"])
-                        .output();
-                }
                 thread::sleep(Duration::from_secs(4));
+                if std::path::Path::new("/sys/class/net/usb0").exists() {
+                    // Verifica se já possui o IP correto antes de reexecutar ip
+                    let has_ip = std::fs::read_to_string("/proc/net/dev").is_ok()
+                        && std::process::Command::new("/sbin/ip")
+                            .args(["-o", "-4", "addr", "show", "dev", "usb0"])
+                            .output()
+                            .map(|o| String::from_utf8_lossy(&o.stdout).contains("192.168.7.2"))
+                            .unwrap_or(false);
+
+                    if !has_ip {
+                        let _ = std::process::Command::new("/sbin/ip")
+                            .args(["link", "set", "dev", "usb0", "up"])
+                            .output();
+                        let _ = std::process::Command::new("/sbin/ip")
+                            .args(["-4", "address", "replace", "192.168.7.2/24", "dev", "usb0"])
+                            .output();
+                    }
+                }
             }
         });
 
         // Thread principal: Listener de comandos
         let listener = TcpListener::bind(format!("0.0.0.0:{}", CONTROL_PORT))
             .expect("Falha ao abrir porta de controle");
+        println!("[r36s-agent] Porta de controle {} escutando.", CONTROL_PORT);
 
         for stream in listener.incoming() {
             match stream {
@@ -258,7 +270,19 @@ impl AgentServer {
                     let mut frame_index: u32 = 0;
                     loop {
                         if !streaming_flag.load(Ordering::Relaxed) {
-                            thread::sleep(Duration::from_millis(50));
+                            // Testa se o cliente ainda está conectado enquanto pausado
+                            let mut probe_buf = [0u8; 1];
+                            let _ = stream.set_nonblocking(true);
+                            match stream.peek(&mut probe_buf) {
+                                Ok(0) => break, // EOF / socket fechado pelo cliente
+                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                    // Socket ainda aberto e sem dados prontos (normal)
+                                }
+                                Err(_) => break, // Erro de conexão
+                                _ => {}
+                            }
+                            let _ = stream.set_nonblocking(false);
+                            thread::sleep(Duration::from_millis(60));
                             continue;
                         }
 

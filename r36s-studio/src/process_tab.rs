@@ -76,8 +76,8 @@ impl ProcessTab {
 
                                 ui.label(format!("{} MB", proc.memory_mb));
 
-                                let short_cmd = if proc.cmdline.len() > 50 {
-                                    format!("{}...", &proc.cmdline[0..47])
+                                let short_cmd = if proc.cmdline.chars().count() > 50 {
+                                    format!("{}...", proc.cmdline.chars().take(47).collect::<String>())
                                 } else {
                                     proc.cmdline.clone()
                                 };
@@ -89,14 +89,14 @@ impl ProcessTab {
                                             pid: proc.pid,
                                             signal: 15,
                                         });
-                                        self.status_msg = Some((true, format!("Enviado SIGTERM para PID {}", proc.pid)));
+                                        self.status_msg = Some((false, format!("Aguardando confirmação de término do PID {}...", proc.pid)));
                                     }
                                     if ui.button(RichText::new("Kill").color(Color32::from_rgb(255, 60, 60))).clicked() {
                                         conn.send_command(ClientCommand::KillProcess {
                                             pid: proc.pid,
                                             signal: 9,
                                         });
-                                        self.status_msg = Some((true, format!("Enviado SIGKILL para PID {}", proc.pid)));
+                                        self.status_msg = Some((false, format!("Aguardando confirmação de SIGKILL do PID {}...", proc.pid)));
                                     }
                                 });
                                 ui.end_row();

@@ -15,6 +15,7 @@ LOG_FILE="$DEVBRIDGE_DIR/install.log"
 BACKUP_DIR="$DEVBRIDGE_DIR/backup"
 PATCHER="$DEVBRIDGE_DIR/patch_dtb_usb.py"
 PAYLOAD_ZIP="$DEVBRIDGE_DIR/payload.zip"
+MENU_HELPER="$DEVBRIDGE_DIR/gamepad_menu.py"
 
 mkdir -p "$DEVBRIDGE_DIR" "$BACKUP_DIR"
 
@@ -111,7 +112,7 @@ uninstall_and_restore() {
     # 1. Parar e remover serviço e binário
     systemctl stop r36s-agent.service 2>/dev/null || true
     systemctl disable r36s-agent.service 2>/dev/null || true
-    rm -f /etc/systemd/system/r36s-agent.service /usr/local/bin/r36s-agent /etc/udev/rules.d/99-r36s-devbridge-usb0.rules
+    rm -f /etc/systemd/system/r36s-agent.service /usr/local/bin/r36s-agent /etc/udev/rules.d/99-r36s-devbridge-usb0.rules /etc/NetworkManager/conf.d/99-r36s-devbridge-usb0.conf /etc/systemd/journald.conf.d/99-r36s-devbridge.conf /etc/logrotate.d/r36s-agent
     systemctl daemon-reload
     udevadm control --reload-rules 2>/dev/null || true
 
@@ -126,25 +127,41 @@ uninstall_and_restore() {
     local dtb
     dtb="$(find_dtb)" || dtb=""
     local dtb_restored=0
-    if [ -f "$BACKUP_DIR/original.dtb" ] && [ -n "$dtb" ]; then
-        if [ -f "$BACKUP_DIR/metadata.txt" ]; then
+
+    # Procura backup em múltiplos caminhos conhecidos do ArkOS
+    local backup_candidate=""
+    local meta_candidate=""
+    if [ -f "$BACKUP_DIR/original.dtb" ]; then
+        backup_candidate="$BACKUP_DIR/original.dtb"
+        [ -f "$BACKUP_DIR/metadata.txt" ] && meta_candidate="$BACKUP_DIR/metadata.txt"
+    elif [ -f "/boot/R36S_USB_SSH_BACKUP/rk3326-r35s-linux.dtb" ]; then
+        backup_candidate="/boot/R36S_USB_SSH_BACKUP/rk3326-r35s-linux.dtb"
+    elif [ -f "/roms/ports/r36s-devbridge/backup/original.dtb" ]; then
+        backup_candidate="/roms/ports/r36s-devbridge/backup/original.dtb"
+        [ -f "/roms/ports/r36s-devbridge/backup/metadata.txt" ] && meta_candidate="/roms/ports/r36s-devbridge/backup/metadata.txt"
+    fi
+
+    if [ -n "$backup_candidate" ] && [ -f "$backup_candidate" ] && [ -n "$dtb" ]; then
+        if [ -n "$meta_candidate" ] && [ -f "$meta_candidate" ]; then
             local expected_hash actual_hash
-            expected_hash=$(awk '{print $1}' "$BACKUP_DIR/metadata.txt")
-            actual_hash=$(sha256sum "$BACKUP_DIR/original.dtb" | awk '{print $1}')
+            expected_hash=$(awk '{print $1}' "$meta_candidate")
+            actual_hash=$(sha256sum "$backup_candidate" | awk '{print $1}')
             if [ "$expected_hash" = "$actual_hash" ]; then
-                cp -f "$BACKUP_DIR/original.dtb" "$dtb"
+                cp -f "$backup_candidate" "$dtb"
                 sync
                 dtb_restored=1
                 log "${C_GREEN}[OK] DTB original verificado (SHA-256) e restaurado em $dtb.${C_RESET}"
             else
-                log "${C_RED}[AVISO] Backup original.dtb diverge do hash original; restauração abortada por cautela.${C_RESET}"
+                log "${C_RED}[AVISO] Backup diverge do hash original; restauração abortada por cautela.${C_RESET}"
             fi
         else
-            cp -f "$BACKUP_DIR/original.dtb" "$dtb"
+            cp -f "$backup_candidate" "$dtb"
             sync
             dtb_restored=1
-            log "${C_GREEN}[OK] DTB original restaurado em $dtb.${C_RESET}"
+            log "${C_GREEN}[OK] DTB original restaurado a partir de $backup_candidate em $dtb.${C_RESET}"
         fi
+    else
+        log "${C_YELLOW}[!] Nenhum backup do DTB original foi localizado; o arquivo atual em $dtb foi mantido.${C_RESET}"
     fi
 
     log "${C_GREEN}[OK] R36S DevBridge desinstalado com sucesso.${C_RESET}"
@@ -210,14 +227,31 @@ install_or_update() {
         grep -q '^g_ether' /etc/modules 2>/dev/null || echo 'g_ether' >> /etc/modules
         log "${C_GREEN}[OK] Módulos dwc2 e g_ether registrados em /etc/modules.${C_RESET}"
     fi
-    modprobe dwc2 2>/dev/null || true
-    modprobe g_ether 2>/dev/null || true
-
     mkdir -p /etc/udev/rules.d
     cat << 'EOF_UDEV' > /etc/udev/rules.d/99-r36s-devbridge-usb0.rules
 SUBSYSTEM=="net", ACTION=="add", KERNEL=="usb0", RUN+="/sbin/ip link set dev usb0 up", RUN+="/sbin/ip -4 address replace 192.168.7.2/24 dev usb0"
 EOF_UDEV
     udevadm control --reload-rules 2>/dev/null || true
+
+    # NetworkManager não deve substituir o IP fixo da interface gadget.
+    mkdir -p /etc/NetworkManager/conf.d
+    cat << 'EOF_NM' > /etc/NetworkManager/conf.d/99-r36s-devbridge-usb0.conf
+[keyfile]
+unmanaged-devices=interface-name:usb0
+EOF_NM
+
+    # ArkOS mantém journald mascarado nesta imagem; usa arquivo de log rotativo.
+    mkdir -p /etc/logrotate.d
+    cat << 'EOF_LOGROTATE' > /etc/logrotate.d/r36s-agent
+/var/log/r36s-agent.log {
+    size 1M
+    rotate 2
+    missingok
+    notifempty
+    copytruncate
+}
+EOF_LOGROTATE
+    rm -f /etc/systemd/journald.conf.d/99-r36s-devbridge.conf
 
     log "\n${C_BOLD}[4/5] Instalando r36s-agent e serviço systemd...${C_RESET}"
     if [ -f "$PAYLOAD_ZIP" ]; then
@@ -255,27 +289,38 @@ EOF_UDEV
 
     log "\n${C_BOLD}[5/5] Ativando serviço r36s-agent...${C_RESET}"
     systemctl daemon-reload
-    systemctl enable r36s-agent.service 2>/dev/null || true
-    systemctl restart r36s-agent.service 2>/dev/null || true
-    sleep 1
-
-    local service_active=0
-    if systemctl is-active --quiet r36s-agent.service; then
-        service_active=1
-        log "${C_GREEN}[OK] Serviço r36s-agent ativo e rodando!${C_RESET}"
-    else
-        log "${C_YELLOW}[!] Serviço r36s-agent registrado; subirá automaticamente no boot.${C_RESET}"
+    if ! systemctl enable r36s-agent.service 2>/dev/null; then
+        log "${C_RED}[ERRO] Não foi possível habilitar o serviço no boot.${C_RESET}"
+        wait_and_finish 8 1
     fi
-
-    # Verifica portas de escuta
-    if command -v ss >/dev/null 2>&1; then
-        if ss -tlpn 2>/dev/null | grep -q ':7365'; then
-            log "${C_GREEN}[OK] Porta 7365 (Controle) escutando.${C_RESET}"
-        fi
-        if ss -tlpn 2>/dev/null | grep -q ':7366'; then
-            log "${C_GREEN}[OK] Porta 7366 (Vídeo) escutando.${C_RESET}"
-        fi
+    if ! systemctl --no-block restart r36s-agent.service 2>/dev/null; then
+        log "${C_RED}[ERRO] Não foi possível solicitar o início do serviço.${C_RESET}"
+        wait_and_finish 8 1
     fi
+    # O restart com --no-block apenas enfileira o trabalho; confirme o listener.
+    local attempt service_ready=0
+    for attempt in {1..15}; do
+        if systemctl is-active --quiet r36s-agent.service &&
+            python3 -c 'import socket; socket.create_connection(("127.0.0.1", 7365), 0.3).close()' 2>/dev/null; then
+            service_ready=1
+            break
+        fi
+        sleep 1
+    done
+    if [ "$service_ready" -ne 1 ]; then
+        log "${C_RED}[ERRO] O serviço não abriu a porta de controle 7365 após 15 segundos.${C_RESET}"
+        local service_state recent_errors
+        service_state=$(systemctl show r36s-agent.service -p ActiveState -p SubState -p Result -p ExecMainCode -p ExecMainStatus --no-pager 2>/dev/null || true)
+        if [ -n "$service_state" ]; then
+            log "${C_YELLOW}Estado do serviço:\n$service_state${C_RESET}"
+        fi
+        recent_errors=$(tail -n 8 /var/log/r36s-agent.log 2>/dev/null || true)
+        if [ -n "$recent_errors" ]; then
+            log "${C_YELLOW}Últimos registros do agente:\n$recent_errors${C_RESET}"
+        fi
+        wait_and_finish 8 1
+    fi
+    log "${C_GREEN}[OK] Serviço ativo e porta 7365 (Controle) respondendo localmente.${C_RESET}"
 
     # Validação e orientação final
     if [ "$REBOOT_REQUIRED" -eq 1 ]; then
@@ -325,7 +370,7 @@ elif systemctl is-active --quiet r36s-agent.service 2>/dev/null || [ -f /usr/loc
     fi
 
     if ip link show dev usb0 >/dev/null 2>&1; then
-        local ip_info
+        ip_info=""
         ip_info=$(ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | head -n1)
         log "Rede usb0: ${C_GREEN}Conectado ($ip_info)${C_RESET}"
     else
@@ -333,14 +378,18 @@ elif systemctl is-active --quiet r36s-agent.service 2>/dev/null || [ -f /usr/loc
     fi
 
     log "\n${C_BOLD}Selecione uma opção:${C_RESET}"
-    log "  ${C_CYAN}[1]${C_RESET} Reaplicar rede USB e reiniciar serviço (Padrão)"
-    log "  ${C_CYAN}[2]${C_RESET} Reinstalar / Atualizar componentes"
-    log "  ${C_CYAN}[3]${C_RESET} Desinstalar e restaurar sistema original"
-    log "  ${C_CYAN}[4]${C_RESET} Sair"
-    log "\nEscolha uma opção (1-4) [auto 1 em 15s]: "
+    log "  ${C_CYAN}[X / 1]${C_RESET} Reaplicar rede USB e reiniciar serviço"
+    log "  ${C_CYAN}[A / 2]${C_RESET} Reinstalar / Atualizar componentes"
+    log "  ${C_CYAN}[Y / 3]${C_RESET} Desinstalar (pressione duas vezes)"
+    log "  ${C_CYAN}[B / 4]${C_RESET} Sair (Padrão)"
+    log "\nPressione um botão [auto sair em 30s]: "
 
-    local choice=""
-    read -t 15 -n 1 choice < /dev/tty1 2>/dev/null || choice=""
+    choice="4"
+    if [ -f "$MENU_HELPER" ]; then
+        choice="$(python3 "$MENU_HELPER" 30 2>/dev/tty1)" || choice="4"
+    else
+        read -t 30 -n 1 choice < /dev/tty1 2>/dev/null || choice="4"
+    fi
     echo ""
 
     case "$choice" in
@@ -355,18 +404,26 @@ elif systemctl is-active --quiet r36s-agent.service 2>/dev/null || [ -f /usr/loc
             printf "\033c" > /dev/tty1 2>/dev/null || true
             exit 0
             ;;
-        *)
+        1)
             log "Reaplicando configuração de rede USB..."
-            modprobe dwc2 2>/dev/null || true
-            modprobe g_ether 2>/dev/null || true
             if ip link show dev usb0 >/dev/null 2>&1; then
                 ip link set dev usb0 up 2>/dev/null || true
                 ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true
                 log "${C_GREEN}[OK] Interface usb0 reconfigurada em 192.168.7.2/24.${C_RESET}"
+            else
+                log "${C_YELLOW}[!] usb0 ainda não está disponível; o serviço tentará carregar os módulos.${C_RESET}"
             fi
-            systemctl restart r36s-agent.service 2>/dev/null || true
-            log "${C_GREEN}[OK] Serviço r36s-agent reiniciado.${C_RESET}"
+            if systemctl --no-block restart r36s-agent.service 2>/dev/null; then
+                log "${C_YELLOW}[!] Reinício do serviço solicitado. Aguarde a rede USB aparecer no PC.${C_RESET}"
+            else
+                log "${C_RED}[ERRO] Não foi possível solicitar reinício do serviço.${C_RESET}"
+                wait_and_finish 8 1
+            fi
             wait_and_finish 4 0
+            ;;
+        *)
+            log "${C_YELLOW}[!] Escolha inválida; saindo sem alterar a conexão.${C_RESET}"
+            wait_and_finish 4 1
             ;;
     esac
 else

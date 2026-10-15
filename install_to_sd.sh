@@ -17,6 +17,10 @@ if [ ! -d "$MEDIA_ROOT" ]; then
     MEDIA_ROOT="/media/$USER_NAME"
 fi
 
+EASYROMS=""
+BOOT=""
+ROOT=""
+
 # Função auxiliar para extrair o disco físico de um diretório montado
 get_parent_disk() {
     local mnt="$1"
@@ -79,33 +83,48 @@ chmod +x "$PORTS_DIR/R36S DevBridge.sh"
 cp -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/payload.zip" "$DEST_DEVBRIDGE/payload.zip"
 cp -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/patch_dtb_usb.py" "$DEST_DEVBRIDGE/patch_dtb_usb.py"
 chmod +x "$DEST_DEVBRIDGE/patch_dtb_usb.py"
+cp -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/gamepad_menu.py" "$DEST_DEVBRIDGE/gamepad_menu.py"
+chmod +x "$DEST_DEVBRIDGE/gamepad_menu.py"
 
 echo "[OK] Port copiado com sucesso para o menu Ports do console!"
 
 # 2. Verificação do DTB (se BOOT estiver acessível)
-if [ -n "$BOOT" ] && [ -f "$BOOT/rk3326-r35s-linux.dtb" ]; then
-    echo -e "\n[2/3] Verificando Device Tree no BOOT..."
-    DTB_STATE="$(python3 "$SCRIPT_DIR/r36s-port/patch_dtb_usb.py" check "$BOOT/rk3326-r35s-linux.dtb" 2>/dev/null || echo "unknown")"
+ACTIVE_DTB=""
+if [ -n "$BOOT" ]; then
+    if [ -f "$BOOT/boot.ini" ]; then
+        INI_DTB=$(grep -E '^[[:space:]]*setenv[[:space:]]+(fdtfile|fdt_file)[[:space:]]+' "$BOOT/boot.ini" 2>/dev/null | head -n1 | awk '{print $NF}' | tr -d '\r"')
+        if [ -n "$INI_DTB" ] && [ -f "$BOOT/$INI_DTB" ]; then
+            ACTIVE_DTB="$BOOT/$INI_DTB"
+        fi
+    fi
+    if [ -z "$ACTIVE_DTB" ] && [ -f "$BOOT/rk3326-r35s-linux.dtb" ]; then
+        ACTIVE_DTB="$BOOT/rk3326-r35s-linux.dtb"
+    fi
+fi
+
+if [ -n "$ACTIVE_DTB" ] && [ -f "$ACTIVE_DTB" ]; then
+    echo -e "\n[2/3] Verificando Device Tree ativo ($ACTIVE_DTB)..."
+    DTB_STATE="$(python3 "$SCRIPT_DIR/r36s-port/patch_dtb_usb.py" check "$ACTIVE_DTB" 2>/dev/null || echo "unknown")"
     echo "Estado atual do DTB USB: $DTB_STATE"
 
     if [[ "$DTB_STATE" != *"dr_mode=peripheral"* ]]; then
         echo "Aplicando patch periférico no DTB..."
         mkdir -p "$DEST_DEVBRIDGE/backup"
         if [ ! -f "$DEST_DEVBRIDGE/backup/original.dtb" ]; then
-            cp -p "$BOOT/rk3326-r35s-linux.dtb" "$DEST_DEVBRIDGE/backup/original.dtb"
-            sha256sum "$BOOT/rk3326-r35s-linux.dtb" > "$DEST_DEVBRIDGE/backup/metadata.txt"
+            cp -p "$ACTIVE_DTB" "$DEST_DEVBRIDGE/backup/original.dtb"
+            sha256sum "$ACTIVE_DTB" > "$DEST_DEVBRIDGE/backup/metadata.txt"
             echo "[OK] Backup do DTB original criado em $DEST_DEVBRIDGE/backup/original.dtb"
         fi
         TMP_DTB="$(mktemp)"
-        python3 "$SCRIPT_DIR/r36s-port/patch_dtb_usb.py" patch "$BOOT/rk3326-r35s-linux.dtb" "$TMP_DTB"
-        cp -f "$TMP_DTB" "$BOOT/rk3326-r35s-linux.dtb"
+        python3 "$SCRIPT_DIR/r36s-port/patch_dtb_usb.py" patch "$ACTIVE_DTB" "$TMP_DTB"
+        cp -f "$TMP_DTB" "$ACTIVE_DTB"
         rm -f "$TMP_DTB"
         echo "[OK] DTB atualizado para modo periférico!"
     else
         echo "[OK] DTB já está pronto em modo periférico!"
     fi
 else
-    echo -e "\n[2/3] Partição BOOT não disponível ou sem DTB; o script Port fará isso no console."
+    echo -e "\n[2/3] Partição BOOT não disponível ou DTB ativo não localizado; o script Port fará isso no console."
 fi
 
 # 3. Pré-instalação no root (se ROOT estiver acessível e com permissão)
@@ -137,6 +156,24 @@ if [ -n "$ROOT" ] && [ -d "$ROOT/usr/local/bin" ] && [ -w "$ROOT/usr/local/bin" 
     cat << 'EOF_UDEV' > "$ROOT/etc/udev/rules.d/99-r36s-devbridge-usb0.rules"
 SUBSYSTEM=="net", ACTION=="add", KERNEL=="usb0", RUN+="/sbin/ip link set dev usb0 up", RUN+="/sbin/ip -4 address replace 192.168.7.2/24 dev usb0"
 EOF_UDEV
+
+    mkdir -p "$ROOT/etc/NetworkManager/conf.d"
+    cat << 'EOF_NM' > "$ROOT/etc/NetworkManager/conf.d/99-r36s-devbridge-usb0.conf"
+[keyfile]
+unmanaged-devices=interface-name:usb0
+EOF_NM
+
+    mkdir -p "$ROOT/etc/logrotate.d"
+    cat << 'EOF_LOGROTATE' > "$ROOT/etc/logrotate.d/r36s-agent"
+/var/log/r36s-agent.log {
+    size 1M
+    rotate 2
+    missingok
+    notifempty
+    copytruncate
+}
+EOF_LOGROTATE
+    rm -f "$ROOT/etc/systemd/journald.conf.d/99-r36s-devbridge.conf"
 
     rm -rf "$TMP_UNZIP"
     echo "[OK] r36s-agent pré-instalado e serviço habilitado no systemd do ArkOS!"

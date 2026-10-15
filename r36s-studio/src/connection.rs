@@ -164,7 +164,7 @@ impl ConnectionManager {
         d.push(line);
     }
 
-    fn check_usb_device(diag: &Arc<Mutex<Vec<String>>>) -> (bool, String) {
+    fn check_usb_device(diag: &Arc<Mutex<Vec<String>>>) -> (bool, String, Option<String>) {
         if let Ok(entries) = fs::read_dir("/sys/class/net") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -180,68 +180,53 @@ impl ConnectionManager {
                         || drv_name == "cdc_ncm"
                         || drv_name == "usbnet"
                     {
-                        Self::ensure_host_ip(&name_str, diag);
-                        return (true, name_str.to_string());
+                        let ip_error = Self::ensure_host_ip(&name_str, diag).err();
+                        return (true, name_str.to_string(), ip_error);
                     }
                 }
             }
         }
-        (false, String::new())
+        (false, String::new(), None)
     }
 
-    fn ensure_host_ip(ifname: &str, diag: &Arc<Mutex<Vec<String>>>) {
-        if let Ok(output) = std::process::Command::new("nmcli")
+    fn host_has_ip(ifname: &str) -> Result<bool, String> {
+        let output = std::process::Command::new("nmcli")
             .args(["-g", "IP4.ADDRESS", "dev", "show", ifname])
             .output()
-        {
-            let text = String::from_utf8_lossy(&output.stdout);
-            if !text.contains("192.168.7.") {
-                Self::add_diag(diag, &format!("Interface {} sem IP 192.168.7.x. Ativando perfil R36S-DevBridge...", ifname));
-
-                // 1. Tenta ativar perfil dedicado existente "R36S-DevBridge"
-                let up_res = std::process::Command::new("nmcli")
-                    .args(["connection", "up", "R36S-DevBridge"])
-                    .output();
-
-                let mut activated = false;
-                if let Ok(ref out) = up_res {
-                    if out.status.success() {
-                        activated = true;
-                        Self::add_diag(diag, "Perfil R36S-DevBridge ativado com sucesso.");
-                    }
-                }
-
-                // 2. Se não existir, cria perfil dedicado vinculado a esta interface específica
-                if !activated {
-                    let add_res = std::process::Command::new("nmcli")
-                        .args([
-                            "connection", "add",
-                            "type", "ethernet",
-                            "ifname", ifname,
-                            "con-name", "R36S-DevBridge",
-                            "ipv4.addresses", "192.168.7.1/24",
-                            "ipv4.method", "manual",
-                        ])
-                        .output();
-
-                    match add_res {
-                        Ok(add_out) if add_out.status.success() => {
-                            let _ = std::process::Command::new("nmcli")
-                                .args(["connection", "up", "R36S-DevBridge"])
-                                .output();
-                            Self::add_diag(diag, &format!("Perfil dedicado R36S-DevBridge criado para {}", ifname));
-                        }
-                        Ok(add_out) => {
-                            let err_text = String::from_utf8_lossy(&add_out.stderr).trim().to_string();
-                            Self::add_diag(diag, &format!("nmcli retornou erro: {}. Se necessário execute: sudo ip addr add 192.168.7.1/24 dev {}", err_text, ifname));
-                        }
-                        Err(e) => {
-                            Self::add_diag(diag, &format!("nmcli não disponível ({}). Execute manualmente: sudo ip addr add 192.168.7.1/24 dev {}", e, ifname));
-                        }
-                    }
-                }
-            }
+            .map_err(|e| format!("nmcli indisponível: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "não foi possível consultar o IP de {ifname}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
         }
+        Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .any(|line| line.trim() == "192.168.7.1/24"))
+    }
+
+    fn ensure_host_ip(ifname: &str, diag: &Arc<Mutex<Vec<String>>>) -> Result<(), String> {
+        if Self::host_has_ip(ifname)? {
+            return Ok(());
+        }
+        Self::add_diag(diag, &format!("Interface {ifname} sem 192.168.7.1/24. Configurando IP no dispositivo USB..."));
+
+        // Modifica a conexão ativa sem criar um perfil por MAC aleatório do gadget.
+        let output = std::process::Command::new("nmcli")
+            .args(["device", "modify", ifname, "ipv4.method", "manual", "ipv4.addresses", "192.168.7.1/24"])
+            .output()
+            .map_err(|e| format!("não foi possível executar nmcli: {e}"))?;
+        if !output.status.success() {
+            return Err(format!(
+                "falha ao configurar o IP de {ifname}: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            ));
+        }
+        if !Self::host_has_ip(ifname)? {
+            return Err(format!("nmcli concluiu, mas {ifname} continua sem 192.168.7.1/24"));
+        }
+        Self::add_diag(diag, &format!("Interface {ifname} configurada em 192.168.7.1/24."));
+        Ok(())
     }
 
     fn control_worker(
@@ -263,7 +248,7 @@ impl ConnectionManager {
 
         loop {
             // Fase 1: Descoberta USB
-            let (usb_found, ifname) = Self::check_usb_device(&diag);
+            let (usb_found, ifname, host_ip_error) = Self::check_usb_device(&diag);
             {
                 let mut st = status.lock().unwrap();
                 *st = ConnectionStatus::Searching {
@@ -278,6 +263,13 @@ impl ConnectionManager {
 
             if !usb_found {
                 thread::sleep(Duration::from_millis(800));
+                continue;
+            }
+            if let Some(error) = host_ip_error {
+                *status.lock().unwrap() = ConnectionStatus::Error {
+                    message: format!("USB {ifname} detectado, mas o IP do PC não foi configurado: {error}"),
+                };
+                thread::sleep(Duration::from_secs(2));
                 continue;
             }
 
@@ -365,8 +357,14 @@ impl ConnectionManager {
                         &bytes_rx,
                     );
                 }
-                Err(_) => {
-                    thread::sleep(Duration::from_millis(800));
+                Err(error) => {
+                    let message = format!(
+                        "USB detectado, mas 192.168.7.2:{} não respondeu: {}",
+                        CONTROL_PORT, error
+                    );
+                    Self::add_diag(&diag, &message);
+                    *status.lock().unwrap() = ConnectionStatus::Error { message };
+                    thread::sleep(Duration::from_secs(2));
                 }
             }
         }
@@ -559,17 +557,25 @@ impl ConnectionManager {
 
                             // Flag == 1: Quadro idêntico ao anterior (tela inalterada)
                             if header.flags == 1 {
-                                let now = Instant::now();
-                                frame_times.push_back(now);
-                                Self::update_fps(&mut frame_times, &current_fps);
+                                let has_valid_frame = current_frame.lock().unwrap().is_some();
+                                if has_valid_frame {
+                                    let now = Instant::now();
+                                    frame_times.push_back(now);
+                                    Self::update_fps(&mut frame_times, &current_fps);
+                                }
                                 continue;
                             }
 
                             // Flag == 2: Framebuffer inacessível no console
                             if header.flags == 2 {
-                                Self::add_diag(&diag, "Aviso: Framebuffer inacessível no R36S");
-                                thread::sleep(Duration::from_millis(100));
+                                Self::add_diag(&diag, "Aviso: Framebuffer /dev/fb0 inacessível no R36S (verifique permissões ou modo do kernel)");
+                                thread::sleep(Duration::from_millis(200));
                                 continue;
+                            }
+
+                            // Flag == 3: Framebuffer mock em execução de testes
+                            if header.flags == 3 {
+                                // Frame mock (gerado sinteticamente para depuração)
                             }
 
                             comp_buf.resize(size, 0);

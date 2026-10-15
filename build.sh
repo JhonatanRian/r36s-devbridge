@@ -36,6 +36,8 @@ chmod +x "$RELEASE_DIR/R36S DevBridge.sh"
 cp -f "$ROOT_DIR/r36s-port/payload.zip" "$RELEASE_DIR/r36s-devbridge/payload.zip"
 cp -f "$ROOT_DIR/r36s-port/patch_dtb_usb.py" "$RELEASE_DIR/r36s-devbridge/patch_dtb_usb.py"
 chmod +x "$RELEASE_DIR/r36s-devbridge/patch_dtb_usb.py"
+cp -f "$ROOT_DIR/r36s-port/gamepad_menu.py" "$RELEASE_DIR/r36s-devbridge/gamepad_menu.py"
+chmod +x "$RELEASE_DIR/r36s-devbridge/gamepad_menu.py"
 
 echo "=========================================================="
 echo "                  COMPILAÇÃO CONCLUÍDA!                   "

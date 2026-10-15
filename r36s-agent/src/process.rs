@@ -14,6 +14,19 @@ impl ProcessManager {
             return Err("Operação não permitida: auto-finalização do daemon".to_string());
         }
 
+        // Restringe a sinais seguros: SIGHUP (1), SIGINT (2), SIGKILL (9), SIGTERM (15)
+        if signal != 1 && signal != 2 && signal != 9 && signal != 15 {
+            return Err(format!("Sinal não permitido: {}. Apenas 1 (HUP), 2 (INT), 9 (KILL), 15 (TERM) são aceitos.", signal));
+        }
+
+        // Não permite matar processos vitais do ArkOS/kernel
+        if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
+            let lower = cmdline.to_lowercase();
+            if lower.contains("systemd") || lower.contains("udevd") || lower.contains("dbus") {
+                return Err(format!("Operação negada: o processo {} é um serviço essencial do sistema", pid));
+            }
+        }
+
         unsafe {
             let res = libc::kill(pid as libc::pid_t, signal);
             if res == 0 {
@@ -184,24 +197,82 @@ impl ProcessManager {
                 }
                 "Nenhum log de Port/Instalador encontrado.".to_string()
             }
-            "dmesg" => {
-                if let Ok(output) = Command::new("dmesg").output() {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    return Self::tail_string(&text, lines_to_fetch);
+            "ppsspp" | "psp" => {
+                let candidates = [
+                    "/home/ark/.config/ppsspp/PSP/SYSTEM/ppsspp.log",
+                    "/roms/psp/ppsspp.log",
+                    "/tmp/ppsspp.log",
+                ];
+                for path in candidates {
+                    if Path::new(path).exists() {
+                        if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
+                            return content;
+                        }
+                    }
                 }
-                "Falha ao executar dmesg.".to_string()
+                "Nenhum log do PPSSPP encontrado em /home/ark/.config/ppsspp/.".to_string()
+            }
+            "drastic" | "nds" => {
+                let candidates = [
+                    "/home/ark/.drastic/log.txt",
+                    "/roms/nds/drastic.log",
+                    "/tmp/drastic.log",
+                ];
+                for path in candidates {
+                    if Path::new(path).exists() {
+                        if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
+                            return content;
+                        }
+                    }
+                }
+                "Nenhum log do DraStic encontrado em /home/ark/.drastic/.".to_string()
+            }
+            "mupen64plus" | "n64" => {
+                let candidates = [
+                    "/home/ark/.config/mupen64plus/mupen64plus.log",
+                    "/tmp/mupen64plus.log",
+                ];
+                for path in candidates {
+                    if Path::new(path).exists() {
+                        if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
+                            return content;
+                        }
+                    }
+                }
+                "Nenhum log do Mupen64Plus encontrado.".to_string()
+            }
+            "dmesg" => {
+                match Command::new("dmesg").output() {
+                    Ok(output) if output.status.success() => {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        Self::tail_string(&text, lines_to_fetch)
+                    }
+                    Ok(output) => {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        format!("dmesg retornou erro (código {:?}): {}", output.status.code(), err.trim())
+                    }
+                    Err(e) => format!("Falha ao invocar dmesg: {}", e),
+                }
             }
             "journalctl" | "agent" => {
-                if let Ok(output) = Command::new("journalctl")
+                match Command::new("journalctl")
                     .args(["-u", "r36s-agent", "-n", &lines_to_fetch.to_string(), "--no-pager"])
                     .output()
                 {
-                    let text = String::from_utf8_lossy(&output.stdout);
-                    if !text.trim().is_empty() {
-                        return text.into_owned();
+                    Ok(output) if output.status.success() => {
+                        let text = String::from_utf8_lossy(&output.stdout);
+                        if !text.trim().is_empty() {
+                            text.into_owned()
+                        } else {
+                            "Sem registros recentes do r36s-agent no journalctl.".to_string()
+                        }
                     }
+                    Ok(output) => {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        format!("journalctl retornou erro (código {:?}): {}", output.status.code(), err.trim())
+                    }
+                    Err(e) => format!("Falha ao invocar journalctl: {}", e),
                 }
-                "Sem registros recentes do r36s-agent no journalctl.".to_string()
             }
             _ => format!("Tipo de log desconhecido: {}", log_type),
         }

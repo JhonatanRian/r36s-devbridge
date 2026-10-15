@@ -6,3 +6,8 @@ dist/
 *.tmp
 *.ppm
 r36s-port/payload.zip
+gaps.md
+plan.md
+implementation_plan.md
+.agents/
+openspec/

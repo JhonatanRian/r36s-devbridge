@@ -1,5 +1,6 @@
 use crate::protocol::{
     FORMAT_BGRA8888_LZ4, FORMAT_RGB565_LZ4, FORMAT_RGBA8888_LZ4,
+    FRAME_FLAG_FB_UNAVAILABLE, FRAME_FLAG_KEYFRAME, FRAME_FLAG_MOCK, FRAME_FLAG_UNCHANGED,
 };
 use memmap2::{Mmap, MmapOptions};
 use std::fs::File;
@@ -76,6 +77,8 @@ pub struct FramebufferReader {
     pub bpp: u8,
     pub line_length: usize,
     pub format: u8,
+    pub is_real_fb: bool,
+    pub fb_error: Option<String>,
     prev_frame_hash: u64,
     force_keyframe: bool,
     packed_buffer: Vec<u8>,
@@ -85,41 +88,53 @@ pub struct FramebufferReader {
 
 impl FramebufferReader {
     pub fn new() -> Self {
+        // Inicialização rápida/não bloqueante:
+        // Não abre /dev/fb0 nem executa ioctls no startup principal para não atrasar
+        // ou bloquear o binding imediato da porta de controle 7365.
+        // A abertura real do framebuffer é feita sob demanda (lazy) na primeira captura.
+        Self {
+            file: None,
+            mmap: None,
+            width: 640,
+            height: 480,
+            bpp: 16,
+            line_length: 640 * 2,
+            format: FORMAT_RGB565_LZ4,
+            is_real_fb: false,
+            fb_error: None,
+            prev_frame_hash: 0,
+            force_keyframe: true,
+            packed_buffer: vec![0u8; 640 * 480 * 2],
+            mock_start: Instant::now(),
+            mock_frame: 0,
+        }
+    }
+
+    pub fn ensure_initialized(&mut self) {
+        if self.file.is_some() && self.mmap.is_some() {
+            return;
+        }
+
         match Self::try_open_fb0() {
             Ok((file, mmap, width, height, bpp, line_length, format)) => {
                 let bytes_per_pixel = (bpp as usize) / 8;
                 let packed_size = (width as usize) * (height as usize) * bytes_per_pixel;
-                Self {
-                    file: Some(file),
-                    mmap: Some(mmap),
-                    width,
-                    height,
-                    bpp,
-                    line_length,
-                    format,
-                    prev_frame_hash: 0,
-                    force_keyframe: true,
-                    packed_buffer: vec![0u8; packed_size],
-                    mock_start: Instant::now(),
-                    mock_frame: 0,
-                }
+                self.file = Some(file);
+                self.mmap = Some(mmap);
+                self.width = width;
+                self.height = height;
+                self.bpp = bpp;
+                self.line_length = line_length;
+                self.format = format;
+                self.is_real_fb = true;
+                self.fb_error = None;
+                self.packed_buffer.resize(packed_size, 0);
             }
             Err(e) => {
-                eprintln!("[r36s-agent] Aviso: /dev/fb0 inacessível (usando mock framebuffer): {}", e);
-                Self {
-                    file: None,
-                    mmap: None,
-                    width: 640,
-                    height: 480,
-                    bpp: 16,
-                    line_length: 640 * 2,
-                    format: FORMAT_RGB565_LZ4,
-                    prev_frame_hash: 0,
-                    force_keyframe: true,
-                    packed_buffer: vec![0u8; 640 * 480 * 2],
-                    mock_start: Instant::now(),
-                    mock_frame: 0,
-                }
+                self.file = None;
+                self.mmap = None;
+                self.is_real_fb = false;
+                self.fb_error = Some(e);
             }
         }
     }
@@ -184,6 +199,8 @@ impl FramebufferReader {
     }
 
     pub fn capture_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {
+        self.ensure_initialized();
+
         if self.file.is_some() && self.mmap.is_some() {
             let file = self.file.as_ref().unwrap();
             let mmap = self.mmap.as_ref().unwrap();
@@ -206,10 +223,12 @@ impl FramebufferReader {
                 self.packed_buffer.resize(total_frame_bytes, 0);
             }
 
-            // Se stride for igual e offset zero, cópia direta; caso contrário, cópia linha por linha
+            // Se stride for igual e offset zero, cópia direta com bounds check estrito
             if self.line_length == row_bytes && start == 0 {
                 if mmap.len() >= total_frame_bytes {
                     self.packed_buffer.copy_from_slice(&mmap[0..total_frame_bytes]);
+                } else {
+                    self.packed_buffer.fill(0);
                 }
             } else {
                 for y in 0..(self.height as usize) {
@@ -218,6 +237,8 @@ impl FramebufferReader {
                     if src_offset + row_bytes <= mmap.len() && dst_offset + row_bytes <= self.packed_buffer.len() {
                         self.packed_buffer[dst_offset..dst_offset + row_bytes]
                             .copy_from_slice(&mmap[src_offset..src_offset + row_bytes]);
+                    } else if dst_offset + row_bytes <= self.packed_buffer.len() {
+                        self.packed_buffer[dst_offset..dst_offset + row_bytes].fill(0);
                     }
                 }
             }
@@ -230,15 +251,19 @@ impl FramebufferReader {
 
             if is_unchanged {
                 // Quadro inalterado: flag = 1, payload comprimido vazio para economizar banda/CPU
-                return (self.width, self.height, self.format, 1, Vec::new());
+                return (self.width, self.height, self.format, FRAME_FLAG_UNCHANGED, Vec::new());
             }
 
             let compressed = lz4_flex::compress(&self.packed_buffer);
-            return (self.width, self.height, self.format, 0, compressed);
+            return (self.width, self.height, self.format, FRAME_FLAG_KEYFRAME, compressed);
         }
 
-        // Gera frame mock caso /dev/fb0 não esteja disponível (testes ou emulação no PC)
-        self.generate_mock_frame()
+        // Se /dev/fb0 não está disponível, reporta FRAME_FLAG_MOCK se DEVBRIDGE_ALLOW_MOCK=1 ou FRAME_FLAG_FB_UNAVAILABLE
+        if std::env::var("DEVBRIDGE_ALLOW_MOCK").is_ok() {
+            self.generate_mock_frame()
+        } else {
+            (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, Vec::new())
+        }
     }
 
     fn compute_hash(data: &[u8]) -> u64 {

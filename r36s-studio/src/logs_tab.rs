@@ -25,6 +25,7 @@ impl LogsTab {
     pub fn render(&mut self, ui: &mut Ui, conn: &ConnectionManager) {
         ui.vertical(|ui| {
             // Controles superiores em linha quebrável
+            let prev_source = self.selected_log_type.clone();
             ui.horizontal_wrapped(|ui| {
                 ui.label("Fonte:");
                 egui::ComboBox::from_label("")
@@ -33,11 +34,20 @@ impl LogsTab {
                         ui.selectable_value(&mut self.selected_log_type, "active_game".to_string(), "🎮 Jogo / Port Ativo (dinâmico)");
                         ui.selectable_value(&mut self.selected_log_type, "emulationstation".to_string(), "EmulationStation (es_log.txt)");
                         ui.selectable_value(&mut self.selected_log_type, "retroarch".to_string(), "RetroArch (retroarch.log)");
+                        ui.selectable_value(&mut self.selected_log_type, "ppsspp".to_string(), "PPSSPP (PSP)");
+                        ui.selectable_value(&mut self.selected_log_type, "drastic".to_string(), "DraStic (NDS)");
+                        ui.selectable_value(&mut self.selected_log_type, "mupen64plus".to_string(), "Mupen64Plus (N64)");
                         ui.selectable_value(&mut self.selected_log_type, "port".to_string(), "Port / Instalador (install.log)");
                         ui.selectable_value(&mut self.selected_log_type, "java".to_string(), "Java / FreeJ2ME (java.log)");
                         ui.selectable_value(&mut self.selected_log_type, "agent".to_string(), "DevBridge Daemon (journal)");
                         ui.selectable_value(&mut self.selected_log_type, "dmesg".to_string(), "Kernel (dmesg)");
                     });
+
+                if self.selected_log_type != prev_source {
+                    self.cached_content = format!("Carregando logs de {}...", self.selected_log_type);
+                    *conn.last_logs.lock().unwrap() = None;
+                    self.request_logs(conn);
+                }
 
                 ui.separator();
 
@@ -47,6 +57,7 @@ impl LogsTab {
 
                 if ui.button("🧹 Limpar").clicked() {
                     self.cached_content.clear();
+                    *conn.last_logs.lock().unwrap() = None;
                 }
 
                 ui.checkbox(&mut self.auto_refresh, "Auto (2s)");
@@ -67,12 +78,17 @@ impl LogsTab {
                 self.request_logs(conn);
             }
 
-            // Verifica se chegou resposta de logs do agente
-            if let Some((log_type, content)) = &*conn.last_logs.lock().unwrap() {
-                if log_type == &self.selected_log_type {
-                    self.cached_content = content.clone();
+            // Consome resposta de logs do agente uma única vez para não reescrever após limpar
+            let mut logs_guard = conn.last_logs.lock().unwrap();
+            if let Some((log_type, content)) = logs_guard.take() {
+                if log_type == self.selected_log_type {
+                    self.cached_content = content;
+                } else {
+                    // Restaura se for de outro tipo
+                    *logs_guard = Some((log_type, content));
                 }
             }
+            drop(logs_guard);
 
             ui.separator();
 

@@ -102,7 +102,13 @@ impl DeployTab {
 
                 ui.add_space(8.0);
 
-                let can_upload = self.selected_file.is_some() && !uploading;
+                let is_connected = matches!(*conn.status.lock().unwrap(), crate::connection::ConnectionStatus::Connected { .. });
+                let can_upload = self.selected_file.is_some() && !uploading && is_connected;
+
+                if !is_connected {
+                    ui.colored_label(Color32::from_rgb(255, 180, 80), "⚠ Conecte o R36S via cabo OTG para habilitar o envio de arquivos.");
+                }
+
                 ui.add_enabled_ui(can_upload, |ui| {
                     if ui.button(RichText::new("🚀 Iniciar Envio para o R36S").strong()).clicked() {
                         if let Some(file_path) = self.selected_file.clone() {
@@ -157,7 +163,7 @@ impl DeployTab {
                 Ok(0) => break,
                 Ok(n) => hasher.update(&buf[..n]),
                 Err(e) => {
-                    *status.lock().unwrap() = Some(format!("ERRO: Falha ao ler arquivo: {}", e));
+                    *status.lock().unwrap() = Some(format!("ERRO: Falha ao ler arquivo local: {}", e));
                     is_uploading.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -167,11 +173,12 @@ impl DeployTab {
         let sha256 = format!("{:x}", hasher.finalize());
         *status.lock().unwrap() = Some("Conectando ao R36S para transferência direta...".to_string());
 
-        let stream_res = TcpStream::connect("192.168.7.2:7365");
+        let target_addr: std::net::SocketAddr = "192.168.7.2:7365".parse().unwrap();
+        let stream_res = TcpStream::connect_timeout(&target_addr, Duration::from_secs(4));
         let mut stream = match stream_res {
             Ok(s) => s,
             Err(e) => {
-                *status.lock().unwrap() = Some(format!("ERRO: Não foi possível conectar ao R36S: {}", e));
+                *status.lock().unwrap() = Some(format!("ERRO: Não foi possível conectar ao R36S (timeout): {}", e));
                 is_uploading.store(false, Ordering::Relaxed);
                 return;
             }
@@ -233,10 +240,16 @@ impl DeployTab {
         let mut sent_bytes: u64 = 0;
         let mut chunk_idx: u32 = 0;
 
-        while let Ok(n) = file.read(&mut buf) {
-            if n == 0 {
-                break;
-            }
+        loop {
+            let n = match file.read(&mut buf) {
+                Ok(0) => break, // Fim do arquivo
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    *status.lock().unwrap() = Some(format!("ERRO de leitura local durante upload: {}", e));
+                    is_uploading.store(false, Ordering::Relaxed);
+                    return;
+                }
+            };
 
             let b64 = base64_encode(&buf[..n]);
             let chunk_cmd = ClientCommand::DeployChunk {

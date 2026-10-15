@@ -24,6 +24,7 @@ pub struct DevBridgeApp {
     logs_tab: LogsTab,
     process_tab: ProcessTab,
     current_tab: ActiveTab,
+    show_telemetry_panel: bool,
 }
 
 impl DevBridgeApp {
@@ -36,6 +37,7 @@ impl DevBridgeApp {
             logs_tab: LogsTab::new(),
             process_tab: ProcessTab::new(),
             current_tab: ActiveTab::ViewportAndTelemetry,
+            show_telemetry_panel: true,
         }
     }
 }
@@ -111,6 +113,17 @@ impl eframe::App for DevBridgeApp {
                     self.connection.toggle_streaming();
                 }
 
+                if self.current_tab == ActiveTab::ViewportAndTelemetry {
+                    let panel_btn_text = if self.show_telemetry_panel {
+                        "◀ Ocultar Painel"
+                    } else {
+                        "▶ Exibir Telemetria"
+                    };
+                    if ui.button(panel_btn_text).clicked() {
+                        self.show_telemetry_panel = !self.show_telemetry_panel;
+                    }
+                }
+
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.current_tab, ActiveTab::Processes, "⚙ Processos");
                     ui.selectable_value(&mut self.current_tab, ActiveTab::Logs, "📜 Logs");
@@ -124,7 +137,7 @@ impl eframe::App for DevBridgeApp {
         // Barra Inferior (Footer)
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ArkOS R36S Toolkit • RK3326 Cortex-A35 • Mali-G31 • 640x480").small());
+                ui.label(RichText::new("ArkOS R36S Toolkit • RK3326 Cortex-A35 • Mali-G31").small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(RichText::new("DevBridge v0.2.0 • Protocolo Conectado").small());
                 });
@@ -132,11 +145,11 @@ impl eframe::App for DevBridgeApp {
         });
 
         // Coluna Esquerda: Painel lateral nativo de telemetria (100% de altura, largura ajustável)
-        if self.current_tab == ActiveTab::ViewportAndTelemetry {
+        if self.current_tab == ActiveTab::ViewportAndTelemetry && self.show_telemetry_panel {
             egui::SidePanel::left("telemetry_side_panel")
                 .resizable(true)
-                .default_width(330.0)
-                .width_range(280.0..=480.0)
+                .default_width(300.0)
+                .width_range(240.0..=450.0)
                 .show(ctx, |ui| {
                     ScrollArea::vertical()
                         .auto_shrink([false; 2])

@@ -92,7 +92,7 @@ Follow these steps carefully for first-time setup:
    ```bash
    ./app
    ```
-3. The desktop studio will automatically detect the R36S USB interface (`rndis_host` / `g_ether`), apply the host network profile (`192.168.7.1`), and perform a protocol v0.2.0 handshake with the console.
+3. The desktop studio will detect the R36S USB interface (`rndis_host` / `g_ether`), configure `192.168.7.1/24` on that interface, and perform a protocol v0.2.0 handshake with the console. If the IP cannot be configured, the app shows the error before attempting TCP.
 4. The top header will turn green:
    ```text
    🟢 Conectado em 192.168.7.2 (< 1ms)
@@ -114,17 +114,20 @@ Whenever you open **`R36S DevBridge`** from the Ports menu on the console in the
 Status: Service active and running
 IP:     192.168.7.2 (usb0)
 
-[1] Re-apply USB network and restart agent (Default)
-[2] Reinstall / Update DevBridge
-[3] Uninstall and restore original factory state
-[4] Exit
+[X / 1] Re-apply USB network and restart agent
+[A / 2] Reinstall / Update DevBridge
+[Y / 3] Uninstall and restore original factory state (press twice)
+[B / 4] Exit (Default)
 ==========================================================
-Select an option (1-4) [auto 1 in 15s]:
+Press a button [auto exit in 30s]:
 ```
 
-- **Option 1**: Re-applies IP and restarts the background service without altering system files.
-- **Option 2**: Re-extracts payload and updates the agent.
-- **Option 3 (Full Rollback)**: Stops and uninstalls the service, removes `/etc/modules` entries, restores the original verified DTB from backup, and returns the OTG port to normal host mode.
+- **X / 1**: Re-applies IP and restarts the background service without altering system files.
+- **A / 2**: Re-extracts payload and updates the agent.
+- **Y / 3 (Uninstall)**: Press twice to remove the service and its module entries. DTB restoration currently requires a verified backup in the Port's `r36s-devbridge/backup` directory; see `gaps.md` before using this option.
+
+The Port checks that the agent opens TCP port `7365` before reporting success. On failure it displays the service state and the last lines of `/var/log/r36s-agent.log`; the full Port run is also saved in `/roms/ports/r36s-devbridge/install.log`.
+- **B / 4**: Exits without changing the running service. The menu also exits after 30 seconds without input.
 
 ---
 

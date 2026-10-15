@@ -81,7 +81,12 @@ impl DeployManager {
         }
 
         let dest_path = canon_target.join(clean_filename);
-        let tmp_path = canon_target.join(format!(".{}.upload.tmp", clean_filename));
+        let pid = std::process::id();
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let tmp_path = canon_target.join(format!(".{}.{}_{}.upload.tmp", clean_filename, pid, now_ms));
 
         let file = File::create(&tmp_path).map_err(|e| format!("Falha ao criar arquivo temporário: {}", e))?;
 
@@ -150,7 +155,8 @@ impl DeployManager {
         }
 
         if let Some(mut file) = session.file.take() {
-            file.flush().map_err(|e| format!("Erro ao sincronizar disco: {}", e))?;
+            file.flush().map_err(|e| format!("Erro no flush em disco: {}", e))?;
+            file.sync_all().map_err(|e| format!("Erro no sync_all em disco: {}", e))?;
             drop(file);
         }
 
@@ -176,6 +182,13 @@ impl DeployManager {
         // Renomeia atomicamente
         fs::rename(&session.tmp_path, &session.dest_path)
             .map_err(|e| format!("Erro ao finalizar arquivo: {}", e))?;
+
+        // Sincroniza o diretório pai para persistência durável no filesystem
+        if let Some(parent) = session.dest_path.parent() {
+            if let Ok(dir_file) = File::open(parent) {
+                let _ = dir_file.sync_all();
+            }
+        }
 
         session.finished_successfully = true;
         Ok((session.dest_path.to_string_lossy().to_string(), final_hash))
