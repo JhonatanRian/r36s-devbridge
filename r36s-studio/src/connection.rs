@@ -121,12 +121,38 @@ impl ConnectionManager {
                         || drv_name == "cdc_ncm"
                         || drv_name == "usbnet"
                     {
+                        Self::ensure_host_ip(&name_str);
                         return true;
                     }
                 }
             }
         }
         false
+    }
+
+    fn ensure_host_ip(ifname: &str) {
+        if let Ok(output) = std::process::Command::new("nmcli")
+            .args(["-g", "IP4.ADDRESS", "dev", "show", ifname])
+            .output()
+        {
+            let text = String::from_utf8_lossy(&output.stdout);
+            if !text.contains("192.168.7.") {
+                if let Ok(conn_out) = std::process::Command::new("nmcli")
+                    .args(["-g", "GENERAL.CONNECTION", "dev", "show", ifname])
+                    .output()
+                {
+                    let conn_name = String::from_utf8_lossy(&conn_out.stdout).trim().to_string();
+                    if !conn_name.is_empty() && conn_name != "--" {
+                        let _ = std::process::Command::new("nmcli")
+                            .args(["connection", "modify", &conn_name, "ipv4.addresses", "192.168.7.1/24", "ipv4.method", "manual"])
+                            .output();
+                        let _ = std::process::Command::new("nmcli")
+                            .args(["connection", "up", &conn_name])
+                            .output();
+                    }
+                }
+            }
+        }
     }
 
     fn control_worker(

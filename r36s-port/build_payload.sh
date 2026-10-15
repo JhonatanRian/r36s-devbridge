@@ -3,13 +3,13 @@ set -Eeuo pipefail
 
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$DIR/.." && pwd -P)"
-AGENT_BIN="$PROJECT_ROOT/r36s-agent/target/aarch64-unknown-linux-gnu/release/r36s-agent"
+AGENT_BIN="$PROJECT_ROOT/r36s-agent/target/aarch64-unknown-linux-musl/release/r36s-agent"
 SERVICE_FILE="$PROJECT_ROOT/r36s-agent/systemd/r36s-agent.service"
 OUT_ZIP="$DIR/payload.zip"
 
 if [ ! -f "$AGENT_BIN" ]; then
-    echo "Compilando r36s-agent para aarch64..."
-    (cd "$PROJECT_ROOT/r36s-agent" && cargo build --release --target aarch64-unknown-linux-gnu)
+    echo "Compilando r36s-agent para aarch64 musl (binário 100% estático)..."
+    (cd "$PROJECT_ROOT/r36s-agent" && cargo build --release --target aarch64-unknown-linux-musl)
 fi
 
 TMP_DIR="$(mktemp -d)"

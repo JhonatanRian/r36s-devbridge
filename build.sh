@@ -9,9 +9,9 @@ echo "=========================================================="
 echo "           COMPILANDO R36S DEVBRIDGE TOOLKIT              "
 echo "=========================================================="
 
-# 1. Compilar r36s-agent para AArch64 (ArkOS no R36S)
-echo -e "\n[1/4] Compilando r36s-agent (AArch64)..."
-(cd "$ROOT_DIR/r36s-agent" && cargo build --release --target aarch64-unknown-linux-gnu)
+# 1. Compilar r36s-agent para AArch64 MUSL (estático para qualquer ArkOS)
+echo -e "\n[1/4] Compilando r36s-agent (AArch64 MUSL estático)..."
+(cd "$ROOT_DIR/r36s-agent" && cargo build --release --target aarch64-unknown-linux-musl)
 echo "r36s-agent compilado com sucesso."
 
 # 2. Empacotar o payload do Port

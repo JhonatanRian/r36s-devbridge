@@ -250,12 +250,14 @@ install_or_update() {
     systemctl daemon-reload
     systemctl enable r36s-agent.service 2>/dev/null || true
     systemctl restart r36s-agent.service 2>/dev/null || true
+    systemctl start ssh.service 2>/dev/null || true
     sleep 1
 
     if systemctl is-active --quiet r36s-agent.service; then
         log "${C_GREEN}[OK] Serviço r36s-agent está ativo e rodando!${C_RESET}"
     else
-        log "${C_YELLOW}[!] Serviço r36s-agent registrado; iniciará automaticamente.${C_RESET}"
+        log "${C_RED}[AVISO] r36s-agent não subiu pelo systemd. Diagnóstico:${C_RESET}"
+        journalctl -u r36s-agent.service -n 5 --no-pager 2>&1 | tee -a "$LOG_FILE" || true
     fi
 
     echo -e "\n${C_GREEN}==========================================================${C_RESET}"
