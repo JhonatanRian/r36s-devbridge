@@ -32,18 +32,30 @@ impl ProcessManager {
 
         if let Ok(output) = res {
             if output.status.success() {
-                return Ok("EmulationStation reiniciado com sucesso via systemd".to_string());
+                // Aguarda 1 segundo e valida se o serviço está ativo
+                std::thread::sleep(std::time::Duration::from_millis(1000));
+                let is_active = Command::new("systemctl")
+                    .args(["is-active", "--quiet", "emulationstation.service"])
+                    .status();
+                if let Ok(st) = is_active {
+                    if st.success() {
+                        return Ok("EmulationStation reiniciado com sucesso via systemd".to_string());
+                    }
+                }
             }
         }
 
-        let pkill_res = Command::new("pkill").arg("-9").arg("-f").arg("emulationstation").output();
-        if let Ok(pkill_out) = pkill_res {
-            if pkill_out.status.success() {
-                return Ok("Processo EmulationStation finalizado para re-spawn".to_string());
+        // Fallback: finaliza o processo para que o supervisor do ArkOS (emulationstation.sh) recarregue
+        let _ = Command::new("pkill").arg("-15").arg("-f").arg("/usr/bin/emulationstation/emulationstation").output();
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        let check_pid = Command::new("pgrep").arg("-f").arg("/usr/bin/emulationstation/emulationstation").output();
+        if let Ok(out) = check_pid {
+            if !out.stdout.is_empty() {
+                return Ok("Processo EmulationStation re-spawned com sucesso".to_string());
             }
         }
 
-        Err("Não foi possível reiniciar o EmulationStation".to_string())
+        Err("Não foi possível confirmar o reinício do EmulationStation".to_string())
     }
 
     pub fn fetch_logs(log_type: &str, max_lines: usize) -> String {
@@ -54,6 +66,62 @@ impl ProcessManager {
         };
 
         match log_type {
+            "active_game" | "active" | "game" => {
+                // 1. Tenta identificar processo de jogo/port ativo e inspecionar os descritores de arquivo stdout/stderr
+                if let Ok(entries) = std::fs::read_dir("/proc") {
+                    for entry in entries.flatten() {
+                        if let Ok(name) = entry.file_name().into_string() {
+                            if let Ok(pid) = name.parse::<u32>() {
+                                let cmdline_path = entry.path().join("cmdline");
+                                if let Ok(cmdline) = std::fs::read_to_string(cmdline_path) {
+                                    let lower = cmdline.to_lowercase();
+                                    let is_game = lower.contains("retroarch")
+                                        || lower.contains("drastic")
+                                        || lower.contains("ppsspp")
+                                        || lower.contains("mupen64plus")
+                                        || lower.contains("/roms/ports/")
+                                        || lower.contains(".sh");
+                                    let is_excluded = lower.contains("r36s-agent") || lower.contains("emulationstation");
+
+                                    if is_game && !is_excluded {
+                                        // Verifica se stdout ou stderr foram redirecionados para arquivo
+                                        for fd in ["1", "2"] {
+                                            let fd_path = entry.path().join("fd").join(fd);
+                                            if let Ok(target) = std::fs::read_link(fd_path) {
+                                                if let Some(target_str) = target.to_str() {
+                                                    if target_str.ends_with(".log") || target_str.ends_with(".txt") {
+                                                        if let Ok(content) = Self::tail_file(target_str, lines_to_fetch) {
+                                                            return format!("[PID {} - {}]\n{}", pid, target_str, content);
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // 2. Fallbacks conhecidos de logs de ports/jogos
+                let candidates = [
+                    "/roms/ports/log.txt",
+                    "/roms2/ports/log.txt",
+                    "/dev/shm/run.log",
+                    "/tmp/run.log",
+                    "/home/ark/.config/retroarch/retroarch.log",
+                ];
+                for path in candidates {
+                    if Path::new(path).exists() {
+                        if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
+                            return format!("[Arquivo: {}]\n{}", path, content);
+                        }
+                    }
+                }
+
+                "Nenhum jogo/port ativo com saída de log redirecionada no momento.".to_string()
+            }
             "emulationstation" | "es" => {
                 let candidates = [
                     "/home/ark/.emulationstation/es_log.txt",

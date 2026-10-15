@@ -196,26 +196,48 @@ impl ConnectionManager {
         {
             let text = String::from_utf8_lossy(&output.stdout);
             if !text.contains("192.168.7.") {
-                Self::add_diag(diag, &format!("Configurando IP 192.168.7.1 na interface {}", ifname));
-                if let Ok(conn_out) = std::process::Command::new("nmcli")
-                    .args(["-g", "GENERAL.CONNECTION", "dev", "show", ifname])
-                    .output()
-                {
-                    let conn_name = String::from_utf8_lossy(&conn_out.stdout).trim().to_string();
-                    if !conn_name.is_empty() && conn_name != "--" {
-                        let _ = std::process::Command::new("nmcli")
-                            .args(["connection", "modify", &conn_name, "ipv4.addresses", "192.168.7.1/24", "ipv4.method", "manual"])
-                            .output();
-                        let _ = std::process::Command::new("nmcli")
-                            .args(["connection", "up", &conn_name])
-                            .output();
-                    } else {
-                        let _ = std::process::Command::new("nmcli")
-                            .args(["connection", "add", "type", "ethernet", "ifname", ifname, "con-name", "R36S-DevBridge", "ip4", "192.168.7.1/24"])
-                            .output();
-                        let _ = std::process::Command::new("nmcli")
-                            .args(["connection", "up", "R36S-DevBridge"])
-                            .output();
+                Self::add_diag(diag, &format!("Interface {} sem IP 192.168.7.x. Ativando perfil R36S-DevBridge...", ifname));
+
+                // 1. Tenta ativar perfil dedicado existente "R36S-DevBridge"
+                let up_res = std::process::Command::new("nmcli")
+                    .args(["connection", "up", "R36S-DevBridge"])
+                    .output();
+
+                let mut activated = false;
+                if let Ok(ref out) = up_res {
+                    if out.status.success() {
+                        activated = true;
+                        Self::add_diag(diag, "Perfil R36S-DevBridge ativado com sucesso.");
+                    }
+                }
+
+                // 2. Se não existir, cria perfil dedicado vinculado a esta interface específica
+                if !activated {
+                    let add_res = std::process::Command::new("nmcli")
+                        .args([
+                            "connection", "add",
+                            "type", "ethernet",
+                            "ifname", ifname,
+                            "con-name", "R36S-DevBridge",
+                            "ipv4.addresses", "192.168.7.1/24",
+                            "ipv4.method", "manual",
+                        ])
+                        .output();
+
+                    match add_res {
+                        Ok(add_out) if add_out.status.success() => {
+                            let _ = std::process::Command::new("nmcli")
+                                .args(["connection", "up", "R36S-DevBridge"])
+                                .output();
+                            Self::add_diag(diag, &format!("Perfil dedicado R36S-DevBridge criado para {}", ifname));
+                        }
+                        Ok(add_out) => {
+                            let err_text = String::from_utf8_lossy(&add_out.stderr).trim().to_string();
+                            Self::add_diag(diag, &format!("nmcli retornou erro: {}. Se necessário execute: sudo ip addr add 192.168.7.1/24 dev {}", err_text, ifname));
+                        }
+                        Err(e) => {
+                            Self::add_diag(diag, &format!("nmcli não disponível ({}). Execute manualmente: sudo ip addr add 192.168.7.1/24 dev {}", e, ifname));
+                        }
                     }
                 }
             }
@@ -437,14 +459,15 @@ impl ConnectionManager {
         logs: &Arc<Mutex<Option<(String, String)>>>,
         deploy_status: &Arc<Mutex<Option<String>>>,
         proc_result: &Arc<Mutex<Option<(bool, String)>>>,
-        _diag: &Arc<Mutex<Vec<String>>>,
+        diag: &Arc<Mutex<Vec<String>>>,
     ) {
-        if let Ok(resp) = serde_json::from_str::<ServerResponse>(raw.trim()) {
-            match resp {
-                ServerResponse::Metrics(data) => {
-                    let mut m = metrics.lock().unwrap();
-                    *m = Some(data);
-                }
+        match serde_json::from_str::<ServerResponse>(raw.trim()) {
+            Ok(resp) => {
+                match resp {
+                    ServerResponse::Metrics(data) => {
+                        let mut m = metrics.lock().unwrap();
+                        *m = Some(data);
+                    }
                 ServerResponse::LogsResponse { log_type, content } => {
                     let mut l = logs.lock().unwrap();
                     *l = Some((log_type, content));
@@ -473,7 +496,11 @@ impl ConnectionManager {
                 _ => {}
             }
         }
+        Err(e) => {
+            Self::add_diag(diag, &format!("Erro ao deserializar resposta do daemon: {}", e));
+        }
     }
+}
 
     fn video_worker(
         current_frame: Arc<Mutex<Option<DecodedFrame>>>,

@@ -17,14 +17,20 @@ if [ ! -d "$MEDIA_ROOT" ]; then
     MEDIA_ROOT="/media/$USER_NAME"
 fi
 
-EASYROMS=""
-BOOT=""
-ROOT=""
+# Função auxiliar para extrair o disco físico de um diretório montado
+get_parent_disk() {
+    local mnt="$1"
+    local dev
+    dev="$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)"
+    if [ -n "$dev" ] && [ -b "$dev" ]; then
+        lsblk -no PKNAME "$dev" 2>/dev/null || echo "$dev"
+    fi
+}
 
 for base in "$MEDIA_ROOT" /run/media/* /media/*; do
-    [ -d "$base/EASYROMS" ] && EASYROMS="$base/EASYROMS"
-    [ -d "$base/BOOT" ] && BOOT="$base/BOOT"
-    [ -d "$base/root" ] && ROOT="$base/root"
+    [ -d "$base/EASYROMS" ] && [ -z "$EASYROMS" ] && EASYROMS="$base/EASYROMS"
+    [ -d "$base/BOOT" ] && [ -z "$BOOT" ] && BOOT="$base/BOOT"
+    [ -d "$base/root" ] && [ -z "$ROOT" ] && ROOT="$base/root"
 done
 
 if [ -z "$EASYROMS" ]; then
@@ -33,15 +39,33 @@ if [ -z "$EASYROMS" ]; then
     exit 1
 fi
 
-echo "Partição EASYROMS: $EASYROMS"
-[ -n "$BOOT" ] && echo "Partição BOOT:     $BOOT"
-[ -n "$ROOT" ] && echo "Partição root:     $ROOT"
+EASYROMS_DISK="$(get_parent_disk "$EASYROMS")"
+echo "Partição EASYROMS: $EASYROMS (disco: ${EASYROMS_DISK:-desconhecido})"
 
-# Garante que o pacote dist/ports existe
-if [ ! -f "$SCRIPT_DIR/dist/ports/R36S DevBridge.sh" ] || [ ! -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/payload.zip" ]; then
-    echo -e "\nCompilando e gerando pacote dist/ports..."
-    "$SCRIPT_DIR/build.sh"
+# Valida se BOOT e ROOT pertencem ao mesmo dispositivo de armazenamento para evitar contaminação
+if [ -n "$BOOT" ]; then
+    BOOT_DISK="$(get_parent_disk "$BOOT")"
+    if [ -n "$EASYROMS_DISK" ] && [ -n "$BOOT_DISK" ] && [ "$EASYROMS_DISK" != "$BOOT_DISK" ]; then
+        echo "AVISO: Partição BOOT ($BOOT, disco $BOOT_DISK) não pertence ao mesmo disco de EASYROMS ($EASYROMS_DISK); ignorando para evitar corrupção." >&2
+        BOOT=""
+    else
+        echo "Partição BOOT:     $BOOT"
+    fi
 fi
+
+if [ -n "$ROOT" ]; then
+    ROOT_DISK="$(get_parent_disk "$ROOT")"
+    if [ -n "$EASYROMS_DISK" ] && [ -n "$ROOT_DISK" ] && [ "$EASYROMS_DISK" != "$ROOT_DISK" ]; then
+        echo "AVISO: Partição root ($ROOT, disco $ROOT_DISK) não pertence ao mesmo disco de EASYROMS ($EASYROMS_DISK); ignorando." >&2
+        ROOT=""
+    else
+        echo "Partição root:     $ROOT"
+    fi
+fi
+
+# Sempre recompila e atualiza o pacote dist/ports para garantir versão atualizada
+echo -e "\nCompilando e gerando pacote atualizado dist/ports..."
+"$SCRIPT_DIR/build.sh"
 
 # 1. Instalação em Ports (/roms/ports/)
 PORTS_DIR="$EASYROMS/ports"

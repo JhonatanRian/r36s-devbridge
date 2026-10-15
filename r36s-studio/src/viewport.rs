@@ -158,12 +158,16 @@ impl ViewportRenderer {
             };
 
             if self.scale_mode == ViewportScale::Fit {
-                draw_viewport(ui);
+                ui.centered_and_justified(|ui| {
+                    draw_viewport(ui);
+                });
             } else {
                 egui::ScrollArea::both()
                     .auto_shrink([false; 2])
                     .show(ui, |ui| {
-                        draw_viewport(ui);
+                        ui.centered_and_justified(|ui| {
+                            draw_viewport(ui);
+                        });
                     });
             }
         });

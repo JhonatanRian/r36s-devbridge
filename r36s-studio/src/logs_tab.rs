@@ -30,6 +30,7 @@ impl LogsTab {
                 egui::ComboBox::from_label("")
                     .selected_text(&self.selected_log_type)
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_log_type, "active_game".to_string(), "🎮 Jogo / Port Ativo (dinâmico)");
                         ui.selectable_value(&mut self.selected_log_type, "emulationstation".to_string(), "EmulationStation (es_log.txt)");
                         ui.selectable_value(&mut self.selected_log_type, "retroarch".to_string(), "RetroArch (retroarch.log)");
                         ui.selectable_value(&mut self.selected_log_type, "port".to_string(), "Port / Instalador (install.log)");

@@ -23,19 +23,29 @@ pub struct ProcessInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
+    #[serde(default)]
     pub timestamp: u64,
+    #[serde(default)]
     pub cpu_usage: f32,
+    #[serde(default)]
     pub cpu_freq_mhz: Vec<u32>,
     pub cpu_temp_c: Option<f32>,
+    #[serde(default)]
     pub ram_used_mb: u64,
+    #[serde(default)]
     pub ram_total_mb: u64,
     pub mali_gpu_load: Option<f32>,
     pub mali_gpu_freq_mhz: Option<u32>,
     pub active_game: Option<String>,
+    #[serde(default)]
     pub running_processes: Vec<ProcessInfo>,
+    #[serde(default)]
     pub fb_width: u16,
+    #[serde(default)]
     pub fb_height: u16,
+    #[serde(default)]
     pub fb_bpp: u8,
+    #[serde(default)]
     pub fb_format: u8,
 }
 

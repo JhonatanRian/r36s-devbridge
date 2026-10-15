@@ -131,45 +131,36 @@ impl eframe::App for DevBridgeApp {
             });
         });
 
-        // Painel Central Principal
+        // Coluna Esquerda: Painel lateral nativo de telemetria (100% de altura, largura ajustável)
+        if self.current_tab == ActiveTab::ViewportAndTelemetry {
+            egui::SidePanel::left("telemetry_side_panel")
+                .resizable(true)
+                .default_width(330.0)
+                .width_range(280.0..=480.0)
+                .show(ctx, |ui| {
+                    ScrollArea::vertical()
+                        .auto_shrink([false; 2])
+                        .show(ui, |ui| {
+                            self.telemetry.render(
+                                ui,
+                                &status_snapshot,
+                                metrics_snapshot.as_ref(),
+                                throughput,
+                            );
+                        });
+                });
+        }
+
+        // Painel Central: ocupa todo o espaço restante da tela do notebook
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.current_tab {
                 ActiveTab::ViewportAndTelemetry => {
-                    ui.horizontal(|ui| {
-                        // Coluna Esquerda: Telemetria compacta (largura fixa ~310px com scroll próprio)
-                        ui.allocate_ui_with_layout(
-                            egui::Vec2::new(310.0, ui.available_height()),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                ScrollArea::vertical()
-                                    .auto_shrink([false; 2])
-                                    .show(ui, |ui| {
-                                        self.telemetry.render(
-                                            ui,
-                                            &status_snapshot,
-                                            metrics_snapshot.as_ref(),
-                                            throughput,
-                                        );
-                                    });
-                            },
-                        );
-
-                        ui.separator();
-
-                        // Coluna Direita: Viewport 4:3 ocupando todo o espaço restante
-                        ui.allocate_ui_with_layout(
-                            ui.available_size(),
-                            egui::Layout::top_down(egui::Align::Min),
-                            |ui| {
-                                self.viewport.render(
-                                    ui,
-                                    is_streaming,
-                                    current_fps,
-                                    frame_snapshot.as_ref(),
-                                );
-                            },
-                        );
-                    });
+                    self.viewport.render(
+                        ui,
+                        is_streaming,
+                        current_fps,
+                        frame_snapshot.as_ref(),
+                    );
                 }
                 ActiveTab::Deploy => {
                     self.deploy_tab.render(ui, &self.connection);
