@@ -81,6 +81,7 @@ pub struct FramebufferReader {
     pub fb_error: Option<String>,
     prev_frame_hash: u64,
     force_keyframe: bool,
+    frame_counter: u64,
     packed_buffer: Vec<u8>,
     mock_start: Instant,
     mock_frame: u32,
@@ -104,6 +105,7 @@ impl FramebufferReader {
             fb_error: None,
             prev_frame_hash: 0,
             force_keyframe: true,
+            frame_counter: 0,
             packed_buffer: vec![0u8; 640 * 480 * 2],
             mock_start: Instant::now(),
             mock_frame: 0,
@@ -205,13 +207,44 @@ impl FramebufferReader {
             let file = self.file.as_ref().unwrap();
             let mmap = self.mmap.as_ref().unwrap();
 
-            // Consulta offsets atuais para lidar com page-flipping / double-buffering
+            // Consulta offsets e resolução atual para lidar com page-flipping / double-buffering e troca de modo de vídeo
             let mut vinfo: FbVarScreeninfo = unsafe { std::mem::zeroed() };
             let mut xoffset = 0usize;
             let mut yoffset = 0usize;
             if unsafe { libc::ioctl(file.as_raw_fd(), 0x4600, &mut vinfo) == 0 } {
                 xoffset = vinfo.xoffset as usize;
                 yoffset = vinfo.yoffset as usize;
+
+                // Detecta se um emulador trocou a resolução ou bpp do framebuffer dinamicamente
+                if vinfo.xres > 0 && vinfo.yres > 0 {
+                    let cur_w = vinfo.xres as u16;
+                    let cur_h = vinfo.yres as u16;
+                    let cur_bpp = if vinfo.bits_per_pixel > 0 { vinfo.bits_per_pixel as u8 } else { self.bpp };
+
+                    if cur_w != self.width || cur_h != self.height || cur_bpp != self.bpp {
+                        self.width = cur_w;
+                        self.height = cur_h;
+                        self.bpp = cur_bpp;
+                        self.format = if cur_bpp == 32 {
+                            if vinfo.red.offset == 16 && vinfo.blue.offset == 0 {
+                                FORMAT_BGRA8888_LZ4
+                            } else {
+                                FORMAT_RGBA8888_LZ4
+                            }
+                        } else {
+                            FORMAT_RGB565_LZ4
+                        };
+
+                        // Recalcula line_length via FBIOGET_FSCREENINFO
+                        let mut finfo: FbFixScreeninfo = unsafe { std::mem::zeroed() };
+                        if unsafe { libc::ioctl(file.as_raw_fd(), 0x4602, &mut finfo) == 0 } && finfo.line_length > 0 {
+                            self.line_length = finfo.line_length as usize;
+                        } else {
+                            self.line_length = (cur_w as usize) * ((cur_bpp as usize) / 8);
+                        }
+                        self.force_keyframe = true;
+                    }
+                }
             }
 
             let bpp_bytes = (self.bpp as usize) / 8;
@@ -221,6 +254,7 @@ impl FramebufferReader {
 
             if self.packed_buffer.len() != total_frame_bytes {
                 self.packed_buffer.resize(total_frame_bytes, 0);
+                self.force_keyframe = true;
             }
 
             // Se stride for igual e offset zero, cópia direta com bounds check estrito
@@ -243,9 +277,13 @@ impl FramebufferReader {
                 }
             }
 
+            self.frame_counter = self.frame_counter.wrapping_add(1);
+
             // Calcula hash rápido para frame-diffing
             let hash = Self::compute_hash(&self.packed_buffer);
-            let is_unchanged = !self.force_keyframe && (hash == self.prev_frame_hash);
+            // Emite keyframe periódico a cada ~60 quadros para garantir sincronia se um cliente reconectar
+            let periodic_keyframe = (self.frame_counter % 60) == 0;
+            let is_unchanged = !self.force_keyframe && !periodic_keyframe && (hash == self.prev_frame_hash);
             self.prev_frame_hash = hash;
             self.force_keyframe = false;
 

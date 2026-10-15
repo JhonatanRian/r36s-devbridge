@@ -591,7 +591,11 @@ impl ConnectionManager {
                                     let rgba = match header.format {
                                         FORMAT_RGB565_LZ4 => Self::rgb565_to_rgba(&decomp_buf, header.width as usize, header.height as usize),
                                         FORMAT_BGRA8888_LZ4 => Self::bgra_to_rgba(&decomp_buf),
-                                        _ => decomp_buf, // FORMAT_RGBA8888_LZ4 já é RGBA
+                                        _ => {
+                                            let mut buf = decomp_buf;
+                                            Self::sanitize_rgba_alpha(&mut buf);
+                                            buf
+                                        }
                                     };
 
                                     let frame = DecodedFrame {
@@ -675,8 +679,15 @@ impl ConnectionManager {
             let r = chunk[2];
             chunk[0] = r;
             chunk[2] = b;
+            chunk[3] = 255; // Garante opacidade absoluta: evita tela preta/escurecida pelo alpha do display driver
         }
         rgba
+    }
+
+    pub fn sanitize_rgba_alpha(rgba: &mut [u8]) {
+        for chunk in rgba.chunks_exact_mut(4) {
+            chunk[3] = 255;
+        }
     }
 }
 
