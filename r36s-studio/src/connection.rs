@@ -405,14 +405,14 @@ impl ConnectionManager {
             let high = rgb565[i * 2 + 1] as u16;
             let pixel = low | (high << 8);
 
-            let r = ((pixel >> 11) & 0x1F) as u8;
-            let g = ((pixel >> 5) & 0x3F) as u8;
-            let b = (pixel & 0x1F) as u8;
+            let r = ((pixel >> 11) & 0x1F) as u32;
+            let g = ((pixel >> 5) & 0x3F) as u32;
+            let b = (pixel & 0x1F) as u32;
 
             let out_idx = i * 4;
-            rgba[out_idx] = (r * 255) / 31;
-            rgba[out_idx + 1] = (g * 255) / 63;
-            rgba[out_idx + 2] = (b * 255) / 31;
+            rgba[out_idx] = ((r * 255) / 31) as u8;
+            rgba[out_idx + 1] = ((g * 255) / 63) as u8;
+            rgba[out_idx + 2] = ((b * 255) / 31) as u8;
             rgba[out_idx + 3] = 255;
         }
 
