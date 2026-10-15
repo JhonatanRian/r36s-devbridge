@@ -14,35 +14,41 @@ pub struct LogsTab {
 impl LogsTab {
     pub fn new() -> Self {
         Self {
-            selected_log_type: "retroarch".to_string(),
+            selected_log_type: "emulationstation".to_string(),
             filter_query: String::new(),
             auto_refresh: true,
             last_refresh: Instant::now(),
-            cached_content: "Clique em 'Atualizar Logs' ou ative o auto-refresh...".to_string(),
+            cached_content: "Clique em 'Atualizar Logs' ou aguarde a primeira sincronização...".to_string(),
         }
     }
 
     pub fn render(&mut self, ui: &mut Ui, conn: &ConnectionManager) {
         ui.vertical(|ui| {
-            // Controles superiores
-            ui.horizontal(|ui| {
-                ui.label("Tipo de Log:");
+            // Controles superiores em linha quebrável
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Fonte:");
                 egui::ComboBox::from_label("")
                     .selected_text(&self.selected_log_type)
                     .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.selected_log_type, "emulationstation".to_string(), "EmulationStation (es_log.txt)");
                         ui.selectable_value(&mut self.selected_log_type, "retroarch".to_string(), "RetroArch (retroarch.log)");
+                        ui.selectable_value(&mut self.selected_log_type, "port".to_string(), "Port / Instalador (install.log)");
                         ui.selectable_value(&mut self.selected_log_type, "java".to_string(), "Java / FreeJ2ME (java.log)");
-                        ui.selectable_value(&mut self.selected_log_type, "dmesg".to_string(), "Kernel (dmesg)");
                         ui.selectable_value(&mut self.selected_log_type, "agent".to_string(), "DevBridge Daemon (journal)");
+                        ui.selectable_value(&mut self.selected_log_type, "dmesg".to_string(), "Kernel (dmesg)");
                     });
 
                 ui.separator();
 
-                if ui.button("🔄 Atualizar Logs").clicked() {
+                if ui.button("🔄 Atualizar").clicked() {
                     self.request_logs(conn);
                 }
 
-                ui.checkbox(&mut self.auto_refresh, "Auto-refresh (2s)");
+                if ui.button("🧹 Limpar").clicked() {
+                    self.cached_content.clear();
+                }
+
+                ui.checkbox(&mut self.auto_refresh, "Auto (2s)");
 
                 ui.separator();
 
@@ -54,13 +60,13 @@ impl LogsTab {
                 }
             });
 
-            // Atualização periódica se ativo
+            // Atualização periódica se auto-refresh ativo
             if self.auto_refresh && self.last_refresh.elapsed().as_secs() >= 2 {
                 self.last_refresh = Instant::now();
                 self.request_logs(conn);
             }
 
-            // Verifica se chegou resposta de logs
+            // Verifica se chegou resposta de logs do agente
             if let Some((log_type, content)) = &*conn.last_logs.lock().unwrap() {
                 if log_type == &self.selected_log_type {
                     self.cached_content = content.clone();

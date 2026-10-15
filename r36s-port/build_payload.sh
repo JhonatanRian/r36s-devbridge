@@ -17,8 +17,17 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 cp "$AGENT_BIN" "$TMP_DIR/r36s-agent"
 chmod 755 "$TMP_DIR/r36s-agent"
 cp "$SERVICE_FILE" "$TMP_DIR/r36s-agent.service"
-chmod 644 "$TMP_DIR/r36s-agent.service"
+AGENT_SHA="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
+cat << EOF_MANIFEST > "$TMP_DIR/manifest.json"
+{
+  "version": "0.2.0",
+  "protocol_version": "0.2.0",
+  "architecture": "aarch64",
+  "build_timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
+  "agent_sha256": "$AGENT_SHA"
+}
+EOF_MANIFEST
 
 rm -f "$OUT_ZIP"
-(cd "$TMP_DIR" && zip -q -9 "$OUT_ZIP" r36s-agent r36s-agent.service)
+(cd "$TMP_DIR" && zip -q -9 "$OUT_ZIP" r36s-agent r36s-agent.service manifest.json)
 echo "Payload gerado com sucesso em: $OUT_ZIP ($(ls -lh "$OUT_ZIP" | awk '{print $5}'))"

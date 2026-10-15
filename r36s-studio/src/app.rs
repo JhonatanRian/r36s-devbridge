@@ -4,8 +4,9 @@ use crate::logs_tab::LogsTab;
 use crate::process_tab::ProcessTab;
 use crate::telemetry::TelemetryDashboard;
 use crate::viewport::ViewportRenderer;
-use egui::{Color32, RichText};
+use egui::{Color32, RichText, ScrollArea};
 use std::sync::atomic::Ordering;
+use std::time::Duration;
 
 #[derive(PartialEq)]
 pub enum ActiveTab {
@@ -41,46 +42,60 @@ impl DevBridgeApp {
 
 impl eframe::App for DevBridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Solicita repintura contínua se o stream estiver ativo para 30/60 fps fluidos
+        // Taxa de repintura controlada para fluidez e baixo consumo de CPU
         let is_streaming = self.connection.is_streaming.load(Ordering::Relaxed);
         if is_streaming {
-            ctx.request_repaint();
+            ctx.request_repaint_after(Duration::from_millis(30)); // ~33 FPS
         } else {
-            ctx.request_repaint_after(std::time::Duration::from_millis(100));
+            ctx.request_repaint_after(Duration::from_millis(150));
         }
 
-        // Atualiza frames e telemetria
-        let frame_lock = self.connection.current_frame.lock().unwrap();
-        self.viewport.update_frame(ctx, frame_lock.as_ref());
+        // Drag and drop global de arquivos para a aba de Deploy
+        let dropped_files = ctx.input(|i| i.raw.dropped_files.clone());
+        if let Some(first_file) = dropped_files.first() {
+            if let Some(path) = &first_file.path {
+                self.deploy_tab.set_dropped_file(path.clone());
+                self.current_tab = ActiveTab::Deploy;
+            }
+        }
 
-        let metrics_lock = self.connection.metrics.lock().unwrap();
-        self.telemetry.update_metrics(metrics_lock.as_ref());
+        // Instantâneos rápidos dos Mutexes para liberar threads de rede imediatamente
+        let status_snapshot = self.connection.status.lock().unwrap().clone();
+        let metrics_snapshot = self.connection.metrics.lock().unwrap().clone();
+        let frame_snapshot = self.connection.current_frame.lock().unwrap().clone();
+        let current_fps = *self.connection.current_fps.lock().unwrap();
+        let throughput = *self.connection.throughput_kbps.lock().unwrap();
 
-        let status_lock = self.connection.status.lock().unwrap();
+        // Atualiza textura do viewport e histórico da telemetria
+        self.viewport.update_frame(ctx, frame_snapshot.as_ref());
+        self.telemetry.update_metrics(metrics_snapshot.as_ref());
 
-        // Barra Superior (Header & Navegação)
+        // Barra Superior (Header & Navegação Responsiva)
         egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
             ui.add_space(4.0);
-            ui.horizontal(|ui| {
-                ui.heading("🕹 R36S DevBridge Studio");
+            ui.horizontal_wrapped(|ui| {
+                ui.heading("🕹 R36S DevBridge");
 
                 ui.separator();
 
-                // Status Pill
-                match &*status_lock {
+                // Status Badge
+                match &status_snapshot {
                     ConnectionStatus::Searching { usb_detected, .. } => {
                         let color = if *usb_detected { Color32::from_rgb(255, 200, 0) } else { Color32::from_rgb(255, 80, 80) };
-                        let label = if *usb_detected { "🟡 USB Detectado (Conectando...)" } else { "🔴 Buscando R36S..." };
+                        let label = if *usb_detected { "🟡 USB Detectado" } else { "🔴 Buscando R36S..." };
                         ui.colored_label(color, RichText::new(label).strong());
                     }
-                    ConnectionStatus::Connecting { .. } => {
-                        ui.colored_label(Color32::from_rgb(255, 200, 0), RichText::new("🟡 Conectando...").strong());
+                    ConnectionStatus::Connecting { stage, .. } => {
+                        ui.colored_label(Color32::from_rgb(255, 200, 0), RichText::new(format!("🟡 {}", stage)).strong());
                     }
-                    ConnectionStatus::Connected { target, latency_ms } => {
+                    ConnectionStatus::Connected { target, latency_ms, .. } => {
                         ui.colored_label(
                             Color32::from_rgb(0, 220, 100),
                             RichText::new(format!("🟢 Conectado em {} ({:.1}ms)", target, latency_ms)).strong(),
                         );
+                    }
+                    ConnectionStatus::Error { message } => {
+                        ui.colored_label(Color32::from_rgb(255, 80, 80), RichText::new(format!("Erro: {}", message)).strong());
                     }
                 }
 
@@ -90,7 +105,7 @@ impl eframe::App for DevBridgeApp {
                 let stream_btn_text = if is_streaming {
                     "⏸ Pausar Stream"
                 } else {
-                    "▶ Iniciar Stream (640x480)"
+                    "▶ Iniciar Stream"
                 };
                 if ui.button(RichText::new(stream_btn_text).strong()).clicked() {
                     self.connection.toggle_streaming();
@@ -99,8 +114,8 @@ impl eframe::App for DevBridgeApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.selectable_value(&mut self.current_tab, ActiveTab::Processes, "⚙ Processos");
                     ui.selectable_value(&mut self.current_tab, ActiveTab::Logs, "📜 Logs");
-                    ui.selectable_value(&mut self.current_tab, ActiveTab::Deploy, "📦 Deploy de Jogos");
-                    ui.selectable_value(&mut self.current_tab, ActiveTab::ViewportAndTelemetry, "🖥 Monitor & Viewport");
+                    ui.selectable_value(&mut self.current_tab, ActiveTab::Deploy, "📦 Deploy");
+                    ui.selectable_value(&mut self.current_tab, ActiveTab::ViewportAndTelemetry, "🖥 Monitor & Tela");
                 });
             });
             ui.add_space(4.0);
@@ -109,9 +124,9 @@ impl eframe::App for DevBridgeApp {
         // Barra Inferior (Footer)
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ArkOS R36S Toolkit • RK3326 Cortex-A35 • Mali-G31").small());
+                ui.label(RichText::new("ArkOS R36S Toolkit • RK3326 Cortex-A35 • Mali-G31 • 640x480").small());
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("DevBridge v0.1.0 • Pronto para desenvolvimento").small());
+                    ui.label(RichText::new("DevBridge v0.2.0 • Protocolo Conectado").small());
                 });
             });
         });
@@ -120,13 +135,40 @@ impl eframe::App for DevBridgeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.current_tab {
                 ActiveTab::ViewportAndTelemetry => {
-                    ui.columns(2, |columns| {
-                        // Coluna Esquerda: Telemetria e Hardware
-                        columns[0].set_max_width(380.0);
-                        self.telemetry.render(&mut columns[0], &status_lock, metrics_lock.as_ref());
+                    ui.horizontal(|ui| {
+                        // Coluna Esquerda: Telemetria compacta (largura fixa ~310px com scroll próprio)
+                        ui.allocate_ui_with_layout(
+                            egui::Vec2::new(310.0, ui.available_height()),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                ScrollArea::vertical()
+                                    .auto_shrink([false; 2])
+                                    .show(ui, |ui| {
+                                        self.telemetry.render(
+                                            ui,
+                                            &status_snapshot,
+                                            metrics_snapshot.as_ref(),
+                                            throughput,
+                                        );
+                                    });
+                            },
+                        );
 
-                        // Coluna Direita: Viewport 640x480 da tela
-                        self.viewport.render(&mut columns[1], is_streaming, frame_lock.as_ref());
+                        ui.separator();
+
+                        // Coluna Direita: Viewport 4:3 ocupando todo o espaço restante
+                        ui.allocate_ui_with_layout(
+                            ui.available_size(),
+                            egui::Layout::top_down(egui::Align::Min),
+                            |ui| {
+                                self.viewport.render(
+                                    ui,
+                                    is_streaming,
+                                    current_fps,
+                                    frame_snapshot.as_ref(),
+                                );
+                            },
+                        );
                     });
                 }
                 ActiveTab::Deploy => {
@@ -136,7 +178,7 @@ impl eframe::App for DevBridgeApp {
                     self.logs_tab.render(ui, &self.connection);
                 }
                 ActiveTab::Processes => {
-                    self.process_tab.render(ui, &self.connection, metrics_lock.as_ref());
+                    self.process_tab.render(ui, &self.connection, metrics_snapshot.as_ref());
                 }
             }
         });

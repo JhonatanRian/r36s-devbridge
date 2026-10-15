@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+pub const PROTOCOL_VERSION: &str = "0.2.0";
+
 pub const CONTROL_PORT: u16 = 7365;
 pub const VIDEO_PORT: u16 = 7366;
 
@@ -7,6 +9,7 @@ pub const VIDEO_MAGIC: [u8; 4] = *b"VID0";
 pub const FORMAT_RGB565_LZ4: u8 = 1;
 pub const FORMAT_RGBA8888_LZ4: u8 = 2;
 pub const FORMAT_RAW_RGB565: u8 = 3;
+pub const FORMAT_BGRA8888_LZ4: u8 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessInfo {
@@ -14,6 +17,8 @@ pub struct ProcessInfo {
     pub name: String,
     pub cmdline: String,
     pub memory_mb: u64,
+    #[serde(default)]
+    pub cpu_percent: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,21 +26,31 @@ pub struct SystemMetrics {
     pub timestamp: u64,
     pub cpu_usage: f32,
     pub cpu_freq_mhz: Vec<u32>,
-    pub cpu_temp_c: f32,
+    pub cpu_temp_c: Option<f32>,
     pub ram_used_mb: u64,
     pub ram_total_mb: u64,
     pub mali_gpu_load: Option<f32>,
     pub mali_gpu_freq_mhz: Option<u32>,
     pub active_game: Option<String>,
     pub running_processes: Vec<ProcessInfo>,
+    pub fb_width: u16,
+    pub fb_height: u16,
+    pub fb_bpp: u8,
+    pub fb_format: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ClientCommand {
+    Handshake {
+        client_version: String,
+        client_id: String,
+    },
     Ping,
     GetMetrics,
-    StartStream { target_fps: u32 },
+    StartStream {
+        target_fps: u32,
+    },
     StopStream,
     DeployStart {
         relative_path: String,
@@ -62,16 +77,49 @@ pub enum ClientCommand {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServerResponse {
+    HandshakeAck {
+        agent_version: String,
+        protocol_version: String,
+        compatible: bool,
+        fb_width: u16,
+        fb_height: u16,
+        fb_bpp: u8,
+        fb_format: u8,
+    },
     Pong,
     Metrics(SystemMetrics),
-    StreamStatus { active: bool, fps: u32 },
-    DeployProgress { status: String, message: String },
-    DeploySuccess { path: String, sha256: String },
-    DeployError { error: String },
-    LogsResponse { log_type: String, content: String },
-    KillResult { pid: u32, success: bool, message: String },
-    RestartESResult { success: bool, message: String },
-    Error { message: String },
+    StreamStatus {
+        active: bool,
+        fps: u32,
+    },
+    DeployProgress {
+        status: String,
+        message: String,
+        chunk_index: u32,
+    },
+    DeploySuccess {
+        path: String,
+        sha256: String,
+    },
+    DeployError {
+        error: String,
+    },
+    LogsResponse {
+        log_type: String,
+        content: String,
+    },
+    KillResult {
+        pid: u32,
+        success: bool,
+        message: String,
+    },
+    RestartESResult {
+        success: bool,
+        message: String,
+    },
+    Error {
+        message: String,
+    },
 }
 
 #[repr(C, packed)]

@@ -3,10 +3,10 @@ use crate::framebuffer::FramebufferReader;
 use crate::metrics::MetricsCollector;
 use crate::process::ProcessManager;
 use crate::protocol::*;
-use std::io::{BufRead, BufReader, Read, Write};
+use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -14,27 +14,34 @@ pub struct AgentServer {
     streaming_enabled: Arc<AtomicBool>,
     target_fps: Arc<AtomicU32>,
     metrics_collector: Arc<MetricsCollector>,
+    fb_reader: Arc<Mutex<FramebufferReader>>,
 }
 
 impl AgentServer {
     pub fn new() -> Self {
+        let reader = FramebufferReader::new();
+        let metrics = Arc::new(MetricsCollector::new());
+        metrics.set_fb_info(reader.width, reader.height, reader.bpp, reader.format);
+
         Self {
             streaming_enabled: Arc::new(AtomicBool::new(false)),
             target_fps: Arc::new(AtomicU32::new(30)),
-            metrics_collector: Arc::new(MetricsCollector::new()),
+            metrics_collector: metrics,
+            fb_reader: Arc::new(Mutex::new(reader)),
         }
     }
 
     pub fn start(&self) {
-        println!("[r36s-agent] Iniciando servidor DevBridge...");
+        println!("[r36s-agent] Iniciando servidor DevBridge v{}...", PROTOCOL_VERSION);
         println!("[r36s-agent] Porta de Controle: {}", CONTROL_PORT);
         println!("[r36s-agent] Porta de Vídeo:    {}", VIDEO_PORT);
 
         // Thread para streaming de vídeo
         let streaming_flag = Arc::clone(&self.streaming_enabled);
         let target_fps = Arc::clone(&self.target_fps);
+        let fb_reader_cl = Arc::clone(&self.fb_reader);
         thread::spawn(move || {
-            Self::video_stream_worker(streaming_flag, target_fps);
+            Self::video_stream_worker(streaming_flag, target_fps, fb_reader_cl);
         });
 
         // Watchdog leve para manter interface usb0 UP com IP estático 192.168.7.2
@@ -48,7 +55,7 @@ impl AgentServer {
                         .args(["-4", "address", "replace", "192.168.7.2/24", "dev", "usb0"])
                         .output();
                 }
-                thread::sleep(Duration::from_secs(3));
+                thread::sleep(Duration::from_secs(4));
             }
         });
 
@@ -79,7 +86,26 @@ impl AgentServer {
         target_fps: Arc<AtomicU32>,
         metrics: Arc<MetricsCollector>,
     ) {
-        println!("[r36s-agent] Cliente de controle conectado: {:?}", stream.peer_addr());
+        let peer_addr = stream.peer_addr().ok();
+        println!("[r36s-agent] Cliente de controle conectado: {:?}", peer_addr);
+
+        // Validação de segurança: permitir somente loopback ou rede USB 192.168.7.*
+        if let Some(ref addr) = peer_addr {
+            let ip = addr.ip();
+            let is_allowed = ip.is_loopback() || match ip {
+                std::net::IpAddr::V4(v4) => {
+                    let oct = v4.octets();
+                    oct[0] == 192 && oct[1] == 168 && oct[2] == 7
+                }
+                _ => false,
+            };
+
+            if !is_allowed {
+                eprintln!("[r36s-agent] Conexão rejeitada por segurança (IP não autorizado: {})", ip);
+                return;
+            }
+        }
+
         let _ = stream.set_nodelay(true);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut writer = stream;
@@ -99,6 +125,19 @@ impl AgentServer {
 
             let response = match serde_json::from_str::<ClientCommand>(trimmed) {
                 Ok(cmd) => match cmd {
+                    ClientCommand::Handshake { client_version, client_id } => {
+                        println!("[r36s-agent] Handshake recebido: id={}, versão={}", client_id, client_version);
+                        let (fb_w, fb_h, fb_bpp, fb_fmt) = metrics.get_fb_info();
+                        ServerResponse::HandshakeAck {
+                            agent_version: env!("CARGO_PKG_VERSION").to_string(),
+                            protocol_version: PROTOCOL_VERSION.to_string(),
+                            compatible: true,
+                            fb_width: fb_w,
+                            fb_height: fb_h,
+                            fb_bpp: fb_bpp,
+                            fb_format: fb_fmt,
+                        }
+                    }
                     ClientCommand::Ping => ServerResponse::Pong,
                     ClientCommand::GetMetrics => {
                         let data = metrics.collect();
@@ -123,6 +162,7 @@ impl AgentServer {
                         Ok(msg) => ServerResponse::DeployProgress {
                             status: "in_progress".to_string(),
                             message: msg,
+                            chunk_index: 0,
                         },
                         Err(e) => ServerResponse::DeployError { error: e },
                     },
@@ -142,6 +182,7 @@ impl AgentServer {
                             Ok(written) => ServerResponse::DeployProgress {
                                 status: "chunk_ok".to_string(),
                                 message: format!("Bytes recebidos: {}", written),
+                                chunk_index,
                             },
                             Err(e) => ServerResponse::DeployError { error: e },
                         }
@@ -193,18 +234,26 @@ impl AgentServer {
         println!("[r36s-agent] Cliente de controle desconectado.");
     }
 
-    fn video_stream_worker(streaming_flag: Arc<AtomicBool>, target_fps: Arc<AtomicU32>) {
+    fn video_stream_worker(
+        streaming_flag: Arc<AtomicBool>,
+        target_fps: Arc<AtomicU32>,
+        fb_reader: Arc<Mutex<FramebufferReader>>,
+    ) {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", VIDEO_PORT))
             .expect("Falha ao abrir porta de vídeo");
-
-        let mut fb_reader = FramebufferReader::new();
 
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
                     println!("[r36s-agent] Cliente de vídeo conectado: {:?}", stream.peer_addr());
                     let _ = stream.set_nodelay(true);
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(100)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+
+                    // Reseta sessão para forçar keyframe no início de cada nova conexão
+                    {
+                        let mut reader = fb_reader.lock().unwrap();
+                        reader.reset_session();
+                    }
 
                     let mut frame_index: u32 = 0;
                     loop {
@@ -216,7 +265,11 @@ impl AgentServer {
                         let fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
                         let frame_duration = Duration::from_millis(1000 / fps as u64);
 
-                        let (width, height, format, flags, compressed) = fb_reader.capture_frame();
+                        let (width, height, format, flags, compressed) = {
+                            let mut reader = fb_reader.lock().unwrap();
+                            reader.capture_frame()
+                        };
+
                         frame_index = frame_index.wrapping_add(1);
 
                         let header = VideoFrameHeader::new(
@@ -228,13 +281,17 @@ impl AgentServer {
                             compressed.len() as u32,
                         );
 
-                        // Envia cabeçalho (20 bytes) + payload comprimido
+                        // Envia cabeçalho (20 bytes)
                         let header_bytes = header.to_bytes();
                         if stream.write_all(&header_bytes).is_err() {
                             break;
                         }
-                        if stream.write_all(&compressed).is_err() {
-                            break;
+
+                        // Se payload comprimido não estiver vazio (flags != 1), envia dados
+                        if !compressed.is_empty() {
+                            if stream.write_all(&compressed).is_err() {
+                                break;
+                            }
                         }
 
                         thread::sleep(frame_duration);
@@ -259,7 +316,6 @@ impl ServerResponse {
     }
 }
 
-// Implementação simples de base64 decode sem crates externas pesadas
 fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
     const TABLE: [i8; 256] = {
         let mut t = [-1i8; 256];

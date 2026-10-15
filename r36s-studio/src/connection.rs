@@ -1,8 +1,9 @@
 use crate::protocol::*;
+use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -11,8 +12,9 @@ use std::time::{Duration, Instant};
 #[derive(Debug, Clone, PartialEq)]
 pub enum ConnectionStatus {
     Searching { usb_detected: bool, message: String },
-    Connecting { target: String },
-    Connected { target: String, latency_ms: f32 },
+    Connecting { target: String, stage: String },
+    Connected { target: String, latency_ms: f32, agent_version: String },
+    Error { message: String },
 }
 
 #[derive(Clone)]
@@ -32,6 +34,12 @@ pub struct ConnectionManager {
     pub deploy_status: Arc<Mutex<Option<String>>>,
     pub deploy_progress: Arc<Mutex<f32>>,
     pub is_streaming: Arc<AtomicBool>,
+    pub current_fps: Arc<Mutex<f32>>,
+    pub throughput_kbps: Arc<Mutex<f32>>,
+    pub diag_logs: Arc<Mutex<Vec<String>>>,
+    pub last_process_result: Arc<Mutex<Option<(bool, String)>>>,
+    pub total_bytes_rx: Arc<AtomicU64>,
+    pub total_bytes_tx: Arc<AtomicU64>,
     cmd_sender: Sender<ClientCommand>,
 }
 
@@ -47,6 +55,12 @@ impl ConnectionManager {
         let deploy_status = Arc::new(Mutex::new(None));
         let deploy_progress = Arc::new(Mutex::new(0.0));
         let is_streaming = Arc::new(AtomicBool::new(false));
+        let current_fps = Arc::new(Mutex::new(0.0));
+        let throughput_kbps = Arc::new(Mutex::new(0.0));
+        let diag_logs = Arc::new(Mutex::new(Vec::new()));
+        let last_process_result = Arc::new(Mutex::new(None));
+        let total_bytes_rx = Arc::new(AtomicU64::new(0));
+        let total_bytes_tx = Arc::new(AtomicU64::new(0));
 
         let (cmd_tx, cmd_rx) = channel::<ClientCommand>();
 
@@ -58,8 +72,30 @@ impl ConnectionManager {
             deploy_status: Arc::clone(&deploy_status),
             deploy_progress: Arc::clone(&deploy_progress),
             is_streaming: Arc::clone(&is_streaming),
+            current_fps: Arc::clone(&current_fps),
+            throughput_kbps: Arc::clone(&throughput_kbps),
+            diag_logs: Arc::clone(&diag_logs),
+            last_process_result: Arc::clone(&last_process_result),
+            total_bytes_rx: Arc::clone(&total_bytes_rx),
+            total_bytes_tx: Arc::clone(&total_bytes_tx),
             cmd_sender: cmd_tx,
         };
+
+        // Thread medidora de throughput KB/s
+        let rx_cnt = Arc::clone(&total_bytes_rx);
+        let kbps_lock = Arc::clone(&throughput_kbps);
+        thread::spawn(move || {
+            let mut last_rx = 0u64;
+            loop {
+                thread::sleep(Duration::from_millis(1000));
+                let cur = rx_cnt.load(Ordering::Relaxed);
+                let diff = cur.saturating_sub(last_rx);
+                last_rx = cur;
+                let kbps = (diff as f32) / 1024.0;
+                let mut lock = kbps_lock.lock().unwrap();
+                *lock = kbps;
+            }
+        });
 
         // Thread de controle e telemetria
         let status_cl = Arc::clone(&status);
@@ -67,6 +103,11 @@ impl ConnectionManager {
         let logs_cl = Arc::clone(&last_logs);
         let deploy_st_cl = Arc::clone(&deploy_status);
         let is_streaming_cl = Arc::clone(&is_streaming);
+        let diag_cl = Arc::clone(&diag_logs);
+        let proc_res_cl = Arc::clone(&last_process_result);
+        let bytes_tx_cl = Arc::clone(&total_bytes_tx);
+        let bytes_rx_cl = Arc::clone(&total_bytes_rx);
+
         thread::spawn(move || {
             Self::control_worker(
                 cmd_rx,
@@ -75,6 +116,10 @@ impl ConnectionManager {
                 logs_cl,
                 deploy_st_cl,
                 is_streaming_cl,
+                diag_cl,
+                proc_res_cl,
+                bytes_tx_cl,
+                bytes_rx_cl,
             );
         });
 
@@ -82,8 +127,12 @@ impl ConnectionManager {
         let frame_cl = Arc::clone(&current_frame);
         let is_streaming_vid = Arc::clone(&is_streaming);
         let status_vid = Arc::clone(&status);
+        let fps_cl = Arc::clone(&current_fps);
+        let vid_rx = Arc::clone(&total_bytes_rx);
+        let vid_diag = Arc::clone(&diag_logs);
+
         thread::spawn(move || {
-            Self::video_worker(frame_cl, is_streaming_vid, status_vid);
+            Self::video_worker(frame_cl, is_streaming_vid, status_vid, fps_cl, vid_rx, vid_diag);
         });
 
         mgr
@@ -101,11 +150,21 @@ impl ConnectionManager {
             self.send_command(ClientCommand::StartStream { target_fps: 30 });
         } else {
             self.send_command(ClientCommand::StopStream);
+            let mut fps = self.current_fps.lock().unwrap();
+            *fps = 0.0;
         }
     }
 
-    fn check_usb_device() -> bool {
-        // Varre interfaces de rede USB no Linux
+    fn add_diag(diag: &Arc<Mutex<Vec<String>>>, msg: &str) {
+        let line = format!("[{}] {}", chrono_time(), msg);
+        let mut d = diag.lock().unwrap();
+        if d.len() > 100 {
+            d.remove(0);
+        }
+        d.push(line);
+    }
+
+    fn check_usb_device(diag: &Arc<Mutex<Vec<String>>>) -> (bool, String) {
         if let Ok(entries) = fs::read_dir("/sys/class/net") {
             for entry in entries.flatten() {
                 let name = entry.file_name();
@@ -121,22 +180,23 @@ impl ConnectionManager {
                         || drv_name == "cdc_ncm"
                         || drv_name == "usbnet"
                     {
-                        Self::ensure_host_ip(&name_str);
-                        return true;
+                        Self::ensure_host_ip(&name_str, diag);
+                        return (true, name_str.to_string());
                     }
                 }
             }
         }
-        false
+        (false, String::new())
     }
 
-    fn ensure_host_ip(ifname: &str) {
+    fn ensure_host_ip(ifname: &str, diag: &Arc<Mutex<Vec<String>>>) {
         if let Ok(output) = std::process::Command::new("nmcli")
             .args(["-g", "IP4.ADDRESS", "dev", "show", ifname])
             .output()
         {
             let text = String::from_utf8_lossy(&output.stdout);
             if !text.contains("192.168.7.") {
+                Self::add_diag(diag, &format!("Configurando IP 192.168.7.1 na interface {}", ifname));
                 if let Ok(conn_out) = std::process::Command::new("nmcli")
                     .args(["-g", "GENERAL.CONNECTION", "dev", "show", ifname])
                     .output()
@@ -169,6 +229,10 @@ impl ConnectionManager {
         logs: Arc<Mutex<Option<(String, String)>>>,
         deploy_status: Arc<Mutex<Option<String>>>,
         is_streaming: Arc<AtomicBool>,
+        diag: Arc<Mutex<Vec<String>>>,
+        proc_result: Arc<Mutex<Option<(bool, String)>>>,
+        bytes_tx: Arc<AtomicU64>,
+        bytes_rx: Arc<AtomicU64>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, CONTROL_PORT)
@@ -176,37 +240,94 @@ impl ConnectionManager {
             .unwrap();
 
         loop {
-            // Fase 1: Descoberta e tentativa de conexão
-            let usb_found = Self::check_usb_device();
+            // Fase 1: Descoberta USB
+            let (usb_found, ifname) = Self::check_usb_device(&diag);
             {
                 let mut st = status.lock().unwrap();
                 *st = ConnectionStatus::Searching {
                     usb_detected: usb_found,
                     message: if usb_found {
-                        format!("Interface USB detectada. Conectando em {}...", target_ip)
+                        format!("Interface USB detectada ({})", ifname)
                     } else {
                         "Procurando R36S... Conecte o cabo na porta OTG".to_string()
                     },
                 };
             }
 
-            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(800)) {
+            if !usb_found {
+                thread::sleep(Duration::from_millis(800));
+                continue;
+            }
+
+            // Fase 2: Conexão TCP
+            {
+                let mut st = status.lock().unwrap();
+                *st = ConnectionStatus::Connecting {
+                    target: target_ip.to_string(),
+                    stage: "Abrindo socket TCP...".to_string(),
+                };
+            }
+
+            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(900)) {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
                     let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
 
+                    // Fase 3: Handshake de protocolo
+                    {
+                        let mut st = status.lock().unwrap();
+                        *st = ConnectionStatus::Connecting {
+                            target: target_ip.to_string(),
+                            stage: "Autenticando e verificando protocolo...".to_string(),
+                        };
+                    }
+
+                    let handshake_cmd = ClientCommand::Handshake {
+                        client_version: env!("CARGO_PKG_VERSION").to_string(),
+                        client_id: "r36s-studio-pc".to_string(),
+                    };
+
+                    let mut handshake_ok = false;
+                    let mut agent_ver = "desconhecida".to_string();
+
+                    if Self::send_raw_cmd(&stream, &handshake_cmd, &bytes_tx).is_ok() {
+                        let mut reader = BufReader::new(stream.try_clone().unwrap());
+                        let mut line = String::new();
+                        if reader.read_line(&mut line).is_ok() && !line.is_empty() {
+                            bytes_rx.fetch_add(line.len() as u64, Ordering::Relaxed);
+                            if let Ok(ServerResponse::HandshakeAck { agent_version, fb_width, fb_height, fb_bpp, fb_format, .. }) = serde_json::from_str(&line) {
+                                agent_ver = agent_version;
+                                handshake_ok = true;
+                                Self::add_diag(
+                                    &diag,
+                                    &format!(
+                                        "Conectado ao R36S! Agente v{}, FB: {}x{} @ {} bpp (fmt {})",
+                                        agent_ver, fb_width, fb_height, fb_bpp, fb_format
+                                    ),
+                                );
+                            }
+                        }
+                    }
+
+                    if !handshake_ok {
+                        Self::add_diag(&diag, "Falha no handshake inicial com o daemon; tentando novamente...");
+                        thread::sleep(Duration::from_millis(800));
+                        continue;
+                    }
+
                     {
                         let mut st = status.lock().unwrap();
                         *st = ConnectionStatus::Connected {
                             target: target_ip.to_string(),
-                            latency_ms: 1.0,
+                            latency_ms: 0.5,
+                            agent_version: agent_ver,
                         };
                     }
 
-                    // Se streaming estiver ativo, reinicia stream no agente
+                    // Se streaming já estiver ativo, solicita início no agente
                     if is_streaming.load(Ordering::Relaxed) {
-                        let _ = Self::send_raw_cmd(&stream, &ClientCommand::StartStream { target_fps: 30 });
+                        let _ = Self::send_raw_cmd(&stream, &ClientCommand::StartStream { target_fps: 30 }, &bytes_tx);
                     }
 
                     Self::run_control_session(
@@ -216,6 +337,10 @@ impl ConnectionManager {
                         &metrics,
                         &logs,
                         &deploy_status,
+                        &proc_result,
+                        &diag,
+                        &bytes_tx,
+                        &bytes_rx,
                     );
                 }
                 Err(_) => {
@@ -232,24 +357,31 @@ impl ConnectionManager {
         metrics: &Arc<Mutex<Option<SystemMetrics>>>,
         logs: &Arc<Mutex<Option<(String, String)>>>,
         deploy_status: &Arc<Mutex<Option<String>>>,
+        proc_result: &Arc<Mutex<Option<(bool, String)>>>,
+        diag: &Arc<Mutex<Vec<String>>>,
+        bytes_tx: &Arc<AtomicU64>,
+        bytes_rx: &Arc<AtomicU64>,
     ) {
         let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut last_metrics_req = Instant::now();
         let mut response_buf = String::new();
 
         loop {
-            // Verifica comandos pendentes na fila
+            // Processa comandos pendentes na fila
             while let Ok(cmd) = cmd_rx.try_recv() {
-                if Self::send_raw_cmd(&stream, &cmd).is_err() {
+                if Self::send_raw_cmd(&stream, &cmd, bytes_tx).is_err() {
                     return;
                 }
                 response_buf.clear();
                 if reader.read_line(&mut response_buf).is_ok() {
+                    bytes_rx.fetch_add(response_buf.len() as u64, Ordering::Relaxed);
                     Self::process_response(
                         &response_buf,
                         metrics,
                         logs,
                         deploy_status,
+                        proc_result,
+                        diag,
                     );
                 }
             }
@@ -258,13 +390,14 @@ impl ConnectionManager {
             if last_metrics_req.elapsed() >= Duration::from_millis(1000) {
                 last_metrics_req = Instant::now();
                 let start_ping = Instant::now();
-                if Self::send_raw_cmd(&stream, &ClientCommand::GetMetrics).is_err() {
+                if Self::send_raw_cmd(&stream, &ClientCommand::GetMetrics, bytes_tx).is_err() {
                     return;
                 }
 
                 response_buf.clear();
                 match reader.read_line(&mut response_buf) {
                     Ok(n) if n > 0 => {
+                        bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
                         let latency = start_ping.elapsed().as_secs_f32() * 1000.0;
                         {
                             let mut st = status.lock().unwrap();
@@ -277,6 +410,8 @@ impl ConnectionManager {
                             metrics,
                             logs,
                             deploy_status,
+                            proc_result,
+                            diag,
                         );
                     }
                     _ => return, // Desconectou
@@ -287,10 +422,12 @@ impl ConnectionManager {
         }
     }
 
-    fn send_raw_cmd(mut writer: &TcpStream, cmd: &ClientCommand) -> Result<(), std::io::Error> {
+    fn send_raw_cmd(mut writer: &TcpStream, cmd: &ClientCommand, bytes_tx: &Arc<AtomicU64>) -> Result<(), std::io::Error> {
         let mut json = serde_json::to_string(cmd).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
         json.push('\n');
-        writer.write_all(json.as_bytes())?;
+        let b = json.as_bytes();
+        bytes_tx.fetch_add(b.len() as u64, Ordering::Relaxed);
+        writer.write_all(b)?;
         writer.flush()
     }
 
@@ -299,6 +436,8 @@ impl ConnectionManager {
         metrics: &Arc<Mutex<Option<SystemMetrics>>>,
         logs: &Arc<Mutex<Option<(String, String)>>>,
         deploy_status: &Arc<Mutex<Option<String>>>,
+        proc_result: &Arc<Mutex<Option<(bool, String)>>>,
+        _diag: &Arc<Mutex<Vec<String>>>,
     ) {
         if let Ok(resp) = serde_json::from_str::<ServerResponse>(raw.trim()) {
             match resp {
@@ -310,25 +449,26 @@ impl ConnectionManager {
                     let mut l = logs.lock().unwrap();
                     *l = Some((log_type, content));
                 }
-                ServerResponse::DeployProgress { status, message } => {
+                ServerResponse::DeployProgress { status, message, chunk_index } => {
                     let mut d = deploy_status.lock().unwrap();
-                    *d = Some(format!("[{}] {}", status, message));
+                    *d = Some(format!("[Chunk {} - {}] {}", chunk_index, status, message));
                 }
                 ServerResponse::DeploySuccess { path, sha256 } => {
                     let mut d = deploy_status.lock().unwrap();
-                    *d = Some(format!("Sucesso! Arquivo gravado em {} (SHA-256: {})", path, &sha256[0..8]));
+                    let short_sha = if sha256.len() >= 8 { &sha256[0..8] } else { &sha256 };
+                    *d = Some(format!("Sucesso! Arquivo gravado em {} (SHA: {})", path, short_sha));
                 }
                 ServerResponse::DeployError { error } => {
                     let mut d = deploy_status.lock().unwrap();
                     *d = Some(format!("ERRO no Deploy: {}", error));
                 }
-                ServerResponse::KillResult { message, .. } => {
-                    let mut d = deploy_status.lock().unwrap();
-                    *d = Some(message);
+                ServerResponse::KillResult { pid, success, message } => {
+                    let mut p = proc_result.lock().unwrap();
+                    *p = Some((success, format!("[PID {}] {}", pid, message)));
                 }
-                ServerResponse::RestartESResult { message, .. } => {
-                    let mut d = deploy_status.lock().unwrap();
-                    *d = Some(message);
+                ServerResponse::RestartESResult { success, message } => {
+                    let mut p = proc_result.lock().unwrap();
+                    *p = Some((success, message));
                 }
                 _ => {}
             }
@@ -339,6 +479,9 @@ impl ConnectionManager {
         current_frame: Arc<Mutex<Option<DecodedFrame>>>,
         is_streaming: Arc<AtomicBool>,
         status: Arc<Mutex<ConnectionStatus>>,
+        current_fps: Arc<Mutex<f32>>,
+        bytes_rx: Arc<AtomicU64>,
+        diag: Arc<Mutex<Vec<String>>>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, VIDEO_PORT)
@@ -346,17 +489,15 @@ impl ConnectionManager {
             .unwrap();
 
         let mut header_buf = [0u8; 20];
-        let mut comp_buf = Vec::with_capacity(640 * 480 * 2);
-        let mut last_raw_rgb565 = vec![0u8; 640 * 480 * 2];
+        let mut comp_buf = Vec::with_capacity(640 * 480 * 4);
+        let mut frame_times: VecDeque<Instant> = VecDeque::with_capacity(70);
 
         loop {
-            // Só conecta o canal de vídeo se estivermos com streaming ativo
             if !is_streaming.load(Ordering::Relaxed) {
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
 
-            // Só tenta conectar se o controle principal estiver conectado
             let is_connected = {
                 let st = status.lock().unwrap();
                 matches!(*st, ConnectionStatus::Connected { .. })
@@ -367,15 +508,17 @@ impl ConnectionManager {
                 continue;
             }
 
-            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(800)) {
+            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(900)) {
                 Ok(mut stream) => {
                     let _ = stream.set_nodelay(true);
                     let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+                    Self::add_diag(&diag, "Canal de vídeo TCP conectado.");
 
                     while is_streaming.load(Ordering::Relaxed) {
                         if stream.read_exact(&mut header_buf).is_err() {
                             break;
                         }
+                        bytes_rx.fetch_add(20, Ordering::Relaxed);
 
                         if let Some(header) = VideoFrameHeader::from_bytes(&header_buf) {
                             let size = header.compressed_size as usize;
@@ -383,41 +526,67 @@ impl ConnectionManager {
                                 break;
                             }
 
+                            // Cálculo de bytes esperados após descompressão baseado no formato real
+                            let bytes_per_pixel = if header.format == FORMAT_RGB565_LZ4 { 2 } else { 4 };
+                            let expected_uncompressed = (header.width as usize) * (header.height as usize) * bytes_per_pixel;
+
+                            // Flag == 1: Quadro idêntico ao anterior (tela inalterada)
+                            if header.flags == 1 {
+                                let now = Instant::now();
+                                frame_times.push_back(now);
+                                Self::update_fps(&mut frame_times, &current_fps);
+                                continue;
+                            }
+
+                            // Flag == 2: Framebuffer inacessível no console
+                            if header.flags == 2 {
+                                Self::add_diag(&diag, "Aviso: Framebuffer inacessível no R36S");
+                                thread::sleep(Duration::from_millis(100));
+                                continue;
+                            }
+
                             comp_buf.resize(size, 0);
                             if stream.read_exact(&mut comp_buf).is_err() {
                                 break;
                             }
+                            bytes_rx.fetch_add(size as u64, Ordering::Relaxed);
 
-                            // Se flag == 1 (unchanged), mantém o último frame sem reprocessar
-                            if header.flags == 1 {
-                                continue;
-                            }
+                            // Descompacta LZ4 com o tamanho correto do formato do frame
+                            match lz4_flex::decompress(&comp_buf, expected_uncompressed) {
+                                Ok(decomp_buf) => {
+                                    // Converte para RGBA8888 de acordo com o formato de entrada
+                                    let rgba = match header.format {
+                                        FORMAT_RGB565_LZ4 => Self::rgb565_to_rgba(&decomp_buf, header.width as usize, header.height as usize),
+                                        FORMAT_BGRA8888_LZ4 => Self::bgra_to_rgba(&decomp_buf),
+                                        _ => decomp_buf, // FORMAT_RGBA8888_LZ4 já é RGBA
+                                    };
 
-                            // Descompacta LZ4
-                            if let Ok(decompressed) = lz4_flex::decompress(&comp_buf, (header.width as usize) * (header.height as usize) * 2) {
-                                last_raw_rgb565 = decompressed;
-                            } else if header.format == FORMAT_RGB565_LZ4 {
-                                // Fallback se descompressão rápida com tamanho exato falhar
-                                if let Ok(decompressed) = lz4_flex::decompress_size_prepended(&comp_buf) {
-                                    last_raw_rgb565 = decompressed;
+                                    let frame = DecodedFrame {
+                                        frame_index: header.frame_index,
+                                        width: header.width,
+                                        height: header.height,
+                                        rgba_data: rgba,
+                                        timestamp: Instant::now(),
+                                    };
+
+                                    {
+                                        let mut lock = current_frame.lock().unwrap();
+                                        *lock = Some(frame);
+                                    }
+
+                                    let now = Instant::now();
+                                    frame_times.push_back(now);
+                                    Self::update_fps(&mut frame_times, &current_fps);
+                                }
+                                Err(e) => {
+                                    Self::add_diag(&diag, &format!("Erro na descompressão LZ4: {}", e));
                                 }
                             }
-
-                            // Converte RGB565 para RGBA8888
-                            let rgba = Self::rgb565_to_rgba(&last_raw_rgb565, header.width as usize, header.height as usize);
-
-                            let frame = DecodedFrame {
-                                frame_index: header.frame_index,
-                                width: header.width,
-                                height: header.height,
-                                rgba_data: rgba,
-                                timestamp: Instant::now(),
-                            };
-
-                            let mut lock = current_frame.lock().unwrap();
-                            *lock = Some(frame);
                         }
                     }
+                    Self::add_diag(&diag, "Canal de vídeo desconectado.");
+                    let mut fps = current_fps.lock().unwrap();
+                    *fps = 0.0;
                 }
                 Err(_) => {
                     thread::sleep(Duration::from_millis(500));
@@ -426,7 +595,21 @@ impl ConnectionManager {
         }
     }
 
-    fn rgb565_to_rgba(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {
+    fn update_fps(frame_times: &mut VecDeque<Instant>, current_fps: &Arc<Mutex<f32>>) {
+        let now = Instant::now();
+        while let Some(&front) = frame_times.front() {
+            if now.duration_since(front) > Duration::from_millis(1000) {
+                frame_times.pop_front();
+            } else {
+                break;
+            }
+        }
+        let fps = frame_times.len() as f32;
+        let mut lock = current_fps.lock().unwrap();
+        *lock = fps;
+    }
+
+    pub fn rgb565_to_rgba(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {
         let total_pixels = width * height;
         let mut rgba = vec![255u8; total_pixels * 4];
 
@@ -451,4 +634,24 @@ impl ConnectionManager {
 
         rgba
     }
+
+    pub fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+        let mut rgba = bgra.to_vec();
+        for chunk in rgba.chunks_exact_mut(4) {
+            let b = chunk[0];
+            let r = chunk[2];
+            chunk[0] = r;
+            chunk[2] = b;
+        }
+        rgba
+    }
+}
+
+fn chrono_time() -> String {
+    use std::time::SystemTime;
+    let now = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_secs();
+    let sec = now % 60;
+    let min = (now / 60) % 60;
+    let hr = (now / 3600) % 24;
+    format!("{:02}:{:02}:{:02}", hr, min, sec)
 }

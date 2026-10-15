@@ -66,6 +66,12 @@ if [ -n "$BOOT" ] && [ -f "$BOOT/rk3326-r35s-linux.dtb" ]; then
 
     if [[ "$DTB_STATE" != *"dr_mode=peripheral"* ]]; then
         echo "Aplicando patch periférico no DTB..."
+        mkdir -p "$DEST_DEVBRIDGE/backup"
+        if [ ! -f "$DEST_DEVBRIDGE/backup/original.dtb" ]; then
+            cp -p "$BOOT/rk3326-r35s-linux.dtb" "$DEST_DEVBRIDGE/backup/original.dtb"
+            sha256sum "$BOOT/rk3326-r35s-linux.dtb" > "$DEST_DEVBRIDGE/backup/metadata.txt"
+            echo "[OK] Backup do DTB original criado em $DEST_DEVBRIDGE/backup/original.dtb"
+        fi
         TMP_DTB="$(mktemp)"
         python3 "$SCRIPT_DIR/r36s-port/patch_dtb_usb.py" patch "$BOOT/rk3326-r35s-linux.dtb" "$TMP_DTB"
         cp -f "$TMP_DTB" "$BOOT/rk3326-r35s-linux.dtb"
