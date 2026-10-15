@@ -6,6 +6,9 @@ Wants=network.target
 [Service]
 Type=simple
 User=root
+ExecStartPre=-/sbin/modprobe dwc2
+ExecStartPre=-/sbin/modprobe g_ether
+ExecStartPre=-/bin/sh -c 'sleep 1; /sbin/ip link set dev usb0 up 2>/dev/null && /sbin/ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true'
 ExecStart=/usr/local/bin/r36s-agent
 Restart=always
 RestartSec=3
@@ -15,3 +18,4 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
+

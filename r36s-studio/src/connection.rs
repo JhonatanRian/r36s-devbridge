@@ -149,6 +149,13 @@ impl ConnectionManager {
                         let _ = std::process::Command::new("nmcli")
                             .args(["connection", "up", &conn_name])
                             .output();
+                    } else {
+                        let _ = std::process::Command::new("nmcli")
+                            .args(["connection", "add", "type", "ethernet", "ifname", ifname, "con-name", "R36S-DevBridge", "ip4", "192.168.7.1/24"])
+                            .output();
+                        let _ = std::process::Command::new("nmcli")
+                            .args(["connection", "up", "R36S-DevBridge"])
+                            .output();
                     }
                 }
             }

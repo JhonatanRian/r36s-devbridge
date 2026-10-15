@@ -37,6 +37,21 @@ impl AgentServer {
             Self::video_stream_worker(streaming_flag, target_fps);
         });
 
+        // Watchdog leve para manter interface usb0 UP com IP estático 192.168.7.2
+        thread::spawn(|| {
+            loop {
+                if std::path::Path::new("/sys/class/net/usb0").exists() {
+                    let _ = std::process::Command::new("/sbin/ip")
+                        .args(["link", "set", "dev", "usb0", "up"])
+                        .output();
+                    let _ = std::process::Command::new("/sbin/ip")
+                        .args(["-4", "address", "replace", "192.168.7.2/24", "dev", "usb0"])
+                        .output();
+                }
+                thread::sleep(Duration::from_secs(3));
+            }
+        });
+
         // Thread principal: Listener de comandos
         let listener = TcpListener::bind(format!("0.0.0.0:{}", CONTROL_PORT))
             .expect("Falha ao abrir porta de controle");

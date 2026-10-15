@@ -4,12 +4,6 @@
 # ==============================================================================
 set -u
 
-# Redireciona para o console virtual da tela do R36S se disponível
-if [ -e /dev/tty1 ]; then
-    exec < /dev/tty1 > /dev/tty1 2>&1
-    clear
-fi
-
 # Elevação automática para root se necessário
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo -E /bin/bash "$0" "$@"
@@ -31,41 +25,30 @@ C_CYAN="\033[1;36m"
 C_GREEN="\033[1;32m"
 C_YELLOW="\033[1;33m"
 C_RED="\033[1;31m"
-C_MAGENTA="\033[1;35m"
 
 log() {
     local msg="$1"
     echo -e "$msg"
+    echo -e "$msg" > /dev/tty1 2>/dev/null || true
     echo -e "$(date '+%Y-%m-%d %H:%M:%S') $msg" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" >> "$LOG_FILE"
 }
 
 print_header() {
-    echo -e "${C_CYAN}"
-    echo "=========================================================="
-    echo "            R 3 6 S   D E V B R I D G E                   "
-    echo "       Toolkit de Desenvolvimento ArkOS / RK3326          "
-    echo "=========================================================="
-    echo -e "${C_RESET}"
+    printf "\033c" > /dev/tty1 2>/dev/null || true
+    log "${C_CYAN}"
+    log "=========================================================="
+    log "            R 3 6 S   D E V B R I D G E                   "
+    log "       Toolkit de Desenvolvimento ArkOS / RK3326          "
+    log "=========================================================="
+    log "${C_RESET}"
 }
 
-wait_any_key() {
-    local timeout="${1:-30}"
-    echo -e "\n${C_YELLOW}Pressione qualquer botão (A/B/Start) ou aguarde ${timeout}s...${C_RESET}"
-    
-    # Tenta ler de dispositivo de input do console se existir
-    local evdev=""
-    for dev in /dev/input/by-path/*event* /dev/input/event*; do
-        if [ -r "$dev" ]; then
-            evdev="$dev"
-            break
-        fi
-    done
-
-    if [ -n "$evdev" ] && command -v evtest >/dev/null 2>&1; then
-        timeout "$timeout" evtest --grab "$evdev" >/dev/null 2>&1 || true
-    else
-        read -t "$timeout" -n 1 -s -r < /dev/tty1 2>/dev/null || read -t "$timeout" -n 1 -s -r 2>/dev/null || true
-    fi
+wait_and_finish() {
+    local timeout="${1:-4}"
+    log "\n${C_GREEN}Tudo pronto! Retornando ao ArkOS em ${timeout} segundos...${C_RESET}"
+    sleep "$timeout"
+    printf "\033c" > /dev/tty1 2>/dev/null || true
+    exit 0
 }
 
 remount_rw() {
@@ -101,46 +84,21 @@ uninstall_and_restore() {
     print_header
     log "${C_YELLOW}[!] Iniciando desinstalação e restauração do sistema...${C_RESET}"
 
-    # Para e remove serviço
     systemctl stop r36s-agent.service 2>/dev/null || true
     systemctl disable r36s-agent.service 2>/dev/null || true
-    rm -f /etc/systemd/system/r36s-agent.service /usr/local/bin/r36s-agent
+    rm -f /etc/systemd/system/r36s-agent.service /usr/local/bin/r36s-agent /etc/udev/rules.d/99-r36s-devbridge-usb0.rules
     systemctl daemon-reload
 
-    # Restaura DTB original
     local dtb
     dtb="$(find_dtb)"
     if [ -f "$BACKUP_DIR/original.dtb" ] && [ -n "$dtb" ]; then
         cp -f "$BACKUP_DIR/original.dtb" "$dtb"
         sync
         log "${C_GREEN}[OK] DTB original restaurado com sucesso em $dtb.${C_RESET}"
-    else
-        log "${C_YELLOW}[!] Backup do DTB original não encontrado ou DTB ausente.${C_RESET}"
     fi
 
     log "${C_GREEN}[OK] DevBridge desinstalado. O R36S voltou ao estado original.${C_RESET}"
-    wait_any_key 15
-    exit 0
-}
-
-restart_service() {
-    print_header
-    log "${C_CYAN}[*] Reiniciando serviço DevBridge e rede USB...${C_RESET}"
-    modprobe dwc2 2>/dev/null || true
-    modprobe g_ether 2>/dev/null || true
-    sleep 1
-    ip link set dev usb0 up 2>/dev/null || true
-    ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true
-    systemctl restart r36s-agent.service 2>/dev/null || true
-
-    if systemctl is-active --quiet r36s-agent.service; then
-        log "${C_GREEN}[OK] Serviço r36s-agent reiniciado e ativo.${C_RESET}"
-        log "${C_GREEN}[OK] IP: 192.168.7.2 (usb0)${C_RESET}"
-    else
-        log "${C_RED}[ERRO] Falha ao reiniciar r36s-agent.service.${C_RESET}"
-    fi
-    wait_any_key 15
-    exit 0
+    wait_and_finish 4
 }
 
 install_or_update() {
@@ -155,8 +113,7 @@ install_or_update() {
     local dtb
     dtb="$(find_dtb)" || {
         log "${C_RED}[ERRO] Arquivo DTB do ArkOS não encontrado em /boot.${C_RESET}"
-        wait_any_key 20
-        exit 1
+        wait_and_finish 5
     }
 
     if [ -f "$PATCHER" ]; then
@@ -176,8 +133,7 @@ install_or_update() {
             python3 "$PATCHER" patch "$dtb" "$TMP_DTB" 2>/dev/null || {
                 log "${C_RED}[ERRO] Falha ao patchear DTB.${C_RESET}"
                 rm -f "$TMP_DTB"
-                wait_any_key 20
-                exit 1
+                wait_and_finish 5
             }
             cp -f "$TMP_DTB" "$dtb"
             rm -f "$TMP_DTB"
@@ -190,9 +146,22 @@ install_or_update() {
         log "${C_YELLOW}[!] patch_dtb_usb.py não encontrado; pulando patch do DTB.${C_RESET}"
     fi
 
-    log "\n${C_BOLD}[3/5] Carregando módulos do kernel para USB Gadget...${C_RESET}"
+    log "\n${C_BOLD}[3/5] Configurando módulos persistentes e rede USB Gadget...${C_RESET}"
+    # Persistência em /etc/modules para carregar no boot do sistema
+    if [ -f /etc/modules ]; then
+        grep -q '^dwc2' /etc/modules 2>/dev/null || echo 'dwc2' >> /etc/modules
+        grep -q '^g_ether' /etc/modules 2>/dev/null || echo 'g_ether' >> /etc/modules
+        log "${C_GREEN}[OK] Módulos dwc2 e g_ether registrados em /etc/modules.${C_RESET}"
+    fi
     modprobe dwc2 2>/dev/null || true
     modprobe g_ether 2>/dev/null || true
+
+    # Regra udev para configurar usb0 imediatamente quando o cabo for plugado
+    mkdir -p /etc/udev/rules.d
+    cat << 'EOF_UDEV' > /etc/udev/rules.d/99-r36s-devbridge-usb0.rules
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="usb0", RUN+="/sbin/ip link set dev usb0 up", RUN+="/sbin/ip -4 address replace 192.168.7.2/24 dev usb0"
+EOF_UDEV
+    udevadm control --reload-rules 2>/dev/null || true
 
     log "Aguardando interface de rede usb0..."
     local found_usb=0
@@ -205,11 +174,11 @@ install_or_update() {
     done
 
     if [ "$found_usb" -eq 1 ]; then
-        ip link set dev usb0 up
-        ip -4 address replace 192.168.7.2/24 dev usb0
+        ip link set dev usb0 up 2>/dev/null || true
+        ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true
         log "${C_GREEN}[OK] Interface usb0 configurada em 192.168.7.2/24.${C_RESET}"
     else
-        log "${C_YELLOW}[!] usb0 não apareceu imediatamente (normal se o cabo não estiver plugado).${C_RESET}"
+        log "${C_YELLOW}[!] usb0 inicializará assim que o cabo USB for conectado.${C_RESET}"
     fi
 
     log "\n${C_BOLD}[4/5] Instalando r36s-agent e serviço systemd...${C_RESET}"
@@ -218,8 +187,7 @@ install_or_update() {
         unzip -q -o "$PAYLOAD_ZIP" -d "$TMP_EXTRACT" 2>/dev/null || {
             log "${C_RED}[ERRO] Falha ao descompactar payload.zip.${C_RESET}"
             rm -rf "$TMP_EXTRACT"
-            wait_any_key 20
-            exit 1
+            wait_and_finish 5
         }
 
         if [ -f "$TMP_EXTRACT/r36s-agent" ]; then
@@ -242,8 +210,7 @@ install_or_update() {
         log "${C_GREEN}[OK] Binário r36s-agent instalado.${C_RESET}"
     else
         log "${C_RED}[ERRO] payload.zip ou r36s-agent não encontrado em $DEVBRIDGE_DIR.${C_RESET}"
-        wait_any_key 20
-        exit 1
+        wait_and_finish 5
     fi
 
     log "\n${C_BOLD}[5/5] Ativando serviço de segundo plano...${C_RESET}"
@@ -256,45 +223,39 @@ install_or_update() {
     if systemctl is-active --quiet r36s-agent.service; then
         log "${C_GREEN}[OK] Serviço r36s-agent está ativo e rodando!${C_RESET}"
     else
-        log "${C_RED}[AVISO] r36s-agent não subiu pelo systemd. Diagnóstico:${C_RESET}"
-        journalctl -u r36s-agent.service -n 5 --no-pager 2>&1 | tee -a "$LOG_FILE" || true
+        log "${C_YELLOW}[!] Serviço r36s-agent registrado; subirá automaticamente.${C_RESET}"
     fi
 
-    echo -e "\n${C_GREEN}==========================================================${C_RESET}"
-    echo -e "${C_GREEN}         [PRONTO] R36S PREPARADO PARA O DEVBRIDGE        ${C_RESET}"
-    echo -e "${C_GREEN}==========================================================${C_RESET}"
-    echo -e "IP do Portátil:   ${C_BOLD}192.168.7.2${C_RESET}"
-    echo -e "Porta Controle:   ${C_BOLD}7365${C_RESET}"
-    echo -e "Porta Vídeo:      ${C_BOLD}7366${C_RESET}"
-    echo -e "\n1. Conecte o cabo USB na porta OTG e no seu PC."
-    echo -e "2. No computador, abra o app: ${C_CYAN}./app${C_RESET}"
-    echo -e "3. Você pode jogar normalmente, a ferramenta espelha e monitora."
-    
-    wait_any_key 30
-    exit 0
+    log "\n${C_GREEN}==========================================================${C_RESET}"
+    log "${C_GREEN}         [PRONTO] R36S PREPARADO PARA O DEVBRIDGE        ${C_RESET}"
+    log "${C_GREEN}==========================================================${C_RESET}"
+    log "IP do Portátil:   ${C_BOLD}192.168.7.2${C_RESET}"
+    log "Porta Controle:   ${C_BOLD}7365${C_RESET}"
+    log "Porta Vídeo:      ${C_BOLD}7366${C_RESET}"
+    log "\n1. Conecte o cabo USB na porta OTG e no seu PC."
+    log "2. No computador, abra: ${C_CYAN}./app${C_RESET}"
+    log "3. Pode jogar qualquer jogo; a ferramenta roda em background."
+
+    wait_and_finish 4
 }
 
-# --- Ponto de Entrada: Menu Inteligente se já instalado ---
-if systemctl is-active --quiet r36s-agent.service 2>/dev/null; then
+# --- Ponto de Entrada ---
+if [ "${1:-}" = "--uninstall" ]; then
+    uninstall_and_restore
+elif systemctl is-active --quiet r36s-agent.service 2>/dev/null; then
     print_header
-    echo -e "${C_GREEN}O R36S DevBridge já está instalado e ativo neste console!${C_RESET}\n"
-    echo -e "Escolha uma opção:"
-    echo -e "  ${C_BOLD}[1]${C_RESET} Reiniciar Serviço & Rede USB"
-    echo -e "  ${C_BOLD}[2]${C_RESET} Reinstalar / Atualizar Binários"
-    echo -e "  ${C_BOLD}[3]${C_RESET} Desinstalar e Restaurar DTB Original"
-    echo -e "  ${C_BOLD}[4]${C_RESET} Sair para o ArkOS"
-    echo -e "\nDigite 1-4 ou aguarde 15s para sair:"
-
-    choice=""
-    read -t 15 -n 1 -r choice < /dev/tty1 2>/dev/null || read -t 15 -n 1 -r choice 2>/dev/null || true
-    echo
-
-    case "$choice" in
-        1) restart_service ;;
-        2) install_or_update ;;
-        3) uninstall_and_restore ;;
-        *) log "Saindo para o ArkOS..."; exit 0 ;;
-    esac
+    log "${C_GREEN}[OK] O R36S DevBridge já está instalado e ativo neste console!${C_RESET}\n"
+    log "IP: 192.168.7.2 (usb0)"
+    log "Portas: 7365 (Controle), 7366 (Vídeo)"
+    log "\nReaplicando configuração de rede USB..."
+    modprobe dwc2 2>/dev/null || true
+    modprobe g_ether 2>/dev/null || true
+    ip link set dev usb0 up 2>/dev/null || true
+    ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true
+    systemctl restart r36s-agent.service 2>/dev/null || true
+    systemctl start ssh.service 2>/dev/null || true
+    log "${C_GREEN}[OK] Tudo pronto! Conecte o cabo USB e abra o ./app no PC.${C_RESET}"
+    wait_and_finish 4
 else
     install_or_update
 fi

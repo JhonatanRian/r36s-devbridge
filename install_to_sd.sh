@@ -95,10 +95,23 @@ if [ -n "$ROOT" ] && [ -d "$ROOT/usr/local/bin" ] && [ -w "$ROOT/usr/local/bin" 
     mkdir -p "$WANTS_DIR"
     ln -sf "/etc/systemd/system/r36s-agent.service" "$WANTS_DIR/r36s-agent.service"
 
+    # Registra módulos persistentes em /etc/modules
+    if [ -f "$ROOT/etc/modules" ]; then
+        grep -q '^dwc2' "$ROOT/etc/modules" 2>/dev/null || echo 'dwc2' >> "$ROOT/etc/modules"
+        grep -q '^g_ether' "$ROOT/etc/modules" 2>/dev/null || echo 'g_ether' >> "$ROOT/etc/modules"
+        echo "[OK] Módulos dwc2 e g_ether adicionados a /etc/modules"
+    fi
+
+    # Regra udev para manter usb0 configurado
+    mkdir -p "$ROOT/etc/udev/rules.d"
+    cat << 'EOF_UDEV' > "$ROOT/etc/udev/rules.d/99-r36s-devbridge-usb0.rules"
+SUBSYSTEM=="net", ACTION=="add", KERNEL=="usb0", RUN+="/sbin/ip link set dev usb0 up", RUN+="/sbin/ip -4 address replace 192.168.7.2/24 dev usb0"
+EOF_UDEV
+
     rm -rf "$TMP_UNZIP"
     echo "[OK] r36s-agent pré-instalado e serviço habilitado no systemd do ArkOS!"
 else
-    echo -e "\n[3/3] Partição root requer root/sudo para pré-instalação direta."
+    echo -e "\n[3/3] Partição root requer permissão de escrita (sudo ./install_to_sd.sh para pré-instalação total)."
     echo "      O atalho 'R36S DevBridge' no menu Ports fará a instalação automaticamente."
 fi
 
