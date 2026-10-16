@@ -327,6 +327,15 @@ impl AgentServer {
                     thread::spawn(move || {
                         let mut frame_index: u32 = 0;
                         let mut next_deadline = Instant::now();
+                        let mut comp_buffer = Vec::with_capacity(lz4_flex::block::get_maximum_output_size(640 * 480 * 4));
+
+                        let diag_enabled = std::env::var_os("DEVBRIDGE_DIAG").is_some();
+                        let mut diag_last_report = Instant::now();
+                        let mut diag_frames = 0u64;
+                        let mut diag_unchanged = 0u64;
+                        let mut diag_skips = 0u64;
+                        let mut diag_cap_us = 0u64;
+                        let mut diag_send_us = 0u64;
 
                         loop {
                             // Se uma nova conexão de vídeo chegou no socket, esta sessão é preempcionada e encerra imediatamente
@@ -362,16 +371,30 @@ impl AgentServer {
                             let mut pending_bytes: libc::c_int = 0;
                             let _ = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut pending_bytes) };
                             if pending_bytes > 64 * 1024 {
+                                if diag_enabled {
+                                    diag_skips += 1;
+                                }
                                 thread::sleep(Duration::from_millis(4));
                                 continue;
                             }
 
-                            let (width, height, bpp, format, flags, compressed) = {
+                            let t_cap = if diag_enabled { Some(Instant::now()) } else { None };
+
+                            // Captura e compressão in-place no buffer pré-alocado (zero alocações por frame)
+                            let (width, height, bpp, format, flags, comp_len) = {
                                 let mut reader = fb_reader_cl.lock().unwrap();
-                                let (w, h, fmt, flg, comp) = reader.capture_frame();
-                                (w, h, reader.bpp, fmt, flg, comp)
-                            };
+                                let (w, h, fmt, flg, len) = reader.capture_frame(&mut comp_buffer);
+                                (w, h, reader.bpp, fmt, flg, len)
+                            }; // O Mutex fb_reader_cl é liberado aqui antes do envio pela rede!
                             metrics_cl.set_fb_info(width, height, bpp, format);
+
+                            if let Some(t) = t_cap {
+                                diag_cap_us += t.elapsed().as_micros() as u64;
+                                diag_frames += 1;
+                                if flags == FRAME_FLAG_UNCHANGED {
+                                    diag_unchanged += 1;
+                                }
+                            }
 
                             frame_index = frame_index.wrapping_add(1);
 
@@ -381,8 +404,10 @@ impl AgentServer {
                                 height,
                                 format,
                                 flags,
-                                compressed.len() as u32,
+                                comp_len as u32,
                             );
+
+                            let t_send = if diag_enabled { Some(Instant::now()) } else { None };
 
                             // Envia cabeçalho (20 bytes)
                             let header_bytes = header.to_bytes();
@@ -390,11 +415,33 @@ impl AgentServer {
                                 break;
                             }
 
-                            // Se payload comprimido não estiver vazio (flags != 1), envia dados
-                            if !compressed.is_empty() {
-                                if stream.write_all(&compressed).is_err() {
+                            // Se payload comprimido não estiver vazio (flags != 1 e comp_len > 0), envia dados
+                            if comp_len > 0 {
+                                if stream.write_all(&comp_buffer[..comp_len]).is_err() {
                                     break;
                                 }
+                            }
+
+                            if let Some(t) = t_send {
+                                diag_send_us += t.elapsed().as_micros() as u64;
+                            }
+
+                            // Relatório diagnóstico agregado a cada 5s sem poluir logs por quadro
+                            if diag_enabled && diag_last_report.elapsed() >= Duration::from_secs(5) {
+                                let el_secs = diag_last_report.elapsed().as_secs_f64();
+                                let fps_eff = diag_frames as f64 / el_secs;
+                                let avg_cap_ms = if diag_frames > 0 { (diag_cap_us as f64 / diag_frames as f64) / 1000.0 } else { 0.0 };
+                                let avg_send_ms = if diag_frames > 0 { (diag_send_us as f64 / diag_frames as f64) / 1000.0 } else { 0.0 };
+                                eprintln!(
+                                    "[DEVBRIDGE_DIAG] 5s: {:.1} FPS (total: {}, unchanged: {}, tcp_skips: {}) | avg cap: {:.2}ms, send: {:.2}ms",
+                                    fps_eff, diag_frames, diag_unchanged, diag_skips, avg_cap_ms, avg_send_ms
+                                );
+                                diag_last_report = Instant::now();
+                                diag_frames = 0;
+                                diag_unchanged = 0;
+                                diag_skips = 0;
+                                diag_cap_us = 0;
+                                diag_send_us = 0;
                             }
 
                             // Cadência monotônica precisa: desconta o tempo gasto de captura/envio

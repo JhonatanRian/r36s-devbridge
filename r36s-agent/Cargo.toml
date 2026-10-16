@@ -1,6 +1,6 @@
 [package]
 name = "r36s-agent"
-version = "0.2.5"
+version = "0.2.6"
 edition = "2021"
 authors = ["DevBridge Team"]
 description = "Lightweight background daemon for R36S ArkOS (telemetry, framebuffer streaming and devtools)"

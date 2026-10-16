@@ -144,11 +144,15 @@ pub enum DrmState {
     FbdevFallback,
 }
 
-pub struct DrmReader;
+pub struct DrmReader {
+    plane_ids: Vec<u32>,
+}
 
 impl DrmReader {
     pub fn new() -> Self {
-        Self
+        Self {
+            plane_ids: Vec::with_capacity(16),
+        }
     }
 
     fn gem_close(fd: libc::c_int, handle: u32) {
@@ -210,14 +214,14 @@ impl DrmReader {
             return None;
         }
 
-        let mut plane_ids = vec![0u32; pres.count_planes as usize];
-        pres.plane_id_ptr = plane_ids.as_mut_ptr() as u64;
+        self.plane_ids.resize(pres.count_planes as usize, 0);
+        pres.plane_id_ptr = self.plane_ids.as_mut_ptr() as u64;
         if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres) } < 0 {
             return None;
         }
 
         let mut best_fb: Option<DrmModeFbCmd> = None;
-        for &pid in &plane_ids {
+        for &pid in &self.plane_ids {
             let mut plane: DrmModeGetPlane = unsafe { std::mem::zeroed() };
             plane.plane_id = pid;
             if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &mut plane) } == 0 {
@@ -398,7 +402,7 @@ impl FramebufferReader {
         self.transition_start = None;
     }
 
-    pub fn capture_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {
+    pub fn capture_frame(&mut self, comp_out: &mut Vec<u8>) -> (u16, u16, u8, u8, usize) {
         // 1. Prioridade absoluta: Captura direta do plane DRM KMS ativo com até 2 tentativas rápidas (1ms)
         for _ in 0..2 {
             if let Some((drm_w, drm_h, drm_fmt)) = self.drm_reader.capture(&mut self.packed_buffer) {
@@ -413,7 +417,7 @@ impl FramebufferReader {
                 self.transition_start = None;
                 self.is_real_fb = true;
                 self.fb_error = None;
-                return self.compress_and_return_frame();
+                return self.compress_and_return_frame(comp_out);
             }
             thread::sleep(Duration::from_millis(1));
         }
@@ -423,23 +427,23 @@ impl FramebufferReader {
         if state == DrmState::ActiveKms {
             // Cliente KMS ativo em transição (ex.: troca rápida de modo ou app iniciando).
             // Reporta indisponibilidade transitória imediatamente sem falsificar UNCHANGED.
-            return (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, Vec::new());
+            return (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, 0);
         }
 
         // 3. Fallback seguro para /dev/fb0 via pread() (menus de Ports com dialog, console fbcon)
-        if let Some(frame) = self.capture_fb0_direct() {
+        if let Some(frame) = self.capture_fb0_direct(comp_out) {
             self.transition_start = None;
             return frame;
         }
 
         if std::env::var("DEVBRIDGE_ALLOW_MOCK").is_ok() {
-            self.generate_mock_frame()
+            self.generate_mock_frame(comp_out)
         } else {
-            (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, Vec::new())
+            (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, 0)
         }
     }
 
-    fn capture_fb0_direct(&mut self) -> Option<(u16, u16, u8, u8, Vec<u8>)> {
+    fn capture_fb0_direct(&mut self, comp_out: &mut Vec<u8>) -> Option<(u16, u16, u8, u8, usize)> {
         let file = File::open("/dev/fb0").ok()?;
         let fd = file.as_raw_fd();
 
@@ -479,6 +483,7 @@ impl FramebufferReader {
             self.format = format;
             self.line_length = line_length;
             self.force_keyframe = true;
+            self.prev_frame_buffer.clear();
         }
 
         let row_bytes = (width as usize) * bytes_per_pixel;
@@ -504,10 +509,10 @@ impl FramebufferReader {
 
         self.is_real_fb = true;
         self.fb_error = None;
-        Some(self.compress_and_return_frame())
+        Some(self.compress_and_return_frame(comp_out))
     }
 
-    fn compress_and_return_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {
+    fn compress_and_return_frame(&mut self, comp_out: &mut Vec<u8>) -> (u16, u16, u8, u8, usize) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
 
         // Emite keyframe periódico a cada ~60 quadros para garantir sincronia se um cliente reconectar
@@ -522,21 +527,29 @@ impl FramebufferReader {
         self.force_keyframe = false;
 
         if is_unchanged {
-            // Quadro 100% idêntico: flag = 1, payload comprimido vazio para economizar banda/CPU
-            return (self.width, self.height, self.format, FRAME_FLAG_UNCHANGED, Vec::new());
+            // Quadro 100% idêntico: flag = 1, payload comprimido vazio (0 bytes)
+            return (self.width, self.height, self.format, FRAME_FLAG_UNCHANGED, 0);
         }
 
-        // Atualiza o buffer de referência do quadro anterior
-        if self.prev_frame_buffer.len() != self.packed_buffer.len() {
-            self.prev_frame_buffer.resize(self.packed_buffer.len(), 0);
+        // Garante que o buffer de saída tenha capacidade suficiente para o pior caso do LZ4
+        let max_compressed_len = lz4_flex::block::get_maximum_output_size(self.packed_buffer.len());
+        if comp_out.len() < max_compressed_len {
+            comp_out.resize(max_compressed_len, 0);
         }
-        self.prev_frame_buffer.copy_from_slice(&self.packed_buffer);
 
-        let compressed = lz4_flex::compress(&self.packed_buffer);
-        (self.width, self.height, self.format, FRAME_FLAG_KEYFRAME, compressed)
+        let compressed_size = match lz4_flex::block::compress_into(&self.packed_buffer, comp_out) {
+            Ok(size) => size,
+            Err(_) => return (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, 0),
+        };
+
+        // Troca os ponteiros de buffer em O(1) (< 5 ns) sem copiar 1.2 MB de RAM!
+        // Na próxima captura, self.packed_buffer apontará para o buffer antigo e será sobrescrito diretamente.
+        std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer);
+
+        (self.width, self.height, self.format, FRAME_FLAG_KEYFRAME, compressed_size)
     }
 
-    fn generate_mock_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {
+    fn generate_mock_frame(&mut self, comp_out: &mut Vec<u8>) -> (u16, u16, u8, u8, usize) {
         self.mock_frame += 1;
         let w = self.width as usize;
         let h = self.height as usize;
@@ -564,7 +577,11 @@ impl FramebufferReader {
             }
         }
 
-        let compressed = lz4_flex::compress(&raw);
-        (self.width, self.height, FORMAT_RGB565_LZ4, 0, compressed)
+        let max_len = lz4_flex::block::get_maximum_output_size(raw.len());
+        if comp_out.len() < max_len {
+            comp_out.resize(max_len, 0);
+        }
+        let written = lz4_flex::block::compress_into(&raw, comp_out).unwrap_or(0);
+        (self.width, self.height, FORMAT_RGB565_LZ4, 0, written)
     }
 }

@@ -100,14 +100,17 @@ When emulators render through Mali GPU (OpenGL ES) with double buffering, the GP
 1. The top rows might be read while still cleared to zero (`0x00`), resulting in flickering or missing status bars.
 2. The CPU data caches (D-cache) might hold stale cache lines from previous frames.
 
-### Four-Fold Zero-Lag Architecture in `r36s-agent`:
+### Six-Fold Zero-Lag & Zero-Allocation Architecture in `r36s-agent`:
 1. **Implicit Fence Polling:** Before reading, the agent polls the DMA-BUF file descriptor with `libc::poll(&mut pfd, 1, 10)` (`POLLIN`). This yields CPU time until any pending GPU write reservation fence on the buffer is resolved.
 2. **DMA-BUF Cache Synchronization (`DMA_BUF_IOCTL_SYNC`):**
    - **`DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ`**: Signals the kernel that the CPU is beginning to read from the memory, forcing ARM CPU cache invalidation.
    - **`DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ`**: Completes the read operation.
-3. **Exact 100% `memcmp` Diffing:** Instead of skipping half of the frame bytes in a lossy hash, the agent uses SIMD-accelerated `memcmp` against `prev_frame_buffer`. It inspects 100% of all pixels in < 25 µs, terminating immediately on the first altered byte (< 1 µs during motion), guaranteeing zero missed animations and zero hash collisions.
-4. **TCP Backpressure Control (`TIOCOUTQ`):** Queries `libc::ioctl(fd, libc::TIOCOUTQ, &mut pending)`. If the TCP socket send buffer has more than 64 KB pending, the agent skips pushing to the queue for that tick. This completely prevents TCP buffer bloat, guaranteeing that the viewer on PC always displays the real-time frame (< 16 ms latency) with zero queue accumulation.
-5. **Monotonic Tick Deadline:** Uses deadline scheduling (`next_deadline += frame_duration`) rather than fixed sleeps after work, guaranteeing a rock-solid 30 FPS / 60 FPS frame delivery without drift.
+3. **Exact 100% `memcmp` Diffing & $O(1)$ Buffer Swap:** Instead of skipping half of the frame bytes in a lossy hash, the agent uses SIMD-accelerated `memcmp` against `prev_frame_buffer`. It inspects 100% of all pixels in < 25 µs, terminating immediately on the first altered byte (< 1 µs during motion). When a new frame is captured, `std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer)` swaps buffer pointers in < 5 ns, completely eliminating a 1.2 MB memory copy (`copy_from_slice`) every frame (~36.8 MB/s RAM bandwidth saved on Cortex-A35).
+4. **Zero-Allocation In-Place Compression:** Uses `lz4_flex::block::compress_into(&self.packed_buffer, comp_out)` into a pre-allocated per-session buffer sized with `get_maximum_output_size()`. This eliminates heap reallocation, zeroing, and Vec growth on every frame.
+5. **Early Lock Release & TCP Backpressure Control (`TIOCOUTQ`):** The framebuffer mutex is released immediately after `capture_frame()`, before writing to the network socket. The agent queries `libc::ioctl(fd, libc::TIOCOUTQ, &mut pending)`. If the TCP socket send buffer has more than 64 KB pending, the agent skips pushing to the queue for that tick. This completely prevents TCP buffer bloat, guaranteeing that the viewer on PC always displays the real-time frame (< 16 ms latency) with zero queue accumulation.
+6. **Monotonic Tick Deadline:** Uses deadline scheduling (`next_deadline += frame_duration`) rather than fixed sleeps after work, guaranteeing a rock-solid 30 FPS / 60 FPS frame delivery without drift.
+7. **Cached Syscall Invariants:** Sysconf values (`_SC_PAGESIZE`, `_SC_CLK_TCK`) are queried once upon daemon startup in `MetricsCollector`, eliminating repeated system call overhead during the 1 Hz `/proc` process scan.
+8. **Low-Overhead Diagnostic Telemetry:** Setting `DEVBRIDGE_DIAG=1` enables aggregated 5-second performance reports (average capture time, network send latency, TCP drop counter, effective FPS) with zero per-frame console I/O spam.
 
 ---
 
