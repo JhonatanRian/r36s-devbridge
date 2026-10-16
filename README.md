@@ -208,6 +208,19 @@ DevBridge operates over two dedicated TCP ports over the USB Ethernet gadget lin
 
 ---
 
+## 📚 Technical Documentation & Architecture
+
+For in-depth architectural guides, hardware limitations, protocol details, and engineering post-mortems, see the [docs/](docs/index.md) directory:
+
+- 📖 **[Documentation Overview & Map](docs/index.md)**
+- 🏛️ **[Architecture & Binary Protocols](docs/architecture.md)** — Breakdown of `r36s-agent` and `r36s-studio`, multi-port TCP channels (7365-7368), and packet specifications.
+- 🕹️ **[Hardware & ArkOS Internals](docs/hardware-and-arkos.md)** — Rockchip RK3326 quirks, `dwc2` USB OTG device-tree patching, and emulator lifecycle (`perfmax` -> `ffplay` -> RetroArch).
+- 🎥 **[Video Pipeline & DRM/KMS Mechanics](docs/video-pipeline.md)** — Preventing State D deadlocks with `pread`, active CRTC plane filtering, and alpha channel fixes.
+- 🔧 **[Troubleshooting & Lessons Learned](docs/troubleshooting.md)** — Diagnostic commands, past case studies, and engineering guidelines for developers and AI agents.
+
+---
+
 ## 📄 License
 
 Licensed under the MIT License. See [LICENSE](LICENSE) for details.
+
