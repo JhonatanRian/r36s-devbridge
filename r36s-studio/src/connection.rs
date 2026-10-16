@@ -596,7 +596,6 @@ impl ConnectionManager {
 
                             // Flag == 2: Framebuffer temporariamente em transição ou indisponível
                             if header.flags == 2 {
-                                thread::sleep(Duration::from_millis(50));
                                 continue;
                             }
 

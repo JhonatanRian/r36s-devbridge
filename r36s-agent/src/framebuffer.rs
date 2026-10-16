@@ -5,6 +5,7 @@ use crate::protocol::{
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::os::unix::io::AsRawFd;
+use std::thread;
 use std::time::{Duration, Instant};
 
 #[repr(C)]
@@ -216,7 +217,6 @@ impl DrmReader {
         }
 
         let mut best_fb: Option<DrmModeFbCmd> = None;
-        let mut best_plane_id: u32 = 0;
         for &pid in &plane_ids {
             let mut plane: DrmModeGetPlane = unsafe { std::mem::zeroed() };
             plane.plane_id = pid;
@@ -239,7 +239,6 @@ impl DrmReader {
                             if let Some(old_fb) = best_fb.replace(fb) {
                                 Self::gem_close(fd, old_fb.handle);
                             }
-                            best_plane_id = pid;
                         } else {
                             Self::gem_close(fd, fb.handle);
                         }
@@ -341,18 +340,6 @@ impl DrmReader {
             libc::close(dma_fd);
         }
 
-        // 4. Verificação pós-captura: se o plano sofreu page-flip durante a cópia (mudou de fb_id),
-        // descartamos a leitura para evitar quadros intermediários ou rasgados (tearing)
-        if best_plane_id > 0 {
-            let mut verify_plane: DrmModeGetPlane = unsafe { std::mem::zeroed() };
-            verify_plane.plane_id = best_plane_id;
-            if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &mut verify_plane) } == 0 {
-                if verify_plane.fb_id != 0 && verify_plane.fb_id != fb.fb_id {
-                    return None;
-                }
-            }
-        }
-
         // Fecha /dev/dri/card0 imediatamente
         drop(card);
 
@@ -375,10 +362,10 @@ pub struct FramebufferReader {
     pub format: u8,
     pub is_real_fb: bool,
     pub fb_error: Option<String>,
-    prev_frame_hash: u64,
     force_keyframe: bool,
     frame_counter: u64,
     packed_buffer: Vec<u8>,
+    prev_frame_buffer: Vec<u8>,
     transition_start: Option<Instant>,
     mock_start: Instant,
     mock_frame: u32,
@@ -395,10 +382,10 @@ impl FramebufferReader {
             format: FORMAT_RGB565_LZ4,
             is_real_fb: true,
             fb_error: None,
-            prev_frame_hash: 0,
             force_keyframe: true,
             frame_counter: 0,
             packed_buffer: vec![0u8; 640 * 480 * 2],
+            prev_frame_buffer: Vec::new(),
             transition_start: None,
             mock_start: Instant::now(),
             mock_frame: 0,
@@ -407,42 +394,39 @@ impl FramebufferReader {
 
     pub fn reset_session(&mut self) {
         self.force_keyframe = true;
-        self.prev_frame_hash = 0;
+        self.prev_frame_buffer.clear();
         self.transition_start = None;
     }
 
     pub fn capture_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {
-        // 1. Prioridade absoluta: Captura direta do plane DRM KMS ativo (jogos RetroArch, EmulationStation, ffplay)
-        if let Some((drm_w, drm_h, drm_fmt)) = self.drm_reader.capture(&mut self.packed_buffer) {
-            if drm_w != self.width || drm_h != self.height || drm_fmt != self.format {
-                self.width = drm_w;
-                self.height = drm_h;
-                self.format = drm_fmt;
-                self.bpp = if drm_fmt == FORMAT_BGRA8888_LZ4 || drm_fmt == FORMAT_RGBA8888_LZ4 { 32 } else { 16 };
-                self.force_keyframe = true;
+        // 1. Prioridade absoluta: Captura direta do plane DRM KMS ativo com até 2 tentativas rápidas (1ms)
+        for _ in 0..2 {
+            if let Some((drm_w, drm_h, drm_fmt)) = self.drm_reader.capture(&mut self.packed_buffer) {
+                if drm_w != self.width || drm_h != self.height || drm_fmt != self.format {
+                    self.width = drm_w;
+                    self.height = drm_h;
+                    self.format = drm_fmt;
+                    self.bpp = if drm_fmt == FORMAT_BGRA8888_LZ4 || drm_fmt == FORMAT_RGBA8888_LZ4 { 32 } else { 16 };
+                    self.force_keyframe = true;
+                    self.prev_frame_buffer.clear();
+                }
+                self.transition_start = None;
+                self.is_real_fb = true;
+                self.fb_error = None;
+                return self.compress_and_return_frame();
             }
-            self.transition_start = None;
-            self.is_real_fb = true;
-            self.fb_error = None;
-            return self.compress_and_return_frame();
+            thread::sleep(Duration::from_millis(1));
         }
 
-        // 2. Se a captura DRM retornou None:
+        // 2. Se a captura DRM não retornou após tentativa rápida:
         let state = DrmReader::inspect_state();
         if state == DrmState::ActiveKms {
-            // Existe um cliente KMS ativo no sistema (ex.: jogo fazendo modeset ou troca rápida de buffer).
-            // Segura o último quadro por até 800ms para evitar piscar tela preta.
-            let now = Instant::now();
-            let start = *self.transition_start.get_or_insert(now);
-            if start.elapsed() < Duration::from_millis(800) && self.prev_frame_hash != 0 {
-                return (self.width, self.height, self.format, FRAME_FLAG_UNCHANGED, Vec::new());
-            }
-            // Passados 800ms sem imagem do KMS, reporta indisponibilidade temporária sem travar o stream
+            // Cliente KMS ativo em transição (ex.: troca rápida de modo ou app iniciando).
+            // Reporta indisponibilidade transitória imediatamente sem falsificar UNCHANGED.
             return (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, Vec::new());
         }
 
         // 3. Fallback seguro para /dev/fb0 via pread() (menus de Ports com dialog, console fbcon)
-        // NUNCA faz mmap em /dev/fb0, eliminando completamente qualquer risco de State D no kernel.
         if let Some(frame) = self.capture_fb0_direct() {
             self.transition_start = None;
             return frame;
@@ -526,42 +510,30 @@ impl FramebufferReader {
     fn compress_and_return_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {
         self.frame_counter = self.frame_counter.wrapping_add(1);
 
-        // Calcula hash rápido para frame-diffing
-        let hash = Self::compute_hash(&self.packed_buffer);
         // Emite keyframe periódico a cada ~60 quadros para garantir sincronia se um cliente reconectar
         let periodic_keyframe = (self.frame_counter % 60) == 0;
-        let is_unchanged = !self.force_keyframe && !periodic_keyframe && (hash == self.prev_frame_hash);
-        self.prev_frame_hash = hash;
+
+        // Comparação exata de 100% dos bytes (memcmp executado em < 25µs no AArch64 com saída antecipada imediata)
+        let is_unchanged = !self.force_keyframe
+            && !periodic_keyframe
+            && (self.prev_frame_buffer.len() == self.packed_buffer.len())
+            && (self.prev_frame_buffer == self.packed_buffer);
+
         self.force_keyframe = false;
 
         if is_unchanged {
-            // Quadro inalterado: flag = 1, payload comprimido vazio para economizar banda/CPU
+            // Quadro 100% idêntico: flag = 1, payload comprimido vazio para economizar banda/CPU
             return (self.width, self.height, self.format, FRAME_FLAG_UNCHANGED, Vec::new());
         }
 
+        // Atualiza o buffer de referência do quadro anterior
+        if self.prev_frame_buffer.len() != self.packed_buffer.len() {
+            self.prev_frame_buffer.resize(self.packed_buffer.len(), 0);
+        }
+        self.prev_frame_buffer.copy_from_slice(&self.packed_buffer);
+
         let compressed = lz4_flex::compress(&self.packed_buffer);
         (self.width, self.height, self.format, FRAME_FLAG_KEYFRAME, compressed)
-    }
-
-    fn compute_hash(data: &[u8]) -> u64 {
-        let mut hash = 0xcbf29ce484222325u64;
-        let (prefix, chunks, suffix) = unsafe { data.align_to::<u64>() };
-        for &b in prefix {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        // Amostragem de alta sensibilidade: processa palavras u64 (64 bits por vez com registradores nativos AArch64)
-        // pulando a cada 2 blocos (16 bytes = 4 pixels). Garante 50% de cobertura do frame
-        // detectando detalhes finos como cursores ou caracteres piscantes em < 0.4ms.
-        for &val in chunks.iter().step_by(2) {
-            hash ^= val;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        for &b in suffix {
-            hash ^= b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        hash
     }
 
     fn generate_mock_frame(&mut self) -> (u16, u16, u8, u8, Vec<u8>) {

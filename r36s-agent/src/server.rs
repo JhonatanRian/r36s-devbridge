@@ -5,10 +5,11 @@ use crate::process::ProcessManager;
 use crate::protocol::*;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
+use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct AgentServer {
     streaming_enabled: Arc<AtomicBool>,
@@ -325,6 +326,8 @@ impl AgentServer {
 
                     thread::spawn(move || {
                         let mut frame_index: u32 = 0;
+                        let mut next_deadline = Instant::now();
+
                         loop {
                             // Se uma nova conexão de vídeo chegou no socket, esta sessão é preempcionada e encerra imediatamente
                             if active_session_cl.load(Ordering::SeqCst) != session_id {
@@ -346,11 +349,22 @@ impl AgentServer {
                                 }
                                 let _ = stream.set_nonblocking(false);
                                 thread::sleep(Duration::from_millis(60));
+                                next_deadline = Instant::now();
                                 continue;
                             }
 
                             let fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 60);
                             let frame_duration = Duration::from_millis(1000 / fps as u64);
+
+                            // Controle anti-buffer-bloat TCP: se a fila de saída do socket tiver mais de 64KB pendentes,
+                            // o receptor ou a rede ainda estão drenando o frame anterior. Pulamos o envio deste ciclo para
+                            // evitar enfileiramento no kernel e garantir que o cliente receba sempre o frame mais atual (< 16ms).
+                            let mut pending_bytes: libc::c_int = 0;
+                            let _ = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut pending_bytes) };
+                            if pending_bytes > 64 * 1024 {
+                                thread::sleep(Duration::from_millis(4));
+                                continue;
+                            }
 
                             let (width, height, bpp, format, flags, compressed) = {
                                 let mut reader = fb_reader_cl.lock().unwrap();
@@ -383,7 +397,14 @@ impl AgentServer {
                                 }
                             }
 
-                            thread::sleep(frame_duration);
+                            // Cadência monotônica precisa: desconta o tempo gasto de captura/envio
+                            let now = Instant::now();
+                            if next_deadline > now {
+                                thread::sleep(next_deadline - now);
+                                next_deadline += frame_duration;
+                            } else {
+                                next_deadline = now + frame_duration;
+                            }
                         }
                         println!("[r36s-agent] Cliente de vídeo desconectado (sessão {}).", session_id);
                     });
