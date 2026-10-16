@@ -65,7 +65,6 @@ impl eframe::App for DevBridgeApp {
         let status_snapshot = self.connection.status.lock().unwrap().clone();
         let metrics_snapshot = self.connection.metrics.lock().unwrap().clone();
         let frame_snapshot = self.connection.current_frame.lock().unwrap().clone();
-        let current_fps = *self.connection.current_fps.lock().unwrap();
         let throughput = *self.connection.throughput_kbps.lock().unwrap();
 
         // Atualiza textura do viewport e histórico da telemetria
@@ -174,7 +173,6 @@ impl eframe::App for DevBridgeApp {
                         ui,
                         is_streaming,
                         video_connected,
-                        current_fps,
                         frame_snapshot.as_ref(),
                     );
                 }

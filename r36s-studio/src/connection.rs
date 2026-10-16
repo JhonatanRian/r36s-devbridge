@@ -1,5 +1,4 @@
 use crate::protocol::*;
-use std::collections::VecDeque;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
@@ -130,13 +129,12 @@ impl ConnectionManager {
         let frame_cl = Arc::clone(&current_frame);
         let is_streaming_vid = Arc::clone(&is_streaming);
         let status_vid = Arc::clone(&status);
-        let fps_cl = Arc::clone(&current_fps);
         let vid_rx = Arc::clone(&total_bytes_rx);
         let vid_diag = Arc::clone(&diag_logs);
         let vid_conn = Arc::clone(&video_connected);
 
         thread::spawn(move || {
-            Self::video_worker(frame_cl, is_streaming_vid, status_vid, fps_cl, vid_rx, vid_diag, vid_conn);
+            Self::video_worker(frame_cl, is_streaming_vid, status_vid, vid_rx, vid_diag, vid_conn);
         });
 
         mgr
@@ -526,7 +524,6 @@ impl ConnectionManager {
         current_frame: Arc<Mutex<Option<DecodedFrame>>>,
         is_streaming: Arc<AtomicBool>,
         status: Arc<Mutex<ConnectionStatus>>,
-        current_fps: Arc<Mutex<f32>>,
         bytes_rx: Arc<AtomicU64>,
         diag: Arc<Mutex<Vec<String>>>,
         video_connected: Arc<AtomicBool>,
@@ -538,7 +535,6 @@ impl ConnectionManager {
 
         let mut header_buf = [0u8; 20];
         let mut comp_buf = Vec::with_capacity(640 * 480 * 4 + 65536);
-        let mut frame_times: VecDeque<Instant> = VecDeque::with_capacity(70);
 
         loop {
             if !is_streaming.load(Ordering::Relaxed) {
@@ -585,12 +581,6 @@ impl ConnectionManager {
 
                             // Flag == 1: Quadro idêntico ao anterior (tela inalterada)
                             if header.flags == 1 {
-                                let has_valid_frame = current_frame.lock().unwrap().is_some();
-                                if has_valid_frame {
-                                    let now = Instant::now();
-                                    frame_times.push_back(now);
-                                    Self::update_fps(&mut frame_times, &current_fps);
-                                }
                                 continue;
                             }
 
@@ -636,10 +626,6 @@ impl ConnectionManager {
                                         let mut lock = current_frame.lock().unwrap();
                                         *lock = Some(frame);
                                     }
-
-                                    let now = Instant::now();
-                                    frame_times.push_back(now);
-                                    Self::update_fps(&mut frame_times, &current_fps);
                                 }
                                 Err(e) => {
                                     Self::add_diag(&diag, &format!("Erro na descompressão LZ4: {}", e));
@@ -649,8 +635,6 @@ impl ConnectionManager {
                     }
                     video_connected.store(false, Ordering::Relaxed);
                     Self::add_diag(&diag, "Canal de vídeo desconectado.");
-                    let mut fps = current_fps.lock().unwrap();
-                    *fps = 0.0;
                 }
                 Err(_) => {
                     video_connected.store(false, Ordering::Relaxed);
@@ -658,20 +642,6 @@ impl ConnectionManager {
                 }
             }
         }
-    }
-
-    fn update_fps(frame_times: &mut VecDeque<Instant>, current_fps: &Arc<Mutex<f32>>) {
-        let now = Instant::now();
-        while let Some(&front) = frame_times.front() {
-            if now.duration_since(front) > Duration::from_millis(1000) {
-                frame_times.pop_front();
-            } else {
-                break;
-            }
-        }
-        let fps = frame_times.len() as f32;
-        let mut lock = current_fps.lock().unwrap();
-        *lock = fps;
     }
 
     pub fn rgb565_to_rgba(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {

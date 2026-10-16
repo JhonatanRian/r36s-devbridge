@@ -67,7 +67,6 @@ impl ViewportRenderer {
         ui: &mut Ui,
         is_streaming: bool,
         video_connected: bool,
-        current_fps: f32,
         frame_opt: Option<&DecodedFrame>,
     ) {
         ui.vertical(|ui| {
@@ -89,14 +88,7 @@ impl ViewportRenderer {
                 ui.separator();
 
                 if is_streaming {
-                    let fps_color = if current_fps >= 25.0 {
-                        Color32::from_rgb(0, 220, 100)
-                    } else if current_fps >= 10.0 {
-                        Color32::from_rgb(255, 180, 0)
-                    } else {
-                        Color32::from_rgb(255, 80, 80)
-                    };
-                    ui.colored_label(fps_color, format!("● {:.0} FPS", current_fps));
+                    ui.colored_label(Color32::from_rgb(0, 220, 100), "● Transmitindo");
                 } else {
                     ui.colored_label(Color32::GRAY, "○ Pausado");
                 }
