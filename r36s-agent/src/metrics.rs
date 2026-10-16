@@ -8,14 +8,27 @@ pub struct MetricsCollector {
     last_cpu_times: Mutex<Option<(u64, u64)>>, // (total, idle)
     last_proc_times: Mutex<HashMap<u32, (u64, Instant)>>, // pid -> (ticks, instant)
     fb_info: Mutex<(u16, u16, u8, u8)>, // (width, height, bpp, format)
+    page_size_kb: u64,
+    clk_tck: f32,
 }
 
 impl MetricsCollector {
     pub fn new() -> Self {
+        let page_size_kb = unsafe {
+            let ps = libc::sysconf(libc::_SC_PAGESIZE);
+            if ps > 0 { (ps as u64) / 1024 } else { 4 }
+        };
+        let clk_tck = unsafe {
+            let tck = libc::sysconf(libc::_SC_CLK_TCK);
+            if tck > 0 { tck as f32 } else { 100.0 }
+        };
+
         Self {
             last_cpu_times: Mutex::new(None),
             last_proc_times: Mutex::new(HashMap::new()),
             fb_info: Mutex::new((640, 480, 16, 1)),
+            page_size_kb,
+            clk_tck,
         }
     }
 
@@ -222,10 +235,7 @@ impl MetricsCollector {
                             continue;
                         }
 
-                        let page_size_kb = unsafe {
-                            let ps = libc::sysconf(libc::_SC_PAGESIZE);
-                            if ps > 0 { (ps as u64) / 1024 } else { 4 }
-                        };
+                        let page_size_kb = self.page_size_kb;
 
                         let memory_mb = fs::read_to_string(statm_path)
                             .ok()
@@ -261,10 +271,7 @@ impl MetricsCollector {
                                         let tick_diff = total_ticks.saturating_sub(prev_ticks);
                                         let time_diff = now.duration_since(prev_time).as_secs_f32();
                                         if time_diff > 0.05 {
-                                            let clk_tck = unsafe {
-                                                let tck = libc::sysconf(libc::_SC_CLK_TCK);
-                                                if tck > 0 { tck as f32 } else { 100.0 }
-                                            };
+                                            let clk_tck = self.clk_tck;
                                             cpu_percent = ((tick_diff as f32 / clk_tck) / time_diff) * 100.0;
                                             cpu_percent = cpu_percent.clamp(0.0, 400.0);
                                         }
