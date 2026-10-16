@@ -13,6 +13,8 @@ use std::time::Duration;
 pub struct AgentServer {
     streaming_enabled: Arc<AtomicBool>,
     target_fps: Arc<AtomicU32>,
+    active_control_id: Arc<AtomicU32>,
+    active_video_session: Arc<AtomicU32>,
     metrics_collector: Arc<MetricsCollector>,
     fb_reader: Arc<Mutex<FramebufferReader>>,
 }
@@ -27,6 +29,8 @@ impl AgentServer {
         Self {
             streaming_enabled: Arc::new(AtomicBool::new(false)),
             target_fps: Arc::new(AtomicU32::new(30)),
+            active_control_id: Arc::new(AtomicU32::new(0)),
+            active_video_session: Arc::new(AtomicU32::new(0)),
             metrics_collector: metrics,
             fb_reader: Arc::new(Mutex::new(reader)),
         }
@@ -41,12 +45,23 @@ impl AgentServer {
         let streaming_flag = Arc::clone(&self.streaming_enabled);
         let target_fps = Arc::clone(&self.target_fps);
         let fb_reader_cl = Arc::clone(&self.fb_reader);
+        let metrics_video = Arc::clone(&self.metrics_collector);
+        let active_video_session = Arc::clone(&self.active_video_session);
         thread::spawn(move || {
-            Self::video_stream_worker(streaming_flag, target_fps, fb_reader_cl);
+            Self::video_stream_worker(
+                streaming_flag,
+                target_fps,
+                fb_reader_cl,
+                metrics_video,
+                active_video_session,
+            );
         });
 
         // Watchdog seguro para manter interface usb0 UP com IP estático 192.168.7.2 sem overhead
         thread::spawn(|| {
+            let _ = std::process::Command::new("systemctl")
+                .args(["start", "ssh.service"])
+                .output();
             loop {
                 thread::sleep(Duration::from_secs(4));
                 if std::path::Path::new("/sys/class/net/usb0").exists() {
@@ -80,9 +95,18 @@ impl AgentServer {
                 Ok(stream) => {
                     let streaming_flag = Arc::clone(&self.streaming_enabled);
                     let target_fps = Arc::clone(&self.target_fps);
+                    let control_id_gen = Arc::clone(&self.active_control_id);
+                    let session_id = control_id_gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
                     let metrics = Arc::clone(&self.metrics_collector);
                     thread::spawn(move || {
-                        Self::handle_control_client(stream, streaming_flag, target_fps, metrics);
+                        Self::handle_control_client(
+                            stream,
+                            streaming_flag,
+                            target_fps,
+                            control_id_gen,
+                            session_id,
+                            metrics,
+                        );
                     });
                 }
                 Err(e) => {
@@ -96,10 +120,12 @@ impl AgentServer {
         stream: TcpStream,
         streaming_flag: Arc<AtomicBool>,
         target_fps: Arc<AtomicU32>,
+        active_control_id: Arc<AtomicU32>,
+        session_id: u32,
         metrics: Arc<MetricsCollector>,
     ) {
         let peer_addr = stream.peer_addr().ok();
-        println!("[r36s-agent] Cliente de controle conectado: {:?}", peer_addr);
+        println!("[r36s-agent] Cliente de controle conectado (sessão {}): {:?}", session_id, peer_addr);
 
         // Validação de segurança: permitir somente loopback ou rede USB 192.168.7.*
         if let Some(ref addr) = peer_addr {
@@ -200,7 +226,23 @@ impl AgentServer {
                         }
                     }
                     ClientCommand::DeployFinish => match deploy_mgr.finish() {
-                        Ok((path, hash)) => ServerResponse::DeploySuccess { path, sha256: hash },
+                        Ok((path, hash)) => {
+                            if path.contains("r36s-devbridge/payload.zip") {
+                                let payload_path = path.clone();
+                                thread::spawn(move || {
+                                    thread::sleep(Duration::from_millis(800));
+                                    let script = format!(
+                                        "TMP_U=$(mktemp -d) && unzip -q -o '{}' -d $TMP_U && cp -f $TMP_U/r36s-agent /usr/local/bin/r36s-agent && chmod 755 /usr/local/bin/r36s-agent && rm -rf $TMP_U && systemctl restart r36s-agent",
+                                        payload_path
+                                    );
+                                    let _ = std::process::Command::new("/bin/sh")
+                                        .arg("-c")
+                                        .arg(&script)
+                                        .output();
+                                });
+                            }
+                            ServerResponse::DeploySuccess { path, sha256: hash }
+                        }
                         Err(e) => ServerResponse::DeployError { error: e },
                     },
                     ClientCommand::FetchLogs { log_type, lines } => {
@@ -241,15 +283,19 @@ impl AgentServer {
             line.clear();
         }
 
-        // Ao desconectar o controle, desativa streaming para economizar CPU
-        streaming_flag.store(false, Ordering::Relaxed);
-        println!("[r36s-agent] Cliente de controle desconectado.");
+        // Somente desativa o streaming se esta ainda for a sessão de controle ativa mais recente
+        if active_control_id.load(Ordering::SeqCst) == session_id {
+            streaming_flag.store(false, Ordering::Relaxed);
+        }
+        println!("[r36s-agent] Cliente de controle desconectado (sessão {}).", session_id);
     }
 
     fn video_stream_worker(
         streaming_flag: Arc<AtomicBool>,
         target_fps: Arc<AtomicU32>,
         fb_reader: Arc<Mutex<FramebufferReader>>,
+        metrics: Arc<MetricsCollector>,
+        active_video_session: Arc<AtomicU32>,
     ) {
         let listener = TcpListener::bind(format!("0.0.0.0:{}", VIDEO_PORT))
             .expect("Falha ao abrir porta de vídeo");
@@ -257,9 +303,13 @@ impl AgentServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
-                    println!("[r36s-agent] Cliente de vídeo conectado: {:?}", stream.peer_addr());
+                    let session_id = active_video_session.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+                    println!("[r36s-agent] Cliente de vídeo conectado (sessão {}): {:?}", session_id, stream.peer_addr());
                     let _ = stream.set_nodelay(true);
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(150)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+
+                    // Garante que o streaming esteja ativo ao conectar no socket 7366
+                    streaming_flag.store(true, Ordering::Relaxed);
 
                     // Reseta sessão para forçar keyframe no início de cada nova conexão
                     {
@@ -267,60 +317,76 @@ impl AgentServer {
                         reader.reset_session();
                     }
 
-                    let mut frame_index: u32 = 0;
-                    loop {
-                        if !streaming_flag.load(Ordering::Relaxed) {
-                            // Testa se o cliente ainda está conectado enquanto pausado
-                            let mut probe_buf = [0u8; 1];
-                            let _ = stream.set_nonblocking(true);
-                            match stream.peek(&mut probe_buf) {
-                                Ok(0) => break, // EOF / socket fechado pelo cliente
-                                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                                    // Socket ainda aberto e sem dados prontos (normal)
-                                }
-                                Err(_) => break, // Erro de conexão
-                                _ => {}
-                            }
-                            let _ = stream.set_nonblocking(false);
-                            thread::sleep(Duration::from_millis(60));
-                            continue;
-                        }
+                    let streaming_flag_cl = Arc::clone(&streaming_flag);
+                    let target_fps_cl = Arc::clone(&target_fps);
+                    let fb_reader_cl = Arc::clone(&fb_reader);
+                    let metrics_cl = Arc::clone(&metrics);
+                    let active_session_cl = Arc::clone(&active_video_session);
 
-                        let fps = target_fps.load(Ordering::Relaxed).clamp(5, 60);
-                        let frame_duration = Duration::from_millis(1000 / fps as u64);
-
-                        let (width, height, format, flags, compressed) = {
-                            let mut reader = fb_reader.lock().unwrap();
-                            reader.capture_frame()
-                        };
-
-                        frame_index = frame_index.wrapping_add(1);
-
-                        let header = VideoFrameHeader::new(
-                            frame_index,
-                            width,
-                            height,
-                            format,
-                            flags,
-                            compressed.len() as u32,
-                        );
-
-                        // Envia cabeçalho (20 bytes)
-                        let header_bytes = header.to_bytes();
-                        if stream.write_all(&header_bytes).is_err() {
-                            break;
-                        }
-
-                        // Se payload comprimido não estiver vazio (flags != 1), envia dados
-                        if !compressed.is_empty() {
-                            if stream.write_all(&compressed).is_err() {
+                    thread::spawn(move || {
+                        let mut frame_index: u32 = 0;
+                        loop {
+                            // Se uma nova conexão de vídeo chegou no socket, esta sessão é preempcionada e encerra imediatamente
+                            if active_session_cl.load(Ordering::SeqCst) != session_id {
+                                println!("[r36s-agent] Sessão de vídeo {} preempcionada por nova conexão.", session_id);
                                 break;
                             }
-                        }
 
-                        thread::sleep(frame_duration);
-                    }
-                    println!("[r36s-agent] Cliente de vídeo desconectado.");
+                            if !streaming_flag_cl.load(Ordering::Relaxed) {
+                                // Testa se o cliente ainda está conectado enquanto pausado
+                                let mut probe_buf = [0u8; 1];
+                                let _ = stream.set_nonblocking(true);
+                                match stream.peek(&mut probe_buf) {
+                                    Ok(0) => break, // EOF / socket fechado pelo cliente
+                                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                                        // Socket ainda aberto e sem dados prontos (normal)
+                                    }
+                                    Err(_) => break, // Erro de conexão
+                                    _ => {}
+                                }
+                                let _ = stream.set_nonblocking(false);
+                                thread::sleep(Duration::from_millis(60));
+                                continue;
+                            }
+
+                            let fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 60);
+                            let frame_duration = Duration::from_millis(1000 / fps as u64);
+
+                            let (width, height, bpp, format, flags, compressed) = {
+                                let mut reader = fb_reader_cl.lock().unwrap();
+                                let (w, h, fmt, flg, comp) = reader.capture_frame();
+                                (w, h, reader.bpp, fmt, flg, comp)
+                            };
+                            metrics_cl.set_fb_info(width, height, bpp, format);
+
+                            frame_index = frame_index.wrapping_add(1);
+
+                            let header = VideoFrameHeader::new(
+                                frame_index,
+                                width,
+                                height,
+                                format,
+                                flags,
+                                compressed.len() as u32,
+                            );
+
+                            // Envia cabeçalho (20 bytes)
+                            let header_bytes = header.to_bytes();
+                            if stream.write_all(&header_bytes).is_err() {
+                                break;
+                            }
+
+                            // Se payload comprimido não estiver vazio (flags != 1), envia dados
+                            if !compressed.is_empty() {
+                                if stream.write_all(&compressed).is_err() {
+                                    break;
+                                }
+                            }
+
+                            thread::sleep(frame_duration);
+                        }
+                        println!("[r36s-agent] Cliente de vídeo desconectado (sessão {}).", session_id);
+                    });
                 }
                 Err(e) => {
                     eprintln!("[r36s-agent] Erro no listener de vídeo: {}", e);

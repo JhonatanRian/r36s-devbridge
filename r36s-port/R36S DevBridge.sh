@@ -19,6 +19,33 @@ MENU_HELPER="$DEVBRIDGE_DIR/gamepad_menu.py"
 
 mkdir -p "$DEVBRIDGE_DIR" "$BACKUP_DIR"
 
+# Prepara consoles virtuais e garante exibição no LCD
+unset LD_PRELOAD
+CURR_TTY="/dev/tty1"
+chmod 666 "$CURR_TTY" /dev/tty0 /dev/uinput 2>/dev/null || true
+export TERM=linux
+export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+export DIALOGRC=/opt/inttools/noshadows.dialogrc
+
+# Se o controlador VOP do DRM tiver ficado DISABLED após saída do ffplay/perfmax,
+# abre e fecha /dev/dri/card0 para disparar drm_lastclose() no kernel e reativar o fbdev (/dev/fb0)
+if grep -q "DISABLED" /sys/kernel/debug/dri/0/summary 2>/dev/null; then
+    true < /dev/dri/card0 2>/dev/null || true
+fi
+
+# Força restauração do modo texto (KD_TEXT = 0) no terminal virtual
+python3 -c "import fcntl; fcntl.ioctl(open('$CURR_TTY', 'wb'), 0x4B3A, 0)" 2>/dev/null || true
+chvt 1 2>/dev/null || true
+
+if [[ -e "/dev/input/by-path/platform-odroidgo2-joypad-event-joystick" ]]; then
+    setfont /usr/share/consolefonts/Lat7-Terminus16.psf.gz 2>/dev/null || true
+else
+    setfont /usr/share/consolefonts/Lat7-Terminus20x10.psf.gz 2>/dev/null || true
+fi
+
+printf "\e[?25l" > "$CURR_TTY" 2>/dev/null || true
+printf "\033c" > "$CURR_TTY" 2>/dev/null || true
+
 # ANSI Colors
 C_RESET="\033[0m"
 C_BOLD="\033[1m"
@@ -27,14 +54,61 @@ C_GREEN="\033[1;32m"
 C_YELLOW="\033[1;33m"
 C_RED="\033[1;31m"
 
+start_gptokeyb() {
+    pkill -9 -f "gptokeyb -1 dialog" 2>/dev/null || true
+    if [ -x /opt/inttools/gptokeyb ]; then
+        chmod 666 /dev/uinput 2>/dev/null || true
+        export SDL_GAMECONTROLLERCONFIG_FILE="/opt/inttools/gamecontrollerdb.txt"
+        /opt/inttools/gptokeyb -1 "dialog" -c "/opt/inttools/keys.gptk" > /dev/null 2>&1 &
+        GPTOKEYB_PID=$!
+    fi
+}
+
+stop_gptokeyb() {
+    [ -n "${GPTOKEYB_PID:-}" ] && kill -9 "$GPTOKEYB_PID" 2>/dev/null || true
+    pkill -9 -f "gptokeyb -1 dialog" 2>/dev/null || true
+    printf "\e[?25h" > "$CURR_TTY" 2>/dev/null || true
+    printf "\033c" > "$CURR_TTY" 2>/dev/null || true
+}
+
+show_msgbox() {
+    local title="$1"
+    local text="$2"
+    local lines="${3:-12}"
+    local cols="${4:-54}"
+    if command -v dialog >/dev/null 2>&1; then
+        start_gptokeyb
+        dialog --clear --backtitle "R36S DevBridge" --title "$title" --msgbox "$text" "$lines" "$cols" 2>&1 > "$CURR_TTY" < "$CURR_TTY"
+        stop_gptokeyb
+    else
+        log "\n--- $title ---\n$text"
+        sleep 4
+    fi
+}
+
+show_infobox() {
+    local title="$1"
+    local text="$2"
+    local lines="${3:-6}"
+    local cols="${4:-52}"
+    if command -v dialog >/dev/null 2>&1; then
+        dialog --clear --backtitle "R36S DevBridge" --title "$title" --infobox "$text" "$lines" "$cols" > "$CURR_TTY" 2>/dev/null || true
+    else
+        log "$text"
+    fi
+}
+
 log() {
     local msg="$1"
     echo -e "$msg"
+    echo -e "$msg" > /dev/tty0 2>/dev/null || true
     echo -e "$msg" > /dev/tty1 2>/dev/null || true
     echo -e "$(date '+%Y-%m-%d %H:%M:%S') $msg" | sed -r "s/\x1B\[([0-9]{1,2}(;[0-9]{1,2})?)?[mGK]//g" >> "$LOG_FILE"
 }
 
 print_header() {
+    chvt 1 2>/dev/null || true
+    printf "\033c" > /dev/tty0 2>/dev/null || true
     printf "\033c" > /dev/tty1 2>/dev/null || true
     log "${C_CYAN}"
     log "=========================================================="
@@ -52,7 +126,8 @@ wait_and_finish() {
     else
         log "\n${C_RED}Encerrando com erro. Pressione qualquer tecla ou aguarde ${timeout}s...${C_RESET}"
     fi
-    read -t "$timeout" -n 1 _ < /dev/tty1 2>/dev/null || sleep "$timeout"
+    read -t "$timeout" -n 1 _ < /dev/tty0 2>/dev/null || read -t "$timeout" -n 1 _ < /dev/tty1 2>/dev/null || sleep "$timeout"
+    printf "\033c" > /dev/tty0 2>/dev/null || true
     printf "\033c" > /dev/tty1 2>/dev/null || true
     exit "$exit_code"
 }
@@ -353,7 +428,18 @@ EOF_LOGROTATE
         log "2. No computador, abra: ${C_CYAN}./app${C_RESET}"
         log "3. Pode iniciar qualquer jogo; o agente roda em segundo plano."
         log "=========================================================="
-        wait_and_finish 5 0
+        show_msgbox "Instalação Concluída" "\
+R36S DevBridge instalado com sucesso!\n\
+\n\
+IP do console: 192.168.7.2\n\
+Porta Controle: 7365 | Porta Video: 7366\n\
+\n\
+1. Conecte o cabo USB na porta OTG e no seu PC.\n\
+2. No computador, abra: ./app\n\
+3. Pode iniciar qualquer jogo; o agente roda em segundo plano.\
+" 14 56
+        stop_gptokeyb
+        exit 0
     fi
 }
 
@@ -361,71 +447,135 @@ EOF_LOGROTATE
 if [ "${1:-}" = "--uninstall" ]; then
     uninstall_and_restore
 elif systemctl is-active --quiet r36s-agent.service 2>/dev/null || [ -f /usr/local/bin/r36s-agent ]; then
-    print_header
-    log "${C_GREEN}[OK] R36S DevBridge já instalado neste console!${C_RESET}"
+    service_status="Inativo"
     if systemctl is-active --quiet r36s-agent.service; then
-        log "Status do serviço: ${C_GREEN}Ativo e rodando${C_RESET}"
-    else
-        log "Status do serviço: ${C_YELLOW}Inativo${C_RESET}"
+        service_status="Ativo e rodando"
     fi
 
+    ip_info=""
     if ip link show dev usb0 >/dev/null 2>&1; then
-        ip_info=""
-        ip_info=$(ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | head -n1)
-        log "Rede usb0: ${C_GREEN}Conectado ($ip_info)${C_RESET}"
+        ip_addr=$(ip -4 -o addr show dev usb0 2>/dev/null | awk '{print $4}' | head -n1)
+        ip_info="usb0: Conectado (${ip_addr:-192.168.7.2/24})"
     else
-        log "Rede usb0: ${C_YELLOW}Aguardando cabo USB OTG${C_RESET}"
+        ip_info="usb0: Desconectado (aguarde cabo OTG)"
     fi
-
-    log "\n${C_BOLD}Selecione uma opção:${C_RESET}"
-    log "  ${C_CYAN}[X / 1]${C_RESET} Reaplicar rede USB e reiniciar serviço"
-    log "  ${C_CYAN}[A / 2]${C_RESET} Reinstalar / Atualizar componentes"
-    log "  ${C_CYAN}[Y / 3]${C_RESET} Desinstalar (pressione duas vezes)"
-    log "  ${C_CYAN}[B / 4]${C_RESET} Sair (Padrão)"
-    log "\nPressione um botão [auto sair em 30s]: "
 
     choice="4"
-    if [ -f "$MENU_HELPER" ]; then
-        choice="$(python3 "$MENU_HELPER" 30 2>/dev/tty1)" || choice="4"
+    if command -v dialog >/dev/null 2>&1; then
+        start_gptokeyb
+        choice=$(dialog --clear \
+            --backtitle "R36S DevBridge - Toolkit de Desenvolvimento" \
+            --title "Menu DevBridge" \
+            --ok-label "Selecionar (A)" \
+            --cancel-label "Sair (B)" \
+            --menu "Status: $service_status\nRede:   $ip_info\n\nNavegue com D-Pad e aperte (A) para selecionar:" 15 56 4 \
+            "1" "Reaplicar rede USB e reiniciar serviço" \
+            "2" "Reinstalar / Atualizar componentes" \
+            "3" "Desinstalar DevBridge" \
+            "4" "Sair" \
+            2>&1 > "$CURR_TTY" < "$CURR_TTY") || choice="4"
+        stop_gptokeyb
+    elif [ -f "$MENU_HELPER" ]; then
+        print_header
+        log "${C_GREEN}[OK] R36S DevBridge já instalado neste console!${C_RESET}"
+        log "Status do serviço: $service_status"
+        log "Rede: $ip_info"
+        log "\n${C_BOLD}Selecione uma opção:${C_RESET}"
+        log "  ${C_CYAN}[X / 1]${C_RESET} Reaplicar rede USB e reiniciar serviço"
+        log "  ${C_CYAN}[A / 2]${C_RESET} Reinstalar / Atualizar componentes"
+        log "  ${C_CYAN}[Y / 3]${C_RESET} Desinstalar"
+        log "  ${C_CYAN}[B / 4]${C_RESET} Sair (Padrão)"
+        choice="$(python3 "$MENU_HELPER" 30)" || choice="4"
     else
-        read -t 30 -n 1 choice < /dev/tty1 2>/dev/null || choice="4"
+        choice="4"
     fi
-    echo ""
 
     case "$choice" in
         2)
+            show_infobox "Atualização" "Atualizando componentes do DevBridge a partir do payload...\nAguarde..." 6 54
             install_or_update
             ;;
         3)
-            uninstall_and_restore
+            confirm="0"
+            if command -v dialog >/dev/null 2>&1; then
+                start_gptokeyb
+                if dialog --clear --backtitle "R36S DevBridge" --title "Confirmar Desinstalação" --yesno "Tem certeza que deseja desinstalar o DevBridge e restaurar as configurações originais?" 8 52 > "$CURR_TTY" < "$CURR_TTY"; then
+                    confirm="1"
+                fi
+                stop_gptokeyb
+            else
+                confirm="1"
+            fi
+            if [ "$confirm" = "1" ]; then
+                show_infobox "Desinstalação" "Desinstalando DevBridge e restaurando sistema...\nAguarde..." 6 52
+                uninstall_and_restore
+                show_msgbox "Desinstalação" "DevBridge desinstalado com sucesso!\nConfiguracoes restauradas." 8 46
+            fi
             ;;
         4)
-            log "Saindo..."
-            printf "\033c" > /dev/tty1 2>/dev/null || true
+            stop_gptokeyb
             exit 0
             ;;
         1)
+            show_infobox "Rede USB" "Reaplicando configuracao de rede USB e reiniciando servico...\nAguarde..." 6 54
+            log "Verificando componentes e atualizações no payload..."
+            if [ -f "$PAYLOAD_ZIP" ]; then
+                TMP_CHK="$(mktemp -d)"
+                if unzip -q -o "$PAYLOAD_ZIP" -d "$TMP_CHK" 2>/dev/null; then
+                    if [ -f "$TMP_CHK/r36s-agent" ]; then
+                        if ! cmp -s "$TMP_CHK/r36s-agent" /usr/local/bin/r36s-agent 2>/dev/null; then
+                            log "${C_GREEN}[ATUALIZAÇÃO] Instalando nova versão do r36s-agent a partir do payload...${C_RESET}"
+                            cp -f "$TMP_CHK/r36s-agent" /usr/local/bin/r36s-agent
+                            chmod 755 /usr/local/bin/r36s-agent
+                        fi
+                    fi
+                    if [ -f "$TMP_CHK/r36s-agent.service" ]; then
+                        cp -f "$TMP_CHK/r36s-agent.service" /etc/systemd/system/r36s-agent.service
+                        chmod 644 /etc/systemd/system/r36s-agent.service
+                    fi
+                    rm -rf "$TMP_CHK"
+                    systemctl daemon-reload
+                fi
+            fi
             log "Reaplicando configuração de rede USB..."
             if ip link show dev usb0 >/dev/null 2>&1; then
                 ip link set dev usb0 up 2>/dev/null || true
                 ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true
                 log "${C_GREEN}[OK] Interface usb0 reconfigurada em 192.168.7.2/24.${C_RESET}"
-            else
-                log "${C_YELLOW}[!] usb0 ainda não está disponível; o serviço tentará carregar os módulos.${C_RESET}"
             fi
-            if systemctl --no-block restart r36s-agent.service 2>/dev/null; then
-                log "${C_YELLOW}[!] Reinício do serviço solicitado. Aguarde a rede USB aparecer no PC.${C_RESET}"
-            else
-                log "${C_RED}[ERRO] Não foi possível solicitar reinício do serviço.${C_RESET}"
-                wait_and_finish 8 1
-            fi
-            wait_and_finish 4 0
+            systemctl --no-block restart r36s-agent.service 2>/dev/null || true
+            show_msgbox "Rede USB Concluída" "\
+Rede USB configurada com sucesso!\n\
+IP do console: 192.168.7.2\n\
+Porta Controle: 7365 | Porta Video: 7366\n\
+\n\
+No seu computador, plugue o cabo USB OTG\n\
+e abra o aplicativo: ./app (DevBridge Studio)\
+" 12 52
+            exit 0
             ;;
         *)
-            log "${C_YELLOW}[!] Escolha inválida; saindo sem alterar a conexão.${C_RESET}"
-            wait_and_finish 4 1
+            stop_gptokeyb
+            exit 0
             ;;
     esac
 else
-    install_or_update
+    if command -v dialog >/dev/null 2>&1; then
+        start_gptokeyb
+        if dialog --clear --backtitle "R36S DevBridge" --title "Instalação do DevBridge" --yesno "\
+R36S DevBridge Toolkit de Desenvolvimento.\n\
+\n\
+Deseja instalar o daemon de comunicacao e habilitar\n\
+o modo desenvolvedor USB neste console?\
+" 11 54 > "$CURR_TTY" < "$CURR_TTY"; then
+            stop_gptokeyb
+            show_infobox "Instalando" "Instalando DevBridge no console...\nAguarde alguns instantes..." 6 50
+            install_or_update
+        else
+            stop_gptokeyb
+            exit 0
+        fi
+    else
+        install_or_update
+    fi
 fi

@@ -34,6 +34,7 @@ pub struct ConnectionManager {
     pub deploy_status: Arc<Mutex<Option<String>>>,
     pub deploy_progress: Arc<Mutex<f32>>,
     pub is_streaming: Arc<AtomicBool>,
+    pub video_connected: Arc<AtomicBool>,
     pub current_fps: Arc<Mutex<f32>>,
     pub throughput_kbps: Arc<Mutex<f32>>,
     pub diag_logs: Arc<Mutex<Vec<String>>>,
@@ -55,6 +56,7 @@ impl ConnectionManager {
         let deploy_status = Arc::new(Mutex::new(None));
         let deploy_progress = Arc::new(Mutex::new(0.0));
         let is_streaming = Arc::new(AtomicBool::new(false));
+        let video_connected = Arc::new(AtomicBool::new(false));
         let current_fps = Arc::new(Mutex::new(0.0));
         let throughput_kbps = Arc::new(Mutex::new(0.0));
         let diag_logs = Arc::new(Mutex::new(Vec::new()));
@@ -72,6 +74,7 @@ impl ConnectionManager {
             deploy_status: Arc::clone(&deploy_status),
             deploy_progress: Arc::clone(&deploy_progress),
             is_streaming: Arc::clone(&is_streaming),
+            video_connected: Arc::clone(&video_connected),
             current_fps: Arc::clone(&current_fps),
             throughput_kbps: Arc::clone(&throughput_kbps),
             diag_logs: Arc::clone(&diag_logs),
@@ -130,9 +133,10 @@ impl ConnectionManager {
         let fps_cl = Arc::clone(&current_fps);
         let vid_rx = Arc::clone(&total_bytes_rx);
         let vid_diag = Arc::clone(&diag_logs);
+        let vid_conn = Arc::clone(&video_connected);
 
         thread::spawn(move || {
-            Self::video_worker(frame_cl, is_streaming_vid, status_vid, fps_cl, vid_rx, vid_diag);
+            Self::video_worker(frame_cl, is_streaming_vid, status_vid, fps_cl, vid_rx, vid_diag, vid_conn);
         });
 
         mgr
@@ -190,6 +194,18 @@ impl ConnectionManager {
     }
 
     fn host_has_ip(ifname: &str) -> Result<bool, String> {
+        if let Ok(output) = std::process::Command::new("ip")
+            .args(["-4", "-o", "addr", "show", "dev", ifname])
+            .output()
+        {
+            if output.status.success() {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                if stdout.contains("192.168.7.1/") {
+                    return Ok(true);
+                }
+            }
+        }
+
         let output = std::process::Command::new("nmcli")
             .args(["-g", "IP4.ADDRESS", "dev", "show", ifname])
             .output()
@@ -282,11 +298,11 @@ impl ConnectionManager {
                 };
             }
 
-            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(900)) {
+            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(1500)) {
                 Ok(stream) => {
                     let _ = stream.set_nodelay(true);
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(1500)));
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(1500)));
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(4500)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(4500)));
 
                     // Fase 3: Handshake de protocolo
                     {
@@ -304,9 +320,9 @@ impl ConnectionManager {
 
                     let mut handshake_ok = false;
                     let mut agent_ver = "desconhecida".to_string();
+                    let mut reader = BufReader::new(stream.try_clone().unwrap());
 
                     if Self::send_raw_cmd(&stream, &handshake_cmd, &bytes_tx).is_ok() {
-                        let mut reader = BufReader::new(stream.try_clone().unwrap());
                         let mut line = String::new();
                         if reader.read_line(&mut line).is_ok() && !line.is_empty() {
                             bytes_rx.fetch_add(line.len() as u64, Ordering::Relaxed);
@@ -339,13 +355,19 @@ impl ConnectionManager {
                         };
                     }
 
-                    // Se streaming já estiver ativo, solicita início no agente
+                    // Se streaming já estiver ativo, solicita início no agente e consome o ACK para não dessincronizar o reader
                     if is_streaming.load(Ordering::Relaxed) {
-                        let _ = Self::send_raw_cmd(&stream, &ClientCommand::StartStream { target_fps: 30 }, &bytes_tx);
+                        if Self::send_raw_cmd(&stream, &ClientCommand::StartStream { target_fps: 30 }, &bytes_tx).is_ok() {
+                            let mut ack_line = String::new();
+                            if let Ok(n) = reader.read_line(&mut ack_line) {
+                                bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
                     }
 
                     Self::run_control_session(
                         stream,
+                        reader,
                         &cmd_rx,
                         &status,
                         &metrics,
@@ -372,6 +394,7 @@ impl ConnectionManager {
 
     fn run_control_session(
         stream: TcpStream,
+        mut reader: BufReader<TcpStream>,
         cmd_rx: &Receiver<ClientCommand>,
         status: &Arc<Mutex<ConnectionStatus>>,
         metrics: &Arc<Mutex<Option<SystemMetrics>>>,
@@ -382,7 +405,6 @@ impl ConnectionManager {
         bytes_tx: &Arc<AtomicU64>,
         bytes_rx: &Arc<AtomicU64>,
     ) {
-        let mut reader = BufReader::new(stream.try_clone().unwrap());
         let mut last_metrics_req = Instant::now();
         let mut response_buf = String::new();
 
@@ -507,6 +529,7 @@ impl ConnectionManager {
         current_fps: Arc<Mutex<f32>>,
         bytes_rx: Arc<AtomicU64>,
         diag: Arc<Mutex<Vec<String>>>,
+        video_connected: Arc<AtomicBool>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, VIDEO_PORT)
@@ -514,11 +537,12 @@ impl ConnectionManager {
             .unwrap();
 
         let mut header_buf = [0u8; 20];
-        let mut comp_buf = Vec::with_capacity(640 * 480 * 4);
+        let mut comp_buf = Vec::with_capacity(640 * 480 * 4 + 65536);
         let mut frame_times: VecDeque<Instant> = VecDeque::with_capacity(70);
 
         loop {
             if !is_streaming.load(Ordering::Relaxed) {
+                video_connected.store(false, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -529,14 +553,16 @@ impl ConnectionManager {
             };
 
             if !is_connected {
+                video_connected.store(false, Ordering::Relaxed);
                 thread::sleep(Duration::from_millis(200));
                 continue;
             }
 
-            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(900)) {
+            match TcpStream::connect_timeout(&target_addr, Duration::from_millis(1500)) {
                 Ok(mut stream) => {
+                    video_connected.store(true, Ordering::Relaxed);
                     let _ = stream.set_nodelay(true);
-                    let _ = stream.set_read_timeout(Some(Duration::from_millis(2000)));
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(3500)));
                     Self::add_diag(&diag, "Canal de vídeo TCP conectado.");
 
                     while is_streaming.load(Ordering::Relaxed) {
@@ -547,7 +573,9 @@ impl ConnectionManager {
 
                         if let Some(header) = VideoFrameHeader::from_bytes(&header_buf) {
                             let size = header.compressed_size as usize;
-                            if size > 640 * 480 * 4 {
+                            let max_allowed = ((header.width as usize) * (header.height as usize) * 4) + 65536;
+                            if size > max_allowed || (size == 0 && header.flags == 0) {
+                                Self::add_diag(&diag, &format!("Aviso: Pacote de vídeo inválido (tam {size}, max {max_allowed})"));
                                 break;
                             }
 
@@ -566,10 +594,9 @@ impl ConnectionManager {
                                 continue;
                             }
 
-                            // Flag == 2: Framebuffer inacessível no console
+                            // Flag == 2: Framebuffer temporariamente em transição ou indisponível
                             if header.flags == 2 {
-                                Self::add_diag(&diag, "Aviso: Framebuffer /dev/fb0 inacessível no R36S (verifique permissões ou modo do kernel)");
-                                thread::sleep(Duration::from_millis(200));
+                                thread::sleep(Duration::from_millis(50));
                                 continue;
                             }
 
@@ -621,11 +648,13 @@ impl ConnectionManager {
                             }
                         }
                     }
+                    video_connected.store(false, Ordering::Relaxed);
                     Self::add_diag(&diag, "Canal de vídeo desconectado.");
                     let mut fps = current_fps.lock().unwrap();
                     *fps = 0.0;
                 }
                 Err(_) => {
+                    video_connected.store(false, Ordering::Relaxed);
                     thread::sleep(Duration::from_millis(500));
                 }
             }

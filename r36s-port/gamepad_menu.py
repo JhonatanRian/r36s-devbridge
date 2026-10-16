@@ -39,50 +39,44 @@ def load_button_map(config_path):
     return DEFAULT_BUTTONS, None
 
 
-def find_joystick(device_name):
+def find_joysticks():
     override = os.environ.get("DEVBRIDGE_JS_DEVICE")
-    if override:
-        return override
-    candidates = sorted(glob.glob("/dev/input/js*"))
-    if device_name:
-        for path in candidates:
-            name_path = "/sys/class/input/{}/device/name".format(os.path.basename(path))
-            try:
-                with open(name_path, encoding="utf-8") as name_file:
-                    if name_file.read().strip() == device_name:
-                        return path
-            except OSError:
-                pass
-    return candidates[0] if len(candidates) == 1 else None
+    if override and os.path.exists(override):
+        return [override]
+    return sorted(glob.glob("/dev/input/js*"))
 
 
 def read_choice(timeout):
-    button_map, device_name = load_button_map(
+    button_map, _ = load_button_map(
         os.environ.get("DEVBRIDGE_INPUT_CONFIG", "/etc/emulationstation/es_input.cfg")
     )
-    joystick_path = find_joystick(device_name)
-    joystick_fd = None
+    joystick_fds = []
+    for path in find_joysticks():
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK)
+            joystick_fds.append(fd)
+        except OSError:
+            pass
+
     tty_fd = None
     old_tty = None
     try:
-        if joystick_path:
-            try:
-                joystick_fd = os.open(joystick_path, os.O_RDONLY | os.O_NONBLOCK)
-            except OSError:
-                pass
-        try:
-            tty_fd = os.open(os.environ.get("DEVBRIDGE_TTY", "/dev/tty1"), os.O_RDONLY | os.O_NONBLOCK)
-            old_tty = termios.tcgetattr(tty_fd)
-            tty.setcbreak(tty_fd)
-        except (OSError, termios.error):
-            if tty_fd is not None:
-                os.close(tty_fd)
-                tty_fd = None
+        for tty_cand in [os.environ.get("DEVBRIDGE_TTY"), "/dev/tty0", "/dev/tty1"]:
+            if tty_cand and os.path.exists(tty_cand):
+                try:
+                    tty_fd = os.open(tty_cand, os.O_RDONLY | os.O_NONBLOCK)
+                    old_tty = termios.tcgetattr(tty_fd)
+                    tty.setcbreak(tty_fd)
+                    break
+                except (OSError, termios.error):
+                    if tty_fd is not None:
+                        os.close(tty_fd)
+                        tty_fd = None
 
         deadline = time.monotonic() + timeout
         uninstall_until = 0.0
         while time.monotonic() < deadline:
-            fds = [fd for fd in (joystick_fd, tty_fd) if fd is not None]
+            fds = [fd for fd in joystick_fds + ([tty_fd] if tty_fd is not None else [])]
             if not fds:
                 break
             ready, _, _ = select.select(fds, [], [], min(0.5, max(0.0, deadline - time.monotonic())))
@@ -120,10 +114,15 @@ def read_choice(timeout):
         return "4"  # Timeout exits without changing the service.
     finally:
         if old_tty is not None and tty_fd is not None:
-            termios.tcsetattr(tty_fd, termios.TCSANOW, old_tty)
-        for fd in (joystick_fd, tty_fd):
-            if fd is not None:
+            try:
+                termios.tcsetattr(tty_fd, termios.TCSANOW, old_tty)
+            except (OSError, termios.error):
+                pass
+        for fd in joystick_fds + ([tty_fd] if tty_fd is not None else []):
+            try:
                 os.close(fd)
+            except OSError:
+                pass
 
 
 if __name__ == "__main__":

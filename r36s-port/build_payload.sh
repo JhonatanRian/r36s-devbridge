@@ -7,6 +7,13 @@ AGENT_BIN="$PROJECT_ROOT/r36s-agent/target/aarch64-unknown-linux-musl/release/r3
 SERVICE_FILE="$PROJECT_ROOT/r36s-agent/systemd/r36s-agent.service"
 OUT_ZIP="$DIR/payload.zip"
 
+# Localiza cargo no PATH ou no diretório .cargo do usuário
+if [ -n "${SUDO_USER:-}" ]; then
+    USER_CARGO="$(getent passwd "$SUDO_USER" | cut -d: -f6)/.cargo/bin"
+    [ -d "$USER_CARGO" ] && export PATH="$USER_CARGO:$PATH"
+fi
+[ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
+
 if [ ! -f "$AGENT_BIN" ]; then
     echo "Compilando r36s-agent para aarch64 musl (binário 100% estático)..."
     (cd "$PROJECT_ROOT/r36s-agent" && cargo build --release --target aarch64-unknown-linux-musl)

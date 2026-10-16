@@ -9,6 +9,33 @@ echo "=========================================================="
 echo "           COMPILANDO R36S DEVBRIDGE TOOLKIT              "
 echo "=========================================================="
 
+# Localiza cargo no PATH ou nos diretórios .cargo padrão
+for cand in \
+    "${CARGO_BIN:-}" \
+    "$(command -v cargo 2>/dev/null || true)" \
+    "${USER_CARGO:-}" \
+    "$HOME/.cargo/bin/cargo" \
+    "/home/${SUDO_USER:-$USER}/.cargo/bin/cargo" \
+    /home/user/.cargo/bin/cargo \
+    /root/.cargo/bin/cargo \
+    /usr/bin/cargo \
+    /usr/local/bin/cargo; do
+    if [ -n "$cand" ] && [ -x "$cand" ]; then
+        export PATH="$(dirname "$cand"):$PATH"
+        break
+    fi
+done
+
+if ! command -v cargo >/dev/null 2>&1; then
+    if [ -f "$ROOT_DIR/dist/ports/r36s-devbridge/payload.zip" ] && [ -f "$ROOT_DIR/app" ]; then
+        echo "Aviso: cargo não localizado no PATH; utilizando artefatos já compilados em dist/ e ./app."
+        exit 0
+    else
+        echo "ERRO: comando 'cargo' não encontrado. Verifique se o Rust está instalado em ~/.cargo/bin" >&2
+        exit 1
+    fi
+fi
+
 # 1. Compilar r36s-agent para AArch64 MUSL (estático para qualquer ArkOS)
 echo -e "\n[1/4] Compilando r36s-agent (AArch64 MUSL estático)..."
 (cd "$ROOT_DIR/r36s-agent" && cargo build --release --target aarch64-unknown-linux-musl)
