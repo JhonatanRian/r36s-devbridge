@@ -66,6 +66,7 @@ impl ViewportRenderer {
         &mut self,
         ui: &mut Ui,
         is_streaming: bool,
+        video_connected: bool,
         current_fps: f32,
         frame_opt: Option<&DecodedFrame>,
     ) {
@@ -155,7 +156,11 @@ impl ViewportRenderer {
                         rect.center(),
                         egui::Align2::CENTER_CENTER,
                         if is_streaming {
-                            "Aguardando primeiro frame do R36S..."
+                            if video_connected {
+                                "Canal de vídeo conectado. Aguardando primeiro quadro do console..."
+                            } else {
+                                "Conectando ao canal de vídeo do R36S (porta 7366)..."
+                            }
                         } else {
                             "Streaming pausado. Clique em 'Iniciar Stream' para exibir a tela."
                         },

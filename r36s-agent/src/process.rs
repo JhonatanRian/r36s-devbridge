@@ -81,22 +81,26 @@ impl ProcessManager {
         match log_type {
             "active_game" | "active" | "game" => {
                 // 1. Tenta identificar processo de jogo/port ativo e inspecionar os descritores de arquivo stdout/stderr
+                let mut active_procs = Vec::new();
                 if let Ok(entries) = std::fs::read_dir("/proc") {
                     for entry in entries.flatten() {
                         if let Ok(name) = entry.file_name().into_string() {
                             if let Ok(pid) = name.parse::<u32>() {
                                 let cmdline_path = entry.path().join("cmdline");
                                 if let Ok(cmdline) = std::fs::read_to_string(cmdline_path) {
-                                    let lower = cmdline.to_lowercase();
+                                    let clean_cmd = cmdline.replace('\0', " ").trim().to_string();
+                                    let lower = clean_cmd.to_lowercase();
                                     let is_game = lower.contains("retroarch")
                                         || lower.contains("drastic")
                                         || lower.contains("ppsspp")
                                         || lower.contains("mupen64plus")
                                         || lower.contains("/roms/ports/")
-                                        || lower.contains(".sh");
+                                        || lower.contains("java")
+                                        || lower.contains("dialog");
                                     let is_excluded = lower.contains("r36s-agent") || lower.contains("emulationstation");
 
                                     if is_game && !is_excluded {
+                                        active_procs.push(format!("PID {}: {}", pid, clean_cmd));
                                         // Verifica se stdout ou stderr foram redirecionados para arquivo
                                         for fd in ["1", "2"] {
                                             let fd_path = entry.path().join("fd").join(fd);
@@ -119,51 +123,146 @@ impl ProcessManager {
 
                 // 2. Fallbacks conhecidos de logs de ports/jogos
                 let candidates = [
-                    "/roms/ports/log.txt",
-                    "/roms2/ports/log.txt",
+                    "/dev/shm/runcommand.log",
                     "/dev/shm/run.log",
                     "/tmp/run.log",
+                    "/tmp/retroarch.log",
                     "/home/ark/.config/retroarch/retroarch.log",
+                    "/roms/ports/log.txt",
+                    "/roms2/ports/log.txt",
                 ];
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return format!("[Arquivo: {}]\n{}", path, content);
+                            if !content.trim().is_empty() {
+                                return format!("[Arquivo: {}]\n{}", path, content);
+                            }
                         }
                     }
                 }
 
-                "Nenhum jogo/port ativo com saída de log redirecionada no momento.".to_string()
+                let mut diag = String::from("=== Diagnóstico em Tempo Real (Jogo / Port Ativo) ===\n");
+                if active_procs.is_empty() {
+                    diag.push_str("Processos de jogo/port ativos: Nenhum em execução no momento.\n");
+                } else {
+                    diag.push_str("Processos de jogo/port ativos:\n");
+                    for p in &active_procs {
+                        diag.push_str(&format!("  - {}\n", p));
+                    }
+                }
+                if let Ok(clients) = std::fs::read_to_string("/sys/kernel/debug/dri/0/clients") {
+                    diag.push_str("\n[Clientes DRM /dev/dri/card0]\n");
+                    diag.push_str(&clients);
+                }
+                if let Ok(summary) = std::fs::read_to_string("/sys/kernel/debug/dri/0/summary") {
+                    diag.push_str("\n[Estado do Vídeo VOP/KMS]\n");
+                    diag.push_str(&summary);
+                }
+                diag
             }
             "emulationstation" | "es" => {
                 let candidates = [
                     "/home/ark/.emulationstation/es_log.txt",
                     "/home/ark/.emulationstation/es_log.txt.bak",
+                    "/dev/shm/es_log.txt",
                     "/tmp/es_log.txt",
                 ];
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            if !content.trim().is_empty() {
+                                return format!("[Arquivo: {}]\n{}", path, content);
+                            }
                         }
                     }
                 }
-                "Nenhum log do EmulationStation encontrado em /home/ark/.emulationstation/.".to_string()
+                let mut diag = String::from("=== Estado do EmulationStation (es_log.txt desativado por padrão no ArkOS) ===\n");
+                if let Ok(out) = Command::new("systemctl").args(["status", "emulationstation.service", "--no-pager"]).output() {
+                    diag.push_str(&String::from_utf8_lossy(&out.stdout));
+                }
+                if let Ok(clients) = std::fs::read_to_string("/sys/kernel/debug/dri/0/clients") {
+                    diag.push_str("\n[Clientes DRM /dev/dri/card0]\n");
+                    diag.push_str(&clients);
+                }
+                diag
             }
             "retroarch" => {
                 let candidates = [
+                    "/dev/shm/runcommand.log",
+                    "/dev/shm/run.log",
                     "/home/ark/.config/retroarch/retroarch.log",
+                    "/dev/shm/retroarch.log",
                     "/roms/ports/retroarch.log",
                     "/tmp/retroarch.log",
+                    "/tmp/run.log",
                 ];
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            if !content.trim().is_empty() {
+                                return format!("[Arquivo: {}]\n{}", path, content);
+                            }
                         }
                     }
                 }
-                "Nenhum log do RetroArch encontrado.".to_string()
+                let mut diag = String::from("=== Diagnóstico RetroArch / Vídeo KMS ===\n");
+                diag.push_str("Nota: O ArkOS executa o RetroArch sem arquivo de log em disco por padrão.\n");
+                if let Ok(clients) = std::fs::read_to_string("/sys/kernel/debug/dri/0/clients") {
+                    diag.push_str("\n[Clientes DRM /dev/dri/card0]\n");
+                    diag.push_str(&clients);
+                }
+                if let Ok(summary) = std::fs::read_to_string("/sys/kernel/debug/dri/0/summary") {
+                    diag.push_str("\n[Resumo VOP / Planos KMS]\n");
+                    diag.push_str(&summary);
+                }
+                diag
+            }
+            "run" | "runcommand" => {
+                let candidates = [
+                    "/dev/shm/runcommand.log",
+                    "/dev/shm/run.log",
+                    "/tmp/run.log",
+                    "/var/log/run.log",
+                ];
+                for path in candidates {
+                    if Path::new(path).exists() {
+                        if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
+                            if !content.trim().is_empty() {
+                                return format!("[Arquivo: {}]\n{}", path, content);
+                            }
+                        }
+                    }
+                }
+                "Nenhum log em /dev/shm/runcommand.log ou /dev/shm/run.log no momento.".to_string()
+            }
+            "syslog" | "system" => {
+                let candidates = [
+                    "/var/log/syslog",
+                    "/var/log/messages",
+                ];
+                for path in candidates {
+                    if Path::new(path).exists() {
+                        if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
+                            if !content.trim().is_empty() {
+                                return format!("[Arquivo: {}]\n{}", path, content);
+                            }
+                        }
+                    }
+                }
+                let mut diag = String::from("=== Diagnóstico do Sistema ArkOS ===\n");
+                if let Ok(out) = Command::new("systemctl").args(["--failed", "--no-pager"]).output() {
+                    diag.push_str("[Serviços com falha]\n");
+                    diag.push_str(&String::from_utf8_lossy(&out.stdout));
+                }
+                if let Ok(out) = Command::new("df").args(["-h", "/", "/roms", "/boot"]).output() {
+                    diag.push_str("\n[Uso de Disco]\n");
+                    diag.push_str(&String::from_utf8_lossy(&out.stdout));
+                }
+                if let Ok(out) = Command::new("ip").args(["-brief", "addr"]).output() {
+                    diag.push_str("\n[Interfaces de Rede]\n");
+                    diag.push_str(&String::from_utf8_lossy(&out.stdout));
+                }
+                diag
             }
             "java" | "freej2me" => {
                 let candidates = [
@@ -175,7 +274,7 @@ impl ProcessManager {
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            return format!("[Arquivo: {}]\n{}", path, content);
                         }
                     }
                 }
@@ -191,7 +290,7 @@ impl ProcessManager {
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            return format!("[Arquivo: {}]\n{}", path, content);
                         }
                     }
                 }
@@ -206,7 +305,7 @@ impl ProcessManager {
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            return format!("[Arquivo: {}]\n{}", path, content);
                         }
                     }
                 }
@@ -221,7 +320,7 @@ impl ProcessManager {
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            return format!("[Arquivo: {}]\n{}", path, content);
                         }
                     }
                 }
@@ -235,7 +334,7 @@ impl ProcessManager {
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
-                            return content;
+                            return format!("[Arquivo: {}]\n{}", path, content);
                         }
                     }
                 }
@@ -254,7 +353,12 @@ impl ProcessManager {
                     Err(e) => format!("Falha ao invocar dmesg: {}", e),
                 }
             }
-            "journalctl" | "agent" => {
+            "journalctl" | "agent" | "daemon" => {
+                if Path::new("/var/log/r36s-agent.log").exists() {
+                    if let Ok(content) = Self::tail_file("/var/log/r36s-agent.log", lines_to_fetch) {
+                        return format!("[/var/log/r36s-agent.log]\n{}", content);
+                    }
+                }
                 match Command::new("journalctl")
                     .args(["-u", "r36s-agent", "-n", &lines_to_fetch.to_string(), "--no-pager"])
                     .output()
@@ -264,7 +368,7 @@ impl ProcessManager {
                         if !text.trim().is_empty() {
                             text.into_owned()
                         } else {
-                            "Sem registros recentes do r36s-agent no journalctl.".to_string()
+                            "Sem registros recentes do r36s-agent no journalctl ou /var/log/r36s-agent.log.".to_string()
                         }
                     }
                     Ok(output) => {
@@ -274,7 +378,7 @@ impl ProcessManager {
                     Err(e) => format!("Falha ao invocar journalctl: {}", e),
                 }
             }
-            _ => format!("Tipo de log desconhecido: {}", log_type),
+            _ => format!("Tipo de log desconhecido: {}. Tipos suportados: active_game, run, emulationstation, retroarch, agent, dmesg, syslog, port, java, ppsspp, drastic, mupen64plus", log_type),
         }
     }
 

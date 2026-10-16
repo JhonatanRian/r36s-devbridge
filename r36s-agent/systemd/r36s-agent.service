@@ -10,7 +10,7 @@ ExecStart=/usr/local/bin/r36s-agent
 Restart=always
 RestartSec=3
 TimeoutStopSec=10s
-KillMode=control-group
+KillMode=process
 StandardOutput=append:/var/log/r36s-agent.log
 StandardError=append:/var/log/r36s-agent.log
 

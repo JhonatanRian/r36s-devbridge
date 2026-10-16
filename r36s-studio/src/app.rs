@@ -124,12 +124,13 @@ impl eframe::App for DevBridgeApp {
                     }
                 }
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.selectable_value(&mut self.current_tab, ActiveTab::Processes, "⚙ Processos");
-                    ui.selectable_value(&mut self.current_tab, ActiveTab::Logs, "📜 Logs");
-                    ui.selectable_value(&mut self.current_tab, ActiveTab::Deploy, "📦 Deploy");
-                    ui.selectable_value(&mut self.current_tab, ActiveTab::ViewportAndTelemetry, "🖥 Monitor & Tela");
-                });
+                ui.separator();
+
+                // Botões de Abas limpos e diretos (sem right_to_left overlap)
+                ui.selectable_value(&mut self.current_tab, ActiveTab::ViewportAndTelemetry, "🖥 Monitor & Tela");
+                ui.selectable_value(&mut self.current_tab, ActiveTab::Deploy, "📦 Deploy");
+                ui.selectable_value(&mut self.current_tab, ActiveTab::Logs, "📜 Logs");
+                ui.selectable_value(&mut self.current_tab, ActiveTab::Processes, "⚙ Processos");
             });
             ui.add_space(4.0);
         });
@@ -168,9 +169,11 @@ impl eframe::App for DevBridgeApp {
         egui::CentralPanel::default().show(ctx, |ui| {
             match self.current_tab {
                 ActiveTab::ViewportAndTelemetry => {
+                    let video_connected = self.connection.video_connected.load(Ordering::Relaxed);
                     self.viewport.render(
                         ui,
                         is_streaming,
+                        video_connected,
                         current_fps,
                         frame_snapshot.as_ref(),
                     );
