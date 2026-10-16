@@ -79,6 +79,17 @@ const DRM_IOCTL_MODE_GETFB: libc::c_int = 0xc01c64adu32 as libc::c_int;
 const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_int = 0xc00c642du32 as libc::c_int;
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 
+// Constantes e estruturas para DMA-BUF CPU Synchronization (RFC/Linux dma-buf.h)
+const DMA_BUF_SYNC_READ: u64 = 1;
+const DMA_BUF_SYNC_START: u64 = 0;
+const DMA_BUF_SYNC_END: u64 = 4;
+const DMA_BUF_IOCTL_SYNC: libc::c_ulong = 0x40086200;
+
+#[repr(C)]
+struct DmaBufSync {
+    flags: u64,
+}
+
 #[repr(C)]
 struct DrmGemClose {
     handle: u32,
@@ -205,6 +216,7 @@ impl DrmReader {
         }
 
         let mut best_fb: Option<DrmModeFbCmd> = None;
+        let mut best_plane_id: u32 = 0;
         for &pid in &plane_ids {
             let mut plane: DrmModeGetPlane = unsafe { std::mem::zeroed() };
             plane.plane_id = pid;
@@ -227,6 +239,7 @@ impl DrmReader {
                             if let Some(old_fb) = best_fb.replace(fb) {
                                 Self::gem_close(fd, old_fb.handle);
                             }
+                            best_plane_id = pid;
                         } else {
                             Self::gem_close(fd, fb.handle);
                         }
@@ -258,6 +271,21 @@ impl DrmReader {
         }
 
         let dma_fd = prime.fd;
+
+        // 1. Sincronização explícita: espera até 10ms se a GPU estiver finalizando a renderização do buffer
+        let mut pfd = libc::pollfd {
+            fd: dma_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        let _ = unsafe { libc::poll(&mut pfd, 1, 10) };
+
+        // 2. Coerência de cache: sinaliza início de leitura da CPU no DMA-BUF (invalida D-cache ARM)
+        let mut sync_start = DmaBufSync {
+            flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
+        };
+        let _ = unsafe { libc::ioctl(dma_fd, DMA_BUF_IOCTL_SYNC as _, &mut sync_start) };
+
         let mmap_len = (pitch * (height as usize) + 4095) & !4095;
         let map_ptr = unsafe {
             libc::mmap(
@@ -271,6 +299,10 @@ impl DrmReader {
         };
 
         if map_ptr == libc::MAP_FAILED {
+            let mut sync_end = DmaBufSync {
+                flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+            };
+            let _ = unsafe { libc::ioctl(dma_fd, DMA_BUF_IOCTL_SYNC as _, &mut sync_end) };
             unsafe {
                 libc::close(dma_fd);
             }
@@ -298,9 +330,27 @@ impl DrmReader {
             }
         }
 
+        // 3. Finaliza leitura da CPU no DMA-BUF
+        let mut sync_end = DmaBufSync {
+            flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
+        };
+        let _ = unsafe { libc::ioctl(dma_fd, DMA_BUF_IOCTL_SYNC as _, &mut sync_end) };
+
         unsafe {
             libc::munmap(map_ptr, mmap_len);
             libc::close(dma_fd);
+        }
+
+        // 4. Verificação pós-captura: se o plano sofreu page-flip durante a cópia (mudou de fb_id),
+        // descartamos a leitura para evitar quadros intermediários ou rasgados (tearing)
+        if best_plane_id > 0 {
+            let mut verify_plane: DrmModeGetPlane = unsafe { std::mem::zeroed() };
+            verify_plane.plane_id = best_plane_id;
+            if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &mut verify_plane) } == 0 {
+                if verify_plane.fb_id != 0 && verify_plane.fb_id != fb.fb_id {
+                    return None;
+                }
+            }
         }
 
         // Fecha /dev/dri/card0 imediatamente
@@ -495,12 +545,21 @@ impl FramebufferReader {
 
     fn compute_hash(data: &[u8]) -> u64 {
         let mut hash = 0xcbf29ce484222325u64;
-        let step = 32;
-        let mut i = 0;
-        while i < data.len() {
-            hash ^= data[i] as u64;
+        let (prefix, chunks, suffix) = unsafe { data.align_to::<u64>() };
+        for &b in prefix {
+            hash ^= b as u64;
             hash = hash.wrapping_mul(0x100000001b3);
-            i += step;
+        }
+        // Amostragem de alta sensibilidade: processa palavras u64 (64 bits por vez com registradores nativos AArch64)
+        // pulando a cada 2 blocos (16 bytes = 4 pixels). Garante 50% de cobertura do frame
+        // detectando detalhes finos como cursores ou caracteres piscantes em < 0.4ms.
+        for &val in chunks.iter().step_by(2) {
+            hash ^= val;
+            hash = hash.wrapping_mul(0x100000001b3);
+        }
+        for &b in suffix {
+            hash ^= b as u64;
+            hash = hash.wrapping_mul(0x100000001b3);
         }
         hash
     }

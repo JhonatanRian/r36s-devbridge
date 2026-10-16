@@ -94,6 +94,21 @@ If DRM planes are transitioning, the capture pipeline falls back automatically t
 
 ---
 
+## ⚡ GPU Fence Synchronization & Tearing Prevention (DMA-BUF)
+
+When emulators render through Mali GPU (OpenGL ES) with double buffering, the GPU writes to the back-buffer asynchronously in tiles ($16 \times 16$ pixels). If the CPU reads the mapped DMA buffer while the GPU is clearing or rendering:
+1. The top rows might be read while still cleared to zero (`0x00`), resulting in flickering or missing status bars.
+2. The CPU data caches (D-cache) might hold stale cache lines from previous frames.
+
+### Three-Fold Solution in `r36s-agent`:
+1. **Implicit Fence Polling:** Before reading, the agent polls the DMA-BUF file descriptor with `libc::poll(&mut pfd, 1, 10)` (`POLLIN`). This yields CPU time until any pending GPU write reservation fence on the buffer is resolved.
+2. **DMA-BUF Cache Synchronization (`DMA_BUF_IOCTL_SYNC`):**
+   - **`DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ`**: Signals the kernel that the CPU is beginning to read from the memory, forcing ARM CPU cache invalidation.
+   - **`DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ`**: Completes the read operation.
+3. **Post-Capture Consistency Check:** After reading, the agent queries the DRM plane's `fb_id` again. If the game issued a `drmModePageFlip` during the copy, the frame is discarded as torn, and the clean frame is retained without flickering.
+
+---
+
 ## 🎨 The 32-bit Alpha Channel Black Screen Dilemma
 
 One of the most elusive bugs during development was a **completely black screen** in `r36s-studio` even though:
