@@ -103,7 +103,7 @@ dependencies = [
 
 [[package]]
 name = "r36s-agent"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "libc",
  "lz4_flex",
