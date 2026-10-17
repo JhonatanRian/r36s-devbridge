@@ -1,6 +1,6 @@
 use crate::protocol::{
-    FORMAT_BGRA8888_LZ4, FORMAT_RGB565_LZ4, FORMAT_RGBA8888_LZ4, FRAME_FLAG_FB_UNAVAILABLE,
-    FRAME_FLAG_KEYFRAME, FRAME_FLAG_UNCHANGED,
+    FORMAT_BGRA8888_LZ4, FORMAT_RGB565_LZ4, FORMAT_RGBA8888_LZ4, FRAME_FLAG_DELTA,
+    FRAME_FLAG_FB_UNAVAILABLE, FRAME_FLAG_KEYFRAME, FRAME_FLAG_UNCHANGED,
 };
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -349,25 +349,43 @@ impl DrmReader {
 
         self.timing.0 = sync_started.elapsed().as_micros() as u64;
         let copy_started = Instant::now();
-        let total_frame_bytes = row_bytes * (height as usize);
-        if packed_buffer.len() != total_frame_bytes {
-            packed_buffer.resize(total_frame_bytes, 0);
-        }
 
         let src_slice = unsafe { std::slice::from_raw_parts(map_ptr as *const u8, mmap_len) };
-        if pitch == row_bytes {
-            if total_frame_bytes <= src_slice.len() {
-                packed_buffer.copy_from_slice(&src_slice[..total_frame_bytes]);
+
+        if bpp == 32 {
+            let out_row_bytes = (width as usize) * 2;
+            let total_frame_bytes = out_row_bytes * (height as usize);
+            if packed_buffer.len() != total_frame_bytes {
+                packed_buffer.resize(total_frame_bytes, 0);
             }
+
+            downpack_bgra8888_to_rgb565(
+                src_slice,
+                pitch,
+                width as usize,
+                height as usize,
+                packed_buffer,
+            );
         } else {
-            for y in 0..(height as usize) {
-                let src_off = y * pitch;
-                let dst_off = y * row_bytes;
-                if src_off + row_bytes <= src_slice.len()
-                    && dst_off + row_bytes <= packed_buffer.len()
-                {
-                    packed_buffer[dst_off..dst_off + row_bytes]
-                        .copy_from_slice(&src_slice[src_off..src_off + row_bytes]);
+            let total_frame_bytes = row_bytes * (height as usize);
+            if packed_buffer.len() != total_frame_bytes {
+                packed_buffer.resize(total_frame_bytes, 0);
+            }
+
+            if pitch == row_bytes {
+                if total_frame_bytes <= src_slice.len() {
+                    packed_buffer.copy_from_slice(&src_slice[..total_frame_bytes]);
+                }
+            } else {
+                for y in 0..(height as usize) {
+                    let src_off = y * pitch;
+                    let dst_off = y * row_bytes;
+                    if src_off + row_bytes <= src_slice.len()
+                        && dst_off + row_bytes <= packed_buffer.len()
+                    {
+                        packed_buffer[dst_off..dst_off + row_bytes]
+                            .copy_from_slice(&src_slice[src_off..src_off + row_bytes]);
+                    }
                 }
             }
         }
@@ -387,11 +405,7 @@ impl DrmReader {
         // Fecha /dev/dri/card0 imediatamente
         drop(card);
 
-        let format = if bpp == 32 {
-            FORMAT_BGRA8888_LZ4
-        } else {
-            FORMAT_RGB565_LZ4
-        };
+        let format = FORMAT_RGB565_LZ4;
 
         if sync_ok {
             Some((width, height, format))
@@ -415,6 +429,7 @@ pub struct FramebufferReader {
     frame_counter: u64,
     packed_buffer: Vec<u8>,
     prev_frame_buffer: Vec<u8>,
+    delta_buffer: Vec<u8>,
     transition_start: Option<Instant>,
     mock_start: Instant,
     mock_frame: u32,
@@ -436,6 +451,7 @@ impl FramebufferReader {
             frame_counter: 0,
             packed_buffer: vec![0u8; 640 * 480 * 2],
             prev_frame_buffer: Vec::new(),
+            delta_buffer: vec![0u8; 640 * 480 * 2],
             transition_start: None,
             mock_start: Instant::now(),
             mock_frame: 0,
@@ -619,6 +635,7 @@ impl FramebufferReader {
             && (self.prev_frame_buffer.len() == self.packed_buffer.len())
             && (self.prev_frame_buffer == self.packed_buffer);
 
+        let force_key = self.force_keyframe;
         self.force_keyframe = false;
 
         if is_unchanged {
@@ -632,14 +649,28 @@ impl FramebufferReader {
             );
         }
 
+        let is_delta = !force_key
+            && !periodic_keyframe
+            && (self.prev_frame_buffer.len() == self.packed_buffer.len());
+
+        let (src_buffer, flag) = if is_delta {
+            if self.delta_buffer.len() != self.packed_buffer.len() {
+                self.delta_buffer.resize(self.packed_buffer.len(), 0);
+            }
+            xor_blocks(&self.packed_buffer, &self.prev_frame_buffer, &mut self.delta_buffer);
+            (&self.delta_buffer, FRAME_FLAG_DELTA)
+        } else {
+            (&self.packed_buffer, FRAME_FLAG_KEYFRAME)
+        };
+
         // Garante que o buffer de saída tenha capacidade suficiente para o pior caso do LZ4
-        let max_compressed_len = lz4_flex::block::get_maximum_output_size(self.packed_buffer.len());
+        let max_compressed_len = lz4_flex::block::get_maximum_output_size(src_buffer.len());
         if comp_out.len() < max_compressed_len {
             comp_out.resize(max_compressed_len, 0);
         }
 
         let compress_started = Instant::now();
-        let compressed_size = match lz4_flex::block::compress_into(&self.packed_buffer, comp_out) {
+        let compressed_size = match lz4_flex::block::compress_into(src_buffer, comp_out) {
             Ok(size) => size,
             Err(_) => {
                 return (
@@ -653,15 +684,24 @@ impl FramebufferReader {
         };
 
         self.compression_us = compress_started.elapsed().as_micros() as u64;
-        // Troca os ponteiros de buffer em O(1) (< 5 ns) sem copiar 1.2 MB de RAM!
-        // Na próxima captura, self.packed_buffer apontará para o buffer antigo e será sobrescrito diretamente.
-        std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer);
+
+        if is_delta {
+            // Em delta, atualiza o buffer de referência copiando o frame atual
+            self.prev_frame_buffer.copy_from_slice(&self.packed_buffer);
+        } else {
+            // Em keyframe, troca os ponteiros de buffer em O(1) (< 5 ns)
+            if self.prev_frame_buffer.len() != self.packed_buffer.len() {
+                self.prev_frame_buffer = self.packed_buffer.clone();
+            } else {
+                std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer);
+            }
+        }
 
         (
             self.width,
             self.height,
             self.format,
-            FRAME_FLAG_KEYFRAME,
+            flag,
             compressed_size,
         )
     }
@@ -703,6 +743,80 @@ impl FramebufferReader {
     }
 }
 
+// Converte BGRA8888 para RGB565 em tempo de cópia descartando canal Alpha
+pub fn downpack_bgra8888_to_rgb565(
+    src: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    dst: &mut [u8],
+) {
+    let row_bytes = width * 4;
+    let out_row_bytes = width * 2;
+    for y in 0..height {
+        let src_row_off = y * pitch;
+        let dst_row_off = y * out_row_bytes;
+        if src_row_off + row_bytes <= src.len() && dst_row_off + out_row_bytes <= dst.len() {
+            let src_row = &src[src_row_off..src_row_off + row_bytes];
+            let dst_row = &mut dst[dst_row_off..dst_row_off + out_row_bytes];
+            for x in 0..width {
+                let b = src_row[x * 4];
+                let g = src_row[x * 4 + 1];
+                let r = src_row[x * 4 + 2];
+                let p = (((r as u16) & 0xF8) << 8)
+                    | (((g as u16) & 0xFC) << 3)
+                    | (((b as u16) & 0xF8) >> 3);
+                dst_row[x * 2] = p as u8;
+                dst_row[x * 2 + 1] = (p >> 8) as u8;
+            }
+        }
+    }
+}
+
+/// Computa XOR em blocos vetorizados: dst[i] = a[i] ^ b[i]
+pub fn xor_blocks(a: &[u8], b: &[u8], dst: &mut [u8]) {
+    let len = a.len().min(b.len()).min(dst.len());
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let mut offset = 0;
+        while offset + 16 <= len {
+            unsafe {
+                let va = vld1q_u8(a.as_ptr().add(offset));
+                let vb = vld1q_u8(b.as_ptr().add(offset));
+                let vres = veorq_u8(va, vb);
+                vst1q_u8(dst.as_mut_ptr().add(offset), vres);
+            }
+            offset += 16;
+        }
+        for i in offset..len {
+            dst[i] = a[i] ^ b[i];
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let chunks_a = a[..len].chunks_exact(16);
+        let chunks_b = b[..len].chunks_exact(16);
+        let mut chunks_dst = dst[..len].chunks_exact_mut(16);
+
+        for ((ca, cb), cd) in chunks_a.zip(chunks_b).zip(&mut chunks_dst) {
+            let ua = u128::from_ne_bytes(ca.try_into().unwrap());
+            let ub = u128::from_ne_bytes(cb.try_into().unwrap());
+            let ud = ua ^ ub;
+            cd.copy_from_slice(&ud.to_ne_bytes());
+        }
+
+        let remainder_dst = chunks_dst.into_remainder();
+        let rem_start = len - remainder_dst.len();
+        for i in 0..remainder_dst.len() {
+            remainder_dst[i] = a[rem_start + i] ^ b[rem_start + i];
+        }
+    }
+}
+
 // Cache coherence is separate from producer ownership. Never fabricate missing pixels.
 fn dma_sync(fd: libc::c_int, sync: &mut DmaBufSync) -> bool {
     for _ in 0..3 {
@@ -720,6 +834,73 @@ fn dma_sync(fd: libc::c_int, sync: &mut DmaBufSync) -> bool {
 #[cfg(test)]
 mod regression_tests {
     use super::*;
+
+    #[test]
+    fn test_downpack_bgra8888_to_rgb565() {
+        let width = 2;
+        let height = 2;
+        let pitch = width * 4;
+        // Pixel 0: Vermelho puro (B=0, G=0, R=255, A=255) -> 0xF800 (le: 0x00, 0xF8)
+        // Pixel 1: Verde puro (B=0, G=255, R=0, A=255) -> 0x07E0 (le: 0xE0, 0x07)
+        // Pixel 2: Azul puro (B=255, G=0, R=0, A=255) -> 0x001F (le: 0x1F, 0x00)
+        // Pixel 3: Branco (B=255, G=255, R=255, A=255) -> 0xFFFF (le: 0xFF, 0xFF)
+        let bgra: Vec<u8> = vec![
+            0, 0, 255, 255,
+            0, 255, 0, 255,
+            255, 0, 0, 255,
+            255, 255, 255, 255,
+        ];
+        let mut rgb565 = vec![0u8; width * height * 2];
+        downpack_bgra8888_to_rgb565(&bgra, pitch, width, height, &mut rgb565);
+
+        // Pixel 0 (Red)
+        assert_eq!(rgb565[0], 0x00);
+        assert_eq!(rgb565[1], 0xF8);
+        // Pixel 1 (Green)
+        assert_eq!(rgb565[2], 0xE0);
+        assert_eq!(rgb565[3], 0x07);
+        // Pixel 2 (Blue)
+        assert_eq!(rgb565[4], 0x1F);
+        assert_eq!(rgb565[5], 0x00);
+        // Pixel 3 (White)
+        assert_eq!(rgb565[6], 0xFF);
+        assert_eq!(rgb565[7], 0xFF);
+    }
+
+    #[test]
+    fn test_xor_blocks_roundtrip() {
+        let frame1: Vec<u8> = (0..1024).map(|i| (i * 17 % 256) as u8).collect();
+        let mut frame2 = frame1.clone();
+        // Altera alguns bytes para simular diferenças
+        for i in 100..200 {
+            frame2[i] ^= 0x5A;
+        }
+        for i in 800..815 { // tamanho não múltiplo de 16
+            frame2[i] ^= 0xC3;
+        }
+
+        let mut delta = vec![0u8; 1024];
+        xor_blocks(&frame2, &frame1, &mut delta);
+
+        // Onde não houve alteração, o delta deve ser zero
+        for i in 0..100 {
+            assert_eq!(delta[i], 0);
+        }
+        for i in 200..800 {
+            assert_eq!(delta[i], 0);
+        }
+        for i in 100..200 {
+            assert_eq!(delta[i], 0x5A);
+        }
+        for i in 800..815 {
+            assert_eq!(delta[i], 0xC3);
+        }
+
+        // Roundtrip: anterior ^ delta = atual
+        let mut reconstructed = vec![0u8; 1024];
+        xor_blocks(&frame1, &delta, &mut reconstructed);
+        assert_eq!(reconstructed, frame2);
+    }
     #[test]
     fn legitimate_black_band_and_native_color_are_preserved() {
         let mut reader = FramebufferReader::new();
@@ -729,15 +910,55 @@ mod regression_tests {
         reader.format = FORMAT_BGRA8888_LZ4;
         reader.packed_buffer = vec![137; 32 * 64 * 4];
         let mut compressed = Vec::new();
-        reader.compress_and_return_frame(&mut compressed);
-        reader.packed_buffer = reader.prev_frame_buffer.clone();
+        let (_, _, _, flag1, _) = reader.compress_and_return_frame(&mut compressed);
+        assert_eq!(flag1, FRAME_FLAG_KEYFRAME);
+
+        let prev_frame = reader.prev_frame_buffer.clone();
+        reader.packed_buffer = prev_frame.clone();
         reader.packed_buffer[20 * 32 * 4..40 * 32 * 4].fill(0);
         let expected = reader.packed_buffer.clone();
-        let (_, _, format, _, size) = reader.compress_and_return_frame(&mut compressed);
+        let (_, _, format, flag2, size) = reader.compress_and_return_frame(&mut compressed);
         assert_eq!(format, FORMAT_BGRA8888_LZ4);
-        assert_eq!(
-            lz4_flex::decompress(&compressed[..size], expected.len()).unwrap(),
-            expected
-        );
+        assert_eq!(flag2, FRAME_FLAG_DELTA);
+
+        let delta = lz4_flex::decompress(&compressed[..size], expected.len()).unwrap();
+        let mut reconstructed = vec![0u8; expected.len()];
+        xor_blocks(&prev_frame, &delta, &mut reconstructed);
+        assert_eq!(reconstructed, expected);
+    }
+
+    #[test]
+    fn test_compress_and_return_frame_flags_sequence() {
+        let mut reader = FramebufferReader::new();
+        reader.width = 16;
+        reader.height = 16;
+        reader.format = FORMAT_RGB565_LZ4;
+        reader.packed_buffer = vec![1; 16 * 16 * 2];
+        let mut comp = Vec::new();
+
+        // 1. Primeiro quadro: deve ser KEYFRAME
+        let (_, _, _, flag, size) = reader.compress_and_return_frame(&mut comp);
+        assert_eq!(flag, FRAME_FLAG_KEYFRAME);
+        assert!(size > 0);
+
+        // 2. Segundo quadro idêntico: deve ser UNCHANGED
+        reader.packed_buffer = reader.prev_frame_buffer.clone();
+        let (_, _, _, flag, size) = reader.compress_and_return_frame(&mut comp);
+        assert_eq!(flag, FRAME_FLAG_UNCHANGED);
+        assert_eq!(size, 0);
+
+        // 3. Terceiro quadro com alteração: deve ser DELTA
+        reader.packed_buffer = reader.prev_frame_buffer.clone();
+        reader.packed_buffer[0] ^= 0xFF;
+        let (_, _, _, flag, size) = reader.compress_and_return_frame(&mut comp);
+        assert_eq!(flag, FRAME_FLAG_DELTA);
+        assert!(size > 0);
+
+        // 4. Força keyframe
+        reader.force_keyframe = true;
+        reader.packed_buffer = reader.prev_frame_buffer.clone();
+        let (_, _, _, flag, size) = reader.compress_and_return_frame(&mut comp);
+        assert_eq!(flag, FRAME_FLAG_KEYFRAME);
+        assert!(size > 0);
     }
 }

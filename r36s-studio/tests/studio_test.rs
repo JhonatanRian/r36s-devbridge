@@ -72,3 +72,52 @@ fn convert_rgb565(rgb565: &[u8], width: usize, height: usize) -> Vec<u8> {
 
     rgba
 }
+
+#[test]
+fn test_keyframe_and_delta_xor_decoding() {
+    use r36s_studio::connection::ConnectionManager;
+
+    let width = 4;
+    let height = 4;
+    let frame_len = width * height * 2; // RGB565
+
+    // 1. Simula quadro de referência inicial (Keyframe)
+    let keyframe_raw: Vec<u8> = (0..frame_len).map(|i| (i * 23 % 256) as u8).collect();
+    let mut comp_keyframe_raw = vec![0u8; lz4_flex::block::get_maximum_output_size(keyframe_raw.len())];
+    let comp_sz = lz4_flex::block::compress_into(&keyframe_raw, &mut comp_keyframe_raw).unwrap();
+
+    // Studio recebe keyframe
+    let decomp_keyframe = lz4_flex::decompress(&comp_keyframe_raw[..comp_sz], frame_len).unwrap();
+    let mut raw_reference_buffer = decomp_keyframe.clone();
+    assert_eq!(raw_reference_buffer, keyframe_raw);
+
+    // 2. Simula próximo quadro modificado (Frame 2)
+    let mut frame2_raw = keyframe_raw.clone();
+    // Modifica alguns pixels
+    frame2_raw[2] ^= 0xAA;
+    frame2_raw[3] ^= 0x55;
+    frame2_raw[10] ^= 0xFF;
+
+    // Agente calcula XOR delta: delta = frame2 ^ keyframe
+    let mut delta = vec![0u8; frame_len];
+    for i in 0..frame_len {
+        delta[i] = frame2_raw[i] ^ keyframe_raw[i];
+    }
+
+    let mut comp_delta_buf = vec![0u8; lz4_flex::block::get_maximum_output_size(delta.len())];
+    let delta_sz = lz4_flex::block::compress_into(&delta, &mut comp_delta_buf).unwrap();
+
+    // Studio recebe delta
+    let decomp_delta = lz4_flex::decompress(&comp_delta_buf[..delta_sz], frame_len).unwrap();
+    ConnectionManager::apply_xor_delta(&mut raw_reference_buffer, &decomp_delta);
+
+    // O buffer de referência reconstruído deve ser exatamente igual ao frame2_raw
+    assert_eq!(raw_reference_buffer, frame2_raw);
+
+    // 3. Converte para RGBA e garante conformidade de cores
+    let rgba = ConnectionManager::rgb565_to_rgba(&raw_reference_buffer, width, height);
+    assert_eq!(rgba.len(), width * height * 4);
+    for chunk in rgba.chunks_exact(4) {
+        assert_eq!(chunk[3], 255); // Alpha sempre opaco
+    }
+}

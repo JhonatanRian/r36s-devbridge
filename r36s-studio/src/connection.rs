@@ -850,12 +850,14 @@ impl ConnectionManager {
 
         let mut header_buf = [0u8; 20];
         let mut comp_buf = Vec::with_capacity(640 * 480 * 4 + 65536);
+        let mut raw_reference_buffer = Vec::new();
 
         loop {
             if !is_streaming.load(Ordering::Relaxed) {
                 *current_frame.lock().unwrap() = None;
                 *received.lock().unwrap() = None;
                 video_connected.store(false, Ordering::Relaxed);
+                raw_reference_buffer.clear();
                 thread::sleep(Duration::from_millis(100));
                 continue;
             }
@@ -869,6 +871,7 @@ impl ConnectionManager {
                 *current_frame.lock().unwrap() = None;
                 *received.lock().unwrap() = None;
                 video_connected.store(false, Ordering::Relaxed);
+                raw_reference_buffer.clear();
                 thread::sleep(Duration::from_millis(200));
                 continue;
             }
@@ -897,12 +900,12 @@ impl ConnectionManager {
                                     header.format,
                                     FORMAT_RGB565_LZ4 | FORMAT_BGRA8888_LZ4 | FORMAT_RGBA8888_LZ4
                                 )
-                                || header.flags > 3
+                                || header.flags > 4
                                 || (matches!(header.flags, 1 | 2) && size != 0)
                                 || size > max_allowed
-                                || (size == 0 && header.flags == 0)
+                                || (size == 0 && (header.flags == 0 || header.flags == 4))
                             {
-                                Self::add_diag(&diag, &format!("Aviso: Pacote de vídeo inválido (tam {size}, max {max_allowed})"));
+                                Self::add_diag(&diag, &format!("Aviso: Pacote de vídeo inválido (tam {size}, max {max_allowed}, flags {})", header.flags));
                                 break;
                             }
 
@@ -941,16 +944,29 @@ impl ConnectionManager {
                             // Descompacta LZ4 com o tamanho correto do formato do frame
                             match lz4_flex::decompress(&comp_buf, expected_uncompressed) {
                                 Ok(decomp_buf) => {
-                                    // Converte para RGBA8888 de acordo com o formato de entrada
+                                    // Processa keyframe vs delta XOR
+                                    if header.flags == FRAME_FLAG_DELTA {
+                                        if raw_reference_buffer.len() == expected_uncompressed {
+                                            Self::apply_xor_delta(&mut raw_reference_buffer, &decomp_buf);
+                                        } else {
+                                            // Dessincronia de referência: ignora até o próximo keyframe
+                                            continue;
+                                        }
+                                    } else {
+                                        // Keyframe (flags == 0 ou mock/outro): substitui buffer de referência
+                                        raw_reference_buffer = decomp_buf;
+                                    }
+
+                                    // Converte para RGBA8888 a partir do buffer de referência reconstruído
                                     let rgba = match header.format {
                                         FORMAT_RGB565_LZ4 => Self::rgb565_to_rgba(
-                                            &decomp_buf,
+                                            &raw_reference_buffer,
                                             header.width as usize,
                                             header.height as usize,
                                         ),
-                                        FORMAT_BGRA8888_LZ4 => Self::bgra_to_rgba(&decomp_buf),
+                                        FORMAT_BGRA8888_LZ4 => Self::bgra_to_rgba(&raw_reference_buffer),
                                         _ => {
-                                            let mut buf = decomp_buf;
+                                            let mut buf = raw_reference_buffer.clone();
                                             Self::sanitize_rgba_alpha(&mut buf);
                                             buf
                                         }
@@ -984,10 +1000,12 @@ impl ConnectionManager {
                         }
                     }
                     video_connected.store(false, Ordering::Relaxed);
+                    raw_reference_buffer.clear();
                     Self::add_diag(&diag, "Canal de vídeo desconectado.");
                 }
                 Err(_) => {
                     video_connected.store(false, Ordering::Relaxed);
+                    raw_reference_buffer.clear();
                     thread::sleep(Duration::from_millis(500));
                 }
             }
@@ -1035,6 +1053,24 @@ impl ConnectionManager {
     pub fn sanitize_rgba_alpha(rgba: &mut [u8]) {
         for chunk in rgba.chunks_exact_mut(4) {
             chunk[3] = 255;
+        }
+    }
+
+    pub fn apply_xor_delta(reference: &mut [u8], delta: &[u8]) {
+        let len = reference.len().min(delta.len());
+        let chunks_delta = delta[..len].chunks_exact(16);
+        let mut chunks_ref = reference[..len].chunks_exact_mut(16);
+
+        for (cr, cd) in (&mut chunks_ref).zip(chunks_delta) {
+            let ur = u128::from_ne_bytes(cr.try_into().unwrap());
+            let ud = u128::from_ne_bytes(cd.try_into().unwrap());
+            cr.copy_from_slice(&(ur ^ ud).to_ne_bytes());
+        }
+
+        let remainder_ref = chunks_ref.into_remainder();
+        let rem_start = len - remainder_ref.len();
+        for i in 0..remainder_ref.len() {
+            remainder_ref[i] ^= delta[rem_start + i];
         }
     }
 }

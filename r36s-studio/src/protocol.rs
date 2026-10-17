@@ -16,6 +16,7 @@ pub const FRAME_FLAG_KEYFRAME: u8 = 0;
 pub const FRAME_FLAG_UNCHANGED: u8 = 1;
 pub const FRAME_FLAG_FB_UNAVAILABLE: u8 = 2;
 pub const FRAME_FLAG_MOCK: u8 = 3;
+pub const FRAME_FLAG_DELTA: u8 = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProcessInfo {
