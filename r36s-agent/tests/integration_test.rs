@@ -47,16 +47,63 @@ fn test_metrics_collector() {
 
 #[test]
 fn test_framebuffer_mock_and_lz4() {
+    std::env::set_var("DEVBRIDGE_ALLOW_MOCK", "1");
     let mut reader = FramebufferReader::new();
-    let (w, h, format, _flags, compressed) = reader.capture_frame();
+    let mut comp_buf = Vec::new();
+    let (w, h, format, _flags, compressed_len) = reader.capture_frame(&mut comp_buf);
 
     assert_eq!(w, 640);
     assert_eq!(h, 480);
     assert_eq!(format, FORMAT_RGB565_LZ4);
-    assert!(!compressed.is_empty(), "Frame comprimido não deve estar vazio");
+    assert!(compressed_len > 0, "Frame comprimido não deve estar vazio");
 
     // Testa descompressão LZ4
     let expected_len = (w as usize) * (h as usize) * 2;
-    let decompressed = lz4_flex::decompress(&compressed, expected_len).expect("Falha ao descompactar LZ4");
+    let decompressed = lz4_flex::decompress(&comp_buf[..compressed_len], expected_len).expect("Falha ao descompactar LZ4");
     assert_eq!(decompressed.len(), expected_len);
+}
+
+#[test]
+fn test_gamepad_service_listening_and_injection() {
+    use r36s_agent::gamepad::GamepadService;
+    use r36s_agent::protocol::*;
+
+    let service = GamepadService::new_mock();
+    assert!(!service.is_listening());
+
+    service.set_listening(true);
+    assert!(service.is_listening());
+
+    let state = service.get_state();
+    assert_eq!(state.buttons, 0);
+
+    // Test button press injection
+    service.inject_action(&GamepadInputAction::Button {
+        mask: BTN_MASK_A,
+        pressed: true,
+    }).unwrap();
+
+    let state_after = service.get_state();
+    assert_eq!(state_after.buttons & BTN_MASK_A, BTN_MASK_A);
+
+    // Test button release injection
+    service.inject_action(&GamepadInputAction::Button {
+        mask: BTN_MASK_A,
+        pressed: false,
+    }).unwrap();
+
+    let state_released = service.get_state();
+    assert_eq!(state_released.buttons & BTN_MASK_A, 0);
+
+    // Test axis injection
+    service.inject_action(&GamepadInputAction::Axis {
+        left_x: 16000,
+        left_y: -16000,
+        right_x: 0,
+        right_y: 0,
+    }).unwrap();
+
+    let state_axis = service.get_state();
+    assert_eq!(state_axis.left_x, 16000);
+    assert_eq!(state_axis.left_y, -16000);
 }

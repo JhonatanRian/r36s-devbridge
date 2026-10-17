@@ -18,6 +18,7 @@ pub struct AgentServer {
     active_video_session: Arc<AtomicU32>,
     metrics_collector: Arc<MetricsCollector>,
     fb_reader: Arc<Mutex<FramebufferReader>>,
+    gamepad: Arc<crate::gamepad::GamepadService>,
 }
 
 impl AgentServer {
@@ -26,6 +27,7 @@ impl AgentServer {
         let reader = FramebufferReader::new();
         let metrics = Arc::new(MetricsCollector::new());
         metrics.set_fb_info(reader.width, reader.height, reader.bpp, reader.format);
+        let gamepad = Arc::new(crate::gamepad::GamepadService::new());
 
         Self {
             streaming_enabled: Arc::new(AtomicBool::new(false)),
@@ -34,6 +36,7 @@ impl AgentServer {
             active_video_session: Arc::new(AtomicU32::new(0)),
             metrics_collector: metrics,
             fb_reader: Arc::new(Mutex::new(reader)),
+            gamepad,
         }
     }
 
@@ -99,6 +102,7 @@ impl AgentServer {
                     let control_id_gen = Arc::clone(&self.active_control_id);
                     let session_id = control_id_gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
                     let metrics = Arc::clone(&self.metrics_collector);
+                    let gamepad = Arc::clone(&self.gamepad);
                     thread::spawn(move || {
                         Self::handle_control_client(
                             stream,
@@ -107,6 +111,7 @@ impl AgentServer {
                             control_id_gen,
                             session_id,
                             metrics,
+                            gamepad,
                         );
                     });
                 }
@@ -124,6 +129,7 @@ impl AgentServer {
         active_control_id: Arc<AtomicU32>,
         session_id: u32,
         metrics: Arc<MetricsCollector>,
+        gamepad: Arc<crate::gamepad::GamepadService>,
     ) {
         let peer_addr = stream.peer_addr().ok();
         println!("[r36s-agent] Cliente de controle conectado (sessão {}): {:?}", session_id, peer_addr);
@@ -274,6 +280,29 @@ impl AgentServer {
                             message: e,
                         },
                     },
+                    ClientCommand::SetGamepadMonitor { enabled } => {
+                        gamepad.set_listening(enabled);
+                        ServerResponse::GamepadAck {
+                            success: true,
+                            message: format!("Monitoramento de controles: {}", if enabled { "ATIVADO" } else { "DESATIVADO" }),
+                        }
+                    }
+                    ClientCommand::GetGamepadState => {
+                        let state = gamepad.get_state();
+                        ServerResponse::GamepadStateResponse(state)
+                    }
+                    ClientCommand::InjectGamepadInput { action } => {
+                        match gamepad.inject_action(&action) {
+                            Ok(_) => ServerResponse::GamepadAck {
+                                success: true,
+                                message: "Comando de controle injetado com sucesso".to_string(),
+                            },
+                            Err(e) => ServerResponse::GamepadAck {
+                                success: false,
+                                message: format!("Falha ao injetar comando: {}", e),
+                            },
+                        }
+                    }
                 },
                 Err(err) => ServerResponse::Error {
                     message: format!("Comando inválido: {}", err),

@@ -40,6 +40,9 @@ pub struct ConnectionManager {
     pub last_process_result: Arc<Mutex<Option<(bool, String)>>>,
     pub total_bytes_rx: Arc<AtomicU64>,
     pub total_bytes_tx: Arc<AtomicU64>,
+    pub gamepad_listening: Arc<AtomicBool>,
+    pub gamepad_input_enabled: Arc<AtomicBool>,
+    pub gamepad_state: Arc<Mutex<GamepadState>>,
     cmd_sender: Sender<ClientCommand>,
 }
 
@@ -62,6 +65,9 @@ impl ConnectionManager {
         let last_process_result = Arc::new(Mutex::new(None));
         let total_bytes_rx = Arc::new(AtomicU64::new(0));
         let total_bytes_tx = Arc::new(AtomicU64::new(0));
+        let gamepad_listening = Arc::new(AtomicBool::new(false));
+        let gamepad_input_enabled = Arc::new(AtomicBool::new(false));
+        let gamepad_state = Arc::new(Mutex::new(GamepadState::default()));
 
         let (cmd_tx, cmd_rx) = channel::<ClientCommand>();
 
@@ -80,6 +86,9 @@ impl ConnectionManager {
             last_process_result: Arc::clone(&last_process_result),
             total_bytes_rx: Arc::clone(&total_bytes_rx),
             total_bytes_tx: Arc::clone(&total_bytes_tx),
+            gamepad_listening: Arc::clone(&gamepad_listening),
+            gamepad_input_enabled: Arc::clone(&gamepad_input_enabled),
+            gamepad_state: Arc::clone(&gamepad_state),
             cmd_sender: cmd_tx,
         };
 
@@ -109,6 +118,8 @@ impl ConnectionManager {
         let proc_res_cl = Arc::clone(&last_process_result);
         let bytes_tx_cl = Arc::clone(&total_bytes_tx);
         let bytes_rx_cl = Arc::clone(&total_bytes_rx);
+        let gp_listening_cl = Arc::clone(&gamepad_listening);
+        let gp_state_cl = Arc::clone(&gamepad_state);
 
         thread::spawn(move || {
             Self::control_worker(
@@ -122,6 +133,8 @@ impl ConnectionManager {
                 proc_res_cl,
                 bytes_tx_cl,
                 bytes_rx_cl,
+                gp_listening_cl,
+                gp_state_cl,
             );
         });
 
@@ -155,6 +168,37 @@ impl ConnectionManager {
             let mut fps = self.current_fps.lock().unwrap();
             *fps = 0.0;
         }
+    }
+
+    pub fn toggle_gamepad_listening(&self) {
+        let current = self.gamepad_listening.load(Ordering::Relaxed);
+        let new_state = !current;
+        self.gamepad_listening.store(new_state, Ordering::Relaxed);
+        self.send_command(ClientCommand::SetGamepadMonitor { enabled: new_state });
+    }
+
+    pub fn set_gamepad_listening(&self, enabled: bool) {
+        self.gamepad_listening.store(enabled, Ordering::Relaxed);
+        self.send_command(ClientCommand::SetGamepadMonitor { enabled });
+    }
+
+    pub fn send_gamepad_action(&self, action: GamepadInputAction) {
+        self.send_command(ClientCommand::InjectGamepadInput { action });
+    }
+
+    pub fn pulse_gamepad_button(&self, mask: u32, duration_ms: u64) {
+        self.send_gamepad_action(GamepadInputAction::Button { mask, pressed: true });
+        let sender = self.cmd_sender.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(duration_ms));
+            let _ = sender.send(ClientCommand::InjectGamepadInput {
+                action: GamepadInputAction::Button { mask, pressed: false },
+            });
+        });
+    }
+
+    pub fn clone_cmd_sender(&self) -> Sender<ClientCommand> {
+        self.cmd_sender.clone()
     }
 
     fn add_diag(diag: &Arc<Mutex<Vec<String>>>, msg: &str) {
@@ -254,6 +298,8 @@ impl ConnectionManager {
         proc_result: Arc<Mutex<Option<(bool, String)>>>,
         bytes_tx: Arc<AtomicU64>,
         bytes_rx: Arc<AtomicU64>,
+        gamepad_listening: Arc<AtomicBool>,
+        gamepad_state: Arc<Mutex<GamepadState>>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, CONTROL_PORT)
@@ -363,6 +409,16 @@ impl ConnectionManager {
                         }
                     }
 
+                    // Se monitoramento de gamepad já estiver ativo na reconexão, habilita no agente
+                    if gamepad_listening.load(Ordering::Relaxed) {
+                        if Self::send_raw_cmd(&stream, &ClientCommand::SetGamepadMonitor { enabled: true }, &bytes_tx).is_ok() {
+                            let mut ack_line = String::new();
+                            if let Ok(n) = reader.read_line(&mut ack_line) {
+                                bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                            }
+                        }
+                    }
+
                     Self::run_control_session(
                         stream,
                         reader,
@@ -375,6 +431,8 @@ impl ConnectionManager {
                         &diag,
                         &bytes_tx,
                         &bytes_rx,
+                        &gamepad_listening,
+                        &gamepad_state,
                     );
                 }
                 Err(error) => {
@@ -402,8 +460,11 @@ impl ConnectionManager {
         diag: &Arc<Mutex<Vec<String>>>,
         bytes_tx: &Arc<AtomicU64>,
         bytes_rx: &Arc<AtomicU64>,
+        gamepad_listening: &Arc<AtomicBool>,
+        gamepad_state: &Arc<Mutex<GamepadState>>,
     ) {
         let mut last_metrics_req = Instant::now();
+        let mut last_gamepad_req = Instant::now();
         let mut response_buf = String::new();
 
         loop {
@@ -422,7 +483,32 @@ impl ConnectionManager {
                         deploy_status,
                         proc_result,
                         diag,
+                        gamepad_state,
                     );
+                }
+            }
+
+            // Polling de gamepad se gamepad_listening estiver ativo (~35ms = ~28 Hz)
+            if gamepad_listening.load(Ordering::Relaxed) && last_gamepad_req.elapsed() >= Duration::from_millis(35) {
+                last_gamepad_req = Instant::now();
+                if Self::send_raw_cmd(&stream, &ClientCommand::GetGamepadState, bytes_tx).is_err() {
+                    return;
+                }
+                response_buf.clear();
+                match reader.read_line(&mut response_buf) {
+                    Ok(n) if n > 0 => {
+                        bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                        Self::process_response(
+                            &response_buf,
+                            metrics,
+                            logs,
+                            deploy_status,
+                            proc_result,
+                            diag,
+                            gamepad_state,
+                        );
+                    }
+                    _ => return, // Desconectou
                 }
             }
 
@@ -452,13 +538,15 @@ impl ConnectionManager {
                             deploy_status,
                             proc_result,
                             diag,
+                            gamepad_state,
                         );
                     }
                     _ => return, // Desconectou
                 }
             }
 
-            thread::sleep(Duration::from_millis(30));
+            let sleep_ms = if gamepad_listening.load(Ordering::Relaxed) { 10 } else { 30 };
+            thread::sleep(Duration::from_millis(sleep_ms));
         }
     }
 
@@ -478,6 +566,7 @@ impl ConnectionManager {
         deploy_status: &Arc<Mutex<Option<String>>>,
         proc_result: &Arc<Mutex<Option<(bool, String)>>>,
         diag: &Arc<Mutex<Vec<String>>>,
+        gamepad_state: &Arc<Mutex<GamepadState>>,
     ) {
         match serde_json::from_str::<ServerResponse>(raw.trim()) {
             Ok(resp) => {
@@ -510,6 +599,15 @@ impl ConnectionManager {
                 ServerResponse::RestartESResult { success, message } => {
                     let mut p = proc_result.lock().unwrap();
                     *p = Some((success, message));
+                }
+                ServerResponse::GamepadStateResponse(state) => {
+                    let mut g = gamepad_state.lock().unwrap();
+                    *g = state;
+                }
+                ServerResponse::GamepadAck { success, message } => {
+                    if !success {
+                        Self::add_diag(diag, &format!("Aviso Gamepad: {}", message));
+                    }
                 }
                 _ => {}
             }

@@ -1,6 +1,7 @@
 mod app;
 mod connection;
 mod deploy_tab;
+mod gamepad_panel;
 mod logs_tab;
 mod process_tab;
 mod protocol;

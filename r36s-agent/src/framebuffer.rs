@@ -70,14 +70,19 @@ pub struct FbFixScreeninfo {
     pub reserved: [u16; 2],
 }
 
+#[cfg(target_env = "musl")]
+type IoctlReq = libc::c_int;
+#[cfg(not(target_env = "musl"))]
+type IoctlReq = libc::c_ulong;
+
 // DRM IOCTLs e Constantes para captura direta de jogos acelerados (KMS/DRM / Mali GBM)
-const DRM_IOCTL_GEM_CLOSE: libc::c_int = 0x40086409;
-const DRM_IOCTL_SET_CLIENT_CAP: libc::c_int = 0x4010640d;
-const DRM_IOCTL_DROP_MASTER: libc::c_int = 0x0000641f;
-const DRM_IOCTL_MODE_GETPLANERESOURCES: libc::c_int = 0xc01064b5u32 as libc::c_int;
-const DRM_IOCTL_MODE_GETPLANE: libc::c_int = 0xc02064b6u32 as libc::c_int;
-const DRM_IOCTL_MODE_GETFB: libc::c_int = 0xc01c64adu32 as libc::c_int;
-const DRM_IOCTL_PRIME_HANDLE_TO_FD: libc::c_int = 0xc00c642du32 as libc::c_int;
+const DRM_IOCTL_GEM_CLOSE: IoctlReq = 0x40086409 as IoctlReq;
+const DRM_IOCTL_SET_CLIENT_CAP: IoctlReq = 0x4010640d as IoctlReq;
+const DRM_IOCTL_DROP_MASTER: IoctlReq = 0x0000641f as IoctlReq;
+const DRM_IOCTL_MODE_GETPLANERESOURCES: IoctlReq = 0xc01064b5u32 as IoctlReq;
+const DRM_IOCTL_MODE_GETPLANE: IoctlReq = 0xc02064b6u32 as IoctlReq;
+const DRM_IOCTL_MODE_GETFB: IoctlReq = 0xc01c64adu32 as IoctlReq;
+const DRM_IOCTL_PRIME_HANDLE_TO_FD: IoctlReq = 0xc00c642du32 as IoctlReq;
 const DRM_CLIENT_CAP_UNIVERSAL_PLANES: u64 = 2;
 
 // Constantes e estruturas para DMA-BUF CPU Synchronization (RFC/Linux dma-buf.h)

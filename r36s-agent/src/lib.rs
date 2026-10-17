@@ -1,5 +1,6 @@
 pub mod deploy;
 pub mod framebuffer;
+pub mod gamepad;
 pub mod metrics;
 pub mod process;
 pub mod protocol;

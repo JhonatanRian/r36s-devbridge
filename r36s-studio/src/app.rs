@@ -1,5 +1,6 @@
 use crate::connection::{ConnectionManager, ConnectionStatus};
 use crate::deploy_tab::DeployTab;
+use crate::gamepad_panel::GamepadPanel;
 use crate::logs_tab::LogsTab;
 use crate::process_tab::ProcessTab;
 use crate::telemetry::TelemetryDashboard;
@@ -20,6 +21,7 @@ pub struct DevBridgeApp {
     connection: ConnectionManager,
     viewport: ViewportRenderer,
     telemetry: TelemetryDashboard,
+    gamepad_panel: GamepadPanel,
     deploy_tab: DeployTab,
     logs_tab: LogsTab,
     process_tab: ProcessTab,
@@ -33,6 +35,7 @@ impl DevBridgeApp {
             connection: ConnectionManager::new(),
             viewport: ViewportRenderer::new(),
             telemetry: TelemetryDashboard::new(),
+            gamepad_panel: GamepadPanel::new(),
             deploy_tab: DeployTab::new(),
             logs_tab: LogsTab::new(),
             process_tab: ProcessTab::new(),
@@ -46,7 +49,8 @@ impl eframe::App for DevBridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         // Taxa de repintura controlada para fluidez e baixo consumo de CPU
         let is_streaming = self.connection.is_streaming.load(Ordering::Relaxed);
-        if is_streaming {
+        let is_gamepad_listening = self.connection.gamepad_listening.load(Ordering::Relaxed);
+        if is_streaming || is_gamepad_listening {
             ctx.request_repaint_after(Duration::from_millis(30)); // ~33 FPS
         } else {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -144,22 +148,30 @@ impl eframe::App for DevBridgeApp {
             });
         });
 
-        // Coluna Esquerda: Painel lateral nativo de telemetria (100% de altura, largura ajustável)
+        // Coluna Esquerda: Painel lateral nativo de telemetria e controles (100% de altura, largura ajustável)
         if self.current_tab == ActiveTab::ViewportAndTelemetry && self.show_telemetry_panel {
             egui::SidePanel::left("telemetry_side_panel")
                 .resizable(true)
-                .default_width(300.0)
-                .width_range(240.0..=450.0)
+                .default_width(320.0)
+                .width_range(260.0..=480.0)
                 .show(ctx, |ui| {
                     ScrollArea::vertical()
                         .auto_shrink([false; 2])
                         .show(ui, |ui| {
+                            // Métricas do Sistema
                             self.telemetry.render(
                                 ui,
                                 &status_snapshot,
                                 metrics_snapshot.as_ref(),
                                 throughput,
                             );
+
+                            ui.add_space(8.0);
+                            ui.separator();
+                            ui.add_space(8.0);
+
+                            // Controle Interativo do R36S (Escuta ao vivo e injeção de comandos)
+                            self.gamepad_panel.render(ui, &self.connection);
                         });
                 });
         }

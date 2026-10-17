@@ -88,6 +88,13 @@ pub enum ClientCommand {
         signal: i32,
     },
     RestartES,
+    SetGamepadMonitor {
+        enabled: bool,
+    },
+    GetGamepadState,
+    InjectGamepadInput {
+        action: GamepadInputAction,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -133,9 +140,54 @@ pub enum ServerResponse {
         success: bool,
         message: String,
     },
+    GamepadStateResponse(GamepadState),
+    GamepadAck {
+        success: bool,
+        message: String,
+    },
     Error {
         message: String,
     },
+}
+
+// Constantes de bitmask dos botões do Gamepad do R36S
+pub const BTN_MASK_DPAD_UP: u32    = 1 << 0;
+pub const BTN_MASK_DPAD_DOWN: u32  = 1 << 1;
+pub const BTN_MASK_DPAD_LEFT: u32  = 1 << 2;
+pub const BTN_MASK_DPAD_RIGHT: u32 = 1 << 3;
+pub const BTN_MASK_A: u32          = 1 << 4;
+pub const BTN_MASK_B: u32          = 1 << 5;
+pub const BTN_MASK_X: u32          = 1 << 6;
+pub const BTN_MASK_Y: u32          = 1 << 7;
+pub const BTN_MASK_L1: u32         = 1 << 8;
+pub const BTN_MASK_R1: u32         = 1 << 9;
+pub const BTN_MASK_L2: u32         = 1 << 10;
+pub const BTN_MASK_R2: u32         = 1 << 11;
+pub const BTN_MASK_SELECT: u32     = 1 << 12;
+pub const BTN_MASK_START: u32      = 1 << 13;
+pub const BTN_MASK_FN: u32         = 1 << 14;
+pub const BTN_MASK_L3: u32         = 1 << 15;
+pub const BTN_MASK_R3: u32         = 1 << 16;
+pub const BTN_MASK_VOL_UP: u32     = 1 << 17;
+pub const BTN_MASK_VOL_DOWN: u32   = 1 << 18;
+pub const BTN_MASK_POWER: u32      = 1 << 19;
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct GamepadState {
+    pub listening: bool,
+    pub device_name: String,
+    pub buttons: u32,
+    pub left_x: i16,
+    pub left_y: i16,
+    pub right_x: i16,
+    pub right_y: i16,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "type", content = "payload")]
+pub enum GamepadInputAction {
+    Button { mask: u32, pressed: bool },
+    Axis { left_x: i16, left_y: i16, right_x: i16, right_y: i16 },
 }
 
 #[repr(C, packed)]

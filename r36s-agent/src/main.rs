@@ -1,5 +1,6 @@
 mod deploy;
 mod framebuffer;
+mod gamepad;
 mod metrics;
 mod process;
 mod protocol;
