@@ -27,13 +27,8 @@ for cand in \
 done
 
 if ! command -v cargo >/dev/null 2>&1; then
-    if [ -f "$ROOT_DIR/dist/ports/r36s-devbridge/payload.zip" ] && [ -f "$ROOT_DIR/app" ]; then
-        echo "Aviso: cargo não localizado no PATH; utilizando artefatos já compilados em dist/ e ./app."
-        exit 0
-    else
-        echo "ERRO: comando 'cargo' não encontrado. Verifique se o Rust está instalado em ~/.cargo/bin" >&2
-        exit 1
-    fi
+    echo "ERRO: cargo não encontrado. Artefatos antigos não serão instalados silenciosamente." >&2
+    exit 1
 fi
 
 # 1. Compilar r36s-agent para AArch64 MUSL (estático para qualquer ArkOS)
@@ -43,12 +38,13 @@ echo "r36s-agent compilado com sucesso."
 
 # 2. Empacotar o payload do Port
 echo -e "\n[2/4] Empacotando payload.zip do Port..."
-"$ROOT_DIR/r36s-port/build_payload.sh"
+DEVBRIDGE_AGENT_BUILT=1 "$ROOT_DIR/r36s-port/build_payload.sh"
 
 # 3. Compilar r36s-studio para o PC Host
 echo -e "\n[3/4] Compilando aplicativo desktop r36s-studio (PC)..."
 (cd "$ROOT_DIR/r36s-studio" && cargo build --release)
-cp -f "$ROOT_DIR/r36s-studio/target/release/r36s-studio" "$ROOT_DIR/app"
+install -m 755 "$ROOT_DIR/r36s-studio/target/release/r36s-studio" "$ROOT_DIR/.app.new"
+mv -f "$ROOT_DIR/.app.new" "$ROOT_DIR/app"
 chmod +x "$ROOT_DIR/app"
 echo "Binário ./app gerado com sucesso na raiz do projeto."
 
@@ -60,6 +56,7 @@ mkdir -p "$RELEASE_DIR/r36s-devbridge"
 cp -f "$ROOT_DIR/r36s-port/R36S DevBridge.sh" "$RELEASE_DIR/R36S DevBridge.sh"
 chmod +x "$RELEASE_DIR/R36S DevBridge.sh"
 
+cp -f "$ROOT_DIR/r36s-port/install_payload.py" "$RELEASE_DIR/r36s-devbridge/install_payload.py"
 cp -f "$ROOT_DIR/r36s-port/payload.zip" "$RELEASE_DIR/r36s-devbridge/payload.zip"
 cp -f "$ROOT_DIR/r36s-port/patch_dtb_usb.py" "$RELEASE_DIR/r36s-devbridge/patch_dtb_usb.py"
 chmod +x "$RELEASE_DIR/r36s-devbridge/patch_dtb_usb.py"

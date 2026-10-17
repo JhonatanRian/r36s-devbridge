@@ -18,87 +18,40 @@ if [ "$(id -u)" -ne 0 ]; then
     exec sudo -E /bin/bash "$0" "$@"
 fi
 
-# 2. Localização e montagem automática de partições
+# Resolve all identities on one physical card before mounting or writing anything.
 MEDIA_ROOT="/run/media/$USER_NAME"
 [ -d "$MEDIA_ROOT" ] || MEDIA_ROOT="/media/$USER_NAME"
-
-find_or_mount_partition() {
-    local label="$1"
-    local mnt=""
-
-    # 1. Procura em pontos já montados
-    for base in "$MEDIA_ROOT" /run/media/* /media/* /mnt; do
-        if [ -d "$base/$label" ]; then
-            mnt="$base/$label"
-            break
+PARTITIONS="$(python3 "$SCRIPT_DIR/r36s-port/sd_card.py")"
+mount_partition() {
+    local label="$1" dev="$2" target options
+    [ -b "$dev" ] || { echo "Dispositivo desapareceu: $dev" >&2; return 1; }
+    target="$(findmnt -rn -S "$dev" -o TARGET || true)"
+    if [ -z "$target" ]; then
+        target="$MEDIA_ROOT/DevBridge-$label"
+        if mountpoint -q "$target"; then
+            echo "Destino ocupado por outro dispositivo: $target. Ejete a montagem antiga antes de instalar." >&2
+            return 1
         fi
-    done
-
-    # 2. Se não encontrou montado, busca pelo label no lsblk e monta
-    if [ -z "$mnt" ]; then
-        local dev
-        dev="$( (lsblk -rno NAME,LABEL 2>/dev/null || true) | grep -E "[[:space:]]${label}$" | head -n1 | awk '{print $1}' || true)"
-        if [ -n "$dev" ]; then
-            local existing_mnt
-            existing_mnt="$(findmnt -n -o TARGET "/dev/$dev" 2>/dev/null || true)"
-            if [ -n "$existing_mnt" ]; then
-                mnt="$existing_mnt"
-            else
-                local target_mnt="/run/media/$USER_NAME/$label"
-                mkdir -p "$target_mnt"
-                if mount "/dev/$dev" "$target_mnt" 2>/dev/null; then
-                    mnt="$target_mnt"
-                fi
-            fi
-        fi
+        mkdir -p "$target" || return 1
+        mount "$dev" "$target" || return 1
     fi
-
-    echo "$mnt"
+    options="$(findmnt -rn -M "$target" -o OPTIONS)" || return 1
+    case ",$options," in *,ro,*) echo "Partição somente leitura: $target" >&2; return 1 ;; esac
+    # EIO is an error, never an instruction to force a remount or detach another filesystem.
+    ls -A "$target" >/dev/null || return 1
+    printf '%s\n' "$target"
 }
-
-get_parent_disk() {
-    local mnt="$1"
-    local dev
-    dev="$(findmnt -n -o SOURCE "$mnt" 2>/dev/null || true)"
-    if [ -n "$dev" ] && [ -b "$dev" ]; then
-        lsblk -no PKNAME "$dev" 2>/dev/null || echo "$dev"
-    fi
-}
-
-EASYROMS="$(find_or_mount_partition "EASYROMS")"
-BOOT="$(find_or_mount_partition "BOOT")"
-ROOT="$(find_or_mount_partition "root")"
-
-if [ -z "$EASYROMS" ]; then
-    echo "ERRO: Partição EASYROMS não encontrada montada no sistema." >&2
-    echo "Dispositivos conectados detectados:" >&2
-    lsblk -o NAME,SIZE,FSTYPE,LABEL,MOUNTPOINT >&2
-    echo "Verifique se o cartão SD está inserido no PC." >&2
-    exit 1
-fi
-
-EASYROMS_DISK="$(get_parent_disk "$EASYROMS")"
-echo "Partição EASYROMS: $EASYROMS (disco: ${EASYROMS_DISK:-desconhecido})"
-
-if [ -n "$BOOT" ]; then
-    BOOT_DISK="$(get_parent_disk "$BOOT")"
-    if [ -n "$EASYROMS_DISK" ] && [ -n "$BOOT_DISK" ] && [ "$EASYROMS_DISK" != "$BOOT_DISK" ]; then
-        echo "AVISO: Partição BOOT ($BOOT) pertence a outro disco; ignorando." >&2
-        BOOT=""
-    else
-        echo "Partição BOOT:     $BOOT"
-    fi
-fi
-
-if [ -n "$ROOT" ]; then
-    ROOT_DISK="$(get_parent_disk "$ROOT")"
-    if [ -n "$EASYROMS_DISK" ] && [ -n "$ROOT_DISK" ] && [ "$EASYROMS_DISK" != "$ROOT_DISK" ]; then
-        echo "AVISO: Partição root ($ROOT) pertence a outro disco; ignorando." >&2
-        ROOT=""
-    else
-        echo "Partição root:     $ROOT"
-    fi
-fi
+EASYROMS="" BOOT="" ROOT=""
+while IFS=$'\t' read -r label device; do
+    case "$label" in
+        EASYROMS) EASYROMS="$(mount_partition "$label" "$device")" ;;
+        BOOT) BOOT="$(mount_partition "$label" "$device")" ;;
+        root) ROOT="$(mount_partition "$label" "$device")" ;;
+    esac
+done <<< "$PARTITIONS"
+echo "Partição EASYROMS: $EASYROMS"
+echo "Partição BOOT: $BOOT"
+echo "Partição root: $ROOT"
 
 # 3. Compilação usando usuário normal para preservar propriedade dos artefatos
 echo -e "\nCompilando e gerando pacote atualizado dist/ports..."
@@ -134,6 +87,7 @@ echo -e "\n[1/3] Copiando arquivos do Port para $PORTS_DIR..."
 cp -f "$SCRIPT_DIR/dist/ports/R36S DevBridge.sh" "$PORTS_DIR/R36S DevBridge.sh"
 chmod +x "$PORTS_DIR/R36S DevBridge.sh"
 
+cp -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/install_payload.py" "$DEST_DEVBRIDGE/install_payload.py"
 cp -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/payload.zip" "$DEST_DEVBRIDGE/payload.zip"
 cp -f "$SCRIPT_DIR/dist/ports/r36s-devbridge/patch_dtb_usb.py" "$DEST_DEVBRIDGE/patch_dtb_usb.py"
 chmod +x "$DEST_DEVBRIDGE/patch_dtb_usb.py"
@@ -187,21 +141,13 @@ if [ -n "$ROOT" ] && [ -d "$ROOT/usr/local/bin" ]; then
     TMP_UNZIP="$(mktemp -d)"
     unzip -q -o "$SCRIPT_DIR/dist/ports/r36s-devbridge/payload.zip" -d "$TMP_UNZIP"
 
-    cp -f "$TMP_UNZIP/r36s-agent" "$ROOT/usr/local/bin/r36s-agent"
-    chmod 755 "$ROOT/usr/local/bin/r36s-agent"
-
-    cp -f "$TMP_UNZIP/r36s-agent.service" "$ROOT/etc/systemd/system/r36s-agent.service"
-    chmod 644 "$ROOT/etc/systemd/system/r36s-agent.service"
+    python3 "$SCRIPT_DIR/r36s-port/install_payload.py" "$TMP_UNZIP" --root "$ROOT"
 
     WANTS_DIR="$ROOT/etc/systemd/system/multi-user.target.wants"
     mkdir -p "$WANTS_DIR"
     ln -sf "/etc/systemd/system/r36s-agent.service" "$WANTS_DIR/r36s-agent.service"
 
-    if [ -f "$ROOT/etc/modules" ]; then
-        grep -q '^dwc2' "$ROOT/etc/modules" 2>/dev/null || echo 'dwc2' >> "$ROOT/etc/modules"
-        grep -q '^g_ether' "$ROOT/etc/modules" 2>/dev/null || echo 'g_ether' >> "$ROOT/etc/modules"
-        echo "[OK] Módulos dwc2 e g_ether configurados em /etc/modules"
-    fi
+
 
     mkdir -p "$ROOT/etc/udev/rules.d"
     cat << 'EOF_UDEV' > "$ROOT/etc/udev/rules.d/99-r36s-devbridge-usb0.rules"
@@ -226,7 +172,7 @@ EOF_NM
 EOF_LOGROTATE
     rm -f "$ROOT/etc/systemd/journald.conf.d/99-r36s-devbridge.conf"
     rm -rf "$TMP_UNZIP"
-    echo "[OK] r36s-agent v0.2.0 instalado com sucesso em /usr/local/bin e habilitado no systemd!"
+    echo "[OK] r36s-agent verificado e instalado com sucesso em /usr/local/bin e habilitado no systemd!"
 else
     echo -e "\n[3/3] AVISO: Partição root não disponível diretamente; a instalação será feita via menu Ports no console."
 fi
@@ -238,6 +184,6 @@ echo "=========================================================="
 echo "          INSTALAÇÃO NO CARTÃO SD CONCLUÍDA!              "
 echo "=========================================================="
 echo "1. Ejete o cartão com segurança e coloque de volta no R36S."
-echo "2. O daemon v0.2.0 já está instalado diretamente no sistema!"
+echo "2. O daemon está instalado; valide a conexão após ligar o console."
 echo "3. Ligue o R36S, plugue o cabo USB OTG no PC e rode: ./app"
 echo "=========================================================="
