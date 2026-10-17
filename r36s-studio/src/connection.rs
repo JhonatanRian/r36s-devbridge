@@ -859,6 +859,7 @@ impl ConnectionManager {
         let mut header_buf = [0u8; 20];
         let mut comp_buf = Vec::with_capacity(640 * 480 * 4 + 65536);
         let mut raw_reference_buffer = Vec::new();
+        let mut decomp_buf = vec![0u8; 640 * 480 * 4];
 
         loop {
             if !is_streaming.load(Ordering::Relaxed) {
@@ -949,20 +950,45 @@ impl ConnectionManager {
                             }
                             bytes_rx.fetch_add(size as u64, Ordering::Relaxed);
 
-                            // Descompacta LZ4 com o tamanho correto do formato do frame
-                            match lz4_flex::decompress(&comp_buf, expected_uncompressed) {
-                                Ok(decomp_buf) => {
+                            if decomp_buf.len() < expected_uncompressed {
+                                decomp_buf.resize(expected_uncompressed, 0);
+                            }
+
+                            // Descompacta LZ4 diretamente no buffer pré-alocado
+                            match lz4_flex::block::decompress_into(
+                                &comp_buf,
+                                &mut decomp_buf[..expected_uncompressed],
+                            ) {
+                                Ok(decomp_len) => {
+                                    if decomp_len != expected_uncompressed {
+                                        Self::add_diag(
+                                            &diag,
+                                            &format!(
+                                                "Erro na descompressão LZ4: tamanho descompactado divergente (esperado {}, obtido {})",
+                                                expected_uncompressed, decomp_len
+                                            ),
+                                        );
+                                        continue;
+                                    }
+
                                     // Processa keyframe vs delta XOR
                                     if header.flags == FRAME_FLAG_DELTA {
                                         if raw_reference_buffer.len() == expected_uncompressed {
-                                            Self::apply_xor_delta(&mut raw_reference_buffer, &decomp_buf);
+                                            Self::apply_xor_delta(
+                                                &mut raw_reference_buffer,
+                                                &decomp_buf[..expected_uncompressed],
+                                            );
                                         } else {
                                             // Dessincronia de referência: ignora até o próximo keyframe
                                             continue;
                                         }
                                     } else {
                                         // Keyframe (flags == 0 ou mock/outro): substitui buffer de referência
-                                        raw_reference_buffer = decomp_buf;
+                                        if raw_reference_buffer.len() != expected_uncompressed {
+                                            raw_reference_buffer.resize(expected_uncompressed, 0);
+                                        }
+                                        raw_reference_buffer
+                                            .copy_from_slice(&decomp_buf[..expected_uncompressed]);
                                     }
 
                                     // Converte para RGBA8888 a partir do buffer de referência reconstruído
@@ -972,7 +998,11 @@ impl ConnectionManager {
                                             header.width as usize,
                                             header.height as usize,
                                         ),
-                                        FORMAT_BGRA8888_LZ4 => Self::bgra_to_rgba(&raw_reference_buffer),
+                                        FORMAT_BGRA8888_LZ4 => {
+                                            let mut buf = raw_reference_buffer.clone();
+                                            Self::bgra_to_rgba_inplace(&mut buf);
+                                            buf
+                                        }
                                         _ => {
                                             let mut buf = raw_reference_buffer.clone();
                                             Self::sanitize_rgba_alpha(&mut buf);
@@ -1046,15 +1076,17 @@ impl ConnectionManager {
         rgba
     }
 
+    pub fn bgra_to_rgba_inplace(buffer: &mut [u8]) {
+        for chunk in buffer.chunks_exact_mut(4) {
+            chunk.swap(0, 2);
+            chunk[3] = 255;
+        }
+    }
+
+    #[allow(dead_code)]
     pub fn bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
         let mut rgba = bgra.to_vec();
-        for chunk in rgba.chunks_exact_mut(4) {
-            let b = chunk[0];
-            let r = chunk[2];
-            chunk[0] = r;
-            chunk[2] = b;
-            chunk[3] = 255; // Garante opacidade absoluta: evita tela preta/escurecida pelo alpha do display driver
-        }
+        Self::bgra_to_rgba_inplace(&mut rgba);
         rgba
     }
 

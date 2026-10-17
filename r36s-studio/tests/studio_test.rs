@@ -291,3 +291,92 @@ fn test_async_gamepad_push_events_concurrent_with_telemetry() {
     session_handle.join().unwrap();
 }
 
+#[test]
+fn test_bgra_to_rgba_inplace_matches_legacy_conversion() {
+    use r36s_studio::connection::ConnectionManager;
+
+    // Função de referência idêntica à implementação anterior
+    fn legacy_bgra_to_rgba(bgra: &[u8]) -> Vec<u8> {
+        let mut rgba = bgra.to_vec();
+        for chunk in rgba.chunks_exact_mut(4) {
+            let b = chunk[0];
+            let r = chunk[2];
+            chunk[0] = r;
+            chunk[2] = b;
+            chunk[3] = 255;
+        }
+        rgba
+    }
+
+    // 1. Teste de pixels específicos (Blue, Red, Green, White, Black com alpha variado)
+    let sample_bgra = vec![
+        255, 0, 0, 100, // Azul puro -> deve virar Vermelho=0, Azul=255, Alpha=255
+        0, 0, 255, 50,  // Vermelho puro -> deve virar Vermelho=255, Azul=0, Alpha=255
+        0, 255, 0, 0,   // Verde puro -> deve virar Verde=255, Alpha=255
+        10, 20, 30, 40, // Misto
+    ];
+
+    let expected = legacy_bgra_to_rgba(&sample_bgra);
+    let mut actual = sample_bgra.clone();
+    ConnectionManager::bgra_to_rgba_inplace(&mut actual);
+
+    assert_eq!(actual, expected);
+    assert_eq!(&actual[0..4], &[0, 0, 255, 255]);
+    assert_eq!(&actual[4..8], &[255, 0, 0, 255]);
+    assert_eq!(&actual[8..12], &[0, 255, 0, 255]);
+    assert_eq!(&actual[12..16], &[30, 20, 10, 255]);
+
+    // 2. Teste em buffer de tamanho realista (640x480 BGRA8888 = 1.228.800 bytes)
+    let total_bytes = 640 * 480 * 4;
+    let mut large_bgra = vec![0u8; total_bytes];
+    for (i, byte) in large_bgra.iter_mut().enumerate() {
+        *byte = (i * 37 % 256) as u8;
+    }
+
+    let expected_large = legacy_bgra_to_rgba(&large_bgra);
+    let mut actual_large = large_bgra.clone();
+    ConnectionManager::bgra_to_rgba_inplace(&mut actual_large);
+
+    assert_eq!(actual_large, expected_large);
+    // Também valida que ConnectionManager::bgra_to_rgba é consistente
+    let helper_large = ConnectionManager::bgra_to_rgba(&large_bgra);
+    assert_eq!(helper_large, expected_large);
+}
+
+#[test]
+fn test_zero_allocation_lz4_decompress_and_in_place_transform() {
+    use r36s_studio::connection::ConnectionManager;
+
+    let width = 64;
+    let height = 64;
+    let raw_len = width * height * 4;
+
+    // Cria frame BGRA sintético
+    let mut raw_frame = vec![0u8; raw_len];
+    for (i, byte) in raw_frame.iter_mut().enumerate() {
+        *byte = ((i * 17) & 0xFF) as u8;
+    }
+
+    // Comprime com LZ4
+    let mut comp_buf = vec![0u8; lz4_flex::block::get_maximum_output_size(raw_len)];
+    let comp_sz = lz4_flex::block::compress_into(&raw_frame, &mut comp_buf).unwrap();
+
+    // Buffer de descompressão pré-alocado (reutilizável)
+    let mut reusable_decomp_buf = vec![0u8; raw_len];
+    let decomp_sz = lz4_flex::block::decompress_into(
+        &comp_buf[..comp_sz],
+        &mut reusable_decomp_buf[..raw_len],
+    )
+    .unwrap();
+    assert_eq!(decomp_sz, raw_len);
+    assert_eq!(&reusable_decomp_buf[..], &raw_frame[..]);
+
+    // Converte in-place
+    ConnectionManager::bgra_to_rgba_inplace(&mut reusable_decomp_buf);
+
+    // Valida propriedades RGBA e Alpha fixado em 255
+    for chunk in reusable_decomp_buf.chunks_exact(4) {
+        assert_eq!(chunk[3], 255);
+    }
+}
+
