@@ -663,14 +663,14 @@ impl FramebufferReader {
             (&self.packed_buffer, FRAME_FLAG_KEYFRAME)
         };
 
-        // Garante que o buffer de saída tenha capacidade suficiente para o pior caso do LZ4
-        let max_compressed_len = lz4_flex::block::get_maximum_output_size(src_buffer.len());
+        // Garante que o buffer de saída tenha capacidade suficiente para o cabeçalho (20 bytes) + pior caso do LZ4
+        let max_compressed_len = 20 + lz4_flex::block::get_maximum_output_size(src_buffer.len());
         if comp_out.len() < max_compressed_len {
             comp_out.resize(max_compressed_len, 0);
         }
 
         let compress_started = Instant::now();
-        let compressed_size = match lz4_flex::block::compress_into(src_buffer, comp_out) {
+        let compressed_size = match lz4_flex::block::compress_into(src_buffer, &mut comp_out[20..]) {
             Ok(size) => size,
             Err(_) => {
                 return (
@@ -734,11 +734,11 @@ impl FramebufferReader {
             }
         }
 
-        let max_len = lz4_flex::block::get_maximum_output_size(raw.len());
+        let max_len = 20 + lz4_flex::block::get_maximum_output_size(raw.len());
         if comp_out.len() < max_len {
             comp_out.resize(max_len, 0);
         }
-        let written = lz4_flex::block::compress_into(&raw, comp_out).unwrap_or(0);
+        let written = lz4_flex::block::compress_into(&raw, &mut comp_out[20..]).unwrap_or(0);
         (self.width, self.height, FORMAT_RGB565_LZ4, 0, written)
     }
 }
@@ -921,7 +921,7 @@ mod regression_tests {
         assert_eq!(format, FORMAT_BGRA8888_LZ4);
         assert_eq!(flag2, FRAME_FLAG_DELTA);
 
-        let delta = lz4_flex::decompress(&compressed[..size], expected.len()).unwrap();
+        let delta = lz4_flex::decompress(&compressed[20..20 + size], expected.len()).unwrap();
         let mut reconstructed = vec![0u8; expected.len()];
         xor_blocks(&prev_frame, &delta, &mut reconstructed);
         assert_eq!(reconstructed, expected);

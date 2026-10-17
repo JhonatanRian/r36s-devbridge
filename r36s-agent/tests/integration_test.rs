@@ -57,9 +57,9 @@ fn test_framebuffer_mock_and_lz4() {
     assert_eq!(format, FORMAT_RGB565_LZ4);
     assert!(compressed_len > 0, "Frame comprimido não deve estar vazio");
 
-    // Testa descompressão LZ4
+    // Testa descompressão LZ4 (dados gravados a partir do offset 20)
     let expected_len = (w as usize) * (h as usize) * 2;
-    let decompressed = lz4_flex::decompress(&comp_buf[..compressed_len], expected_len).expect("Falha ao descompactar LZ4");
+    let decompressed = lz4_flex::decompress(&comp_buf[20..20 + compressed_len], expected_len).expect("Falha ao descompactar LZ4");
     assert_eq!(decompressed.len(), expected_len);
 }
 
@@ -70,4 +70,63 @@ fn gamepad_rejects_input_without_session() {
     assert!(service.inject_action(7, &GamepadInputAction::Button {
         mask: BTN_MASK_A, pressed: true,
     }).is_err());
+}
+
+#[test]
+fn test_coalesced_video_frame_transmission_and_reception() {
+    use std::io::Read;
+    use std::net::{TcpListener, TcpStream};
+
+    std::env::set_var("DEVBRIDGE_ALLOW_MOCK", "1");
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let client_handle = std::thread::spawn(move || {
+        let mut stream = TcpStream::connect(addr).unwrap();
+        // Leitura do cabeçalho de 20 bytes
+        let mut header_buf = [0u8; 20];
+        stream.read_exact(&mut header_buf).expect("Falha ao ler header");
+        let header = VideoFrameHeader::from_bytes(&header_buf).expect("Header inválido");
+
+        let magic = header.magic;
+        let idx = header.frame_index;
+        let w = header.width;
+        let h = header.height;
+        let fmt = header.format;
+        let sz = header.compressed_size;
+
+        assert_eq!(magic, VIDEO_MAGIC);
+        assert_eq!(idx, 1);
+        assert_eq!(w, 640);
+        assert_eq!(h, 480);
+        assert_eq!(fmt, FORMAT_RGB565_LZ4);
+        assert!(sz > 0);
+
+        // Leitura do payload comprimido
+        let mut payload = vec![0u8; sz as usize];
+        stream.read_exact(&mut payload).expect("Falha ao ler payload");
+
+        let expected_raw_len = (w as usize) * (h as usize) * 2;
+        let decompressed = lz4_flex::decompress(&payload, expected_raw_len).expect("Falha ao descompactar payload");
+        assert_eq!(decompressed.len(), expected_raw_len);
+    });
+
+    let (mut server_stream, _) = listener.accept().unwrap();
+    let mut reader = FramebufferReader::new();
+    let mut comp_buffer = Vec::with_capacity(20 + lz4_flex::block::get_maximum_output_size(640 * 480 * 2));
+
+    let (w, h, fmt, flg, comp_len) = reader.capture_frame(&mut comp_buffer);
+    assert!(comp_len > 0);
+
+    let header = VideoFrameHeader::new(1, w, h, fmt, flg, comp_len as u32);
+    comp_buffer[..20].copy_from_slice(&header.to_bytes());
+
+    // Transmissão coalescida em uma única fatia contígua: comp_buffer[..20 + comp_len]
+    let packet = &comp_buffer[..20 + comp_len];
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    r36s_agent::server::write_before(&mut server_stream, packet, deadline)
+        .expect("Falha no envio contíguo do pacote coalescido");
+
+    client_handle.join().unwrap();
 }

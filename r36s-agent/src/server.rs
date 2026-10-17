@@ -447,7 +447,7 @@ impl AgentServer {
                         }
                         let mut next_deadline = Instant::now();
                         let mut comp_buffer = Vec::with_capacity(
-                            lz4_flex::block::get_maximum_output_size(640 * 480 * 4),
+                            20 + lz4_flex::block::get_maximum_output_size(640 * 480 * 4),
                         );
 
                         let diag_enabled = std::env::var_os("DEVBRIDGE_DIAG").is_some();
@@ -547,6 +547,12 @@ impl AgentServer {
                                 comp_len as u32,
                             );
 
+                            let header_bytes = header.to_bytes();
+                            if comp_buffer.len() < 20 {
+                                comp_buffer.resize(20, 0);
+                            }
+                            comp_buffer[..20].copy_from_slice(&header_bytes);
+
                             let t_send = if diag_enabled {
                                 Some(Instant::now())
                             } else {
@@ -555,10 +561,8 @@ impl AgentServer {
 
                             let sent_at = Instant::now();
                             let deadline = sent_at + Duration::from_millis(250);
-                            if write_before(&mut stream, &header.to_bytes(), deadline).is_err()
-                                || write_before(&mut stream, &comp_buffer[..comp_len], deadline)
-                                    .is_err()
-                            {
+                            let packet = &comp_buffer[..20 + comp_len];
+                            if write_before(&mut stream, packet, deadline).is_err() {
                                 eprintln!("[r36s-agent] Vídeo: prazo de envio expirou ou conexão encerrou; descartando sessão {}.", session_id);
                                 break;
                             }
@@ -691,7 +695,7 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
 }
 
 /// Bound the entire frame, including partial writes. A failed frame requires a fresh TCP session.
-fn write_before(
+pub fn write_before(
     stream: &mut TcpStream,
     mut bytes: &[u8],
     deadline: Instant,
