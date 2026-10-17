@@ -17,6 +17,29 @@ This document covers the physical hardware, chipset limitations, operating syste
 
 ---
 
+## ⚠️ Limites do Hardware (R36S) e Armadilhas do ArkOS (O que NUNCA fazer)
+
+O R36S usa o SoC Rockchip RK3326 (4x ARM Cortex-A35 @ 1.3–1.5GHz in-order, GPU Mali-G31 MP2 e 1GB DDR3L compartilhada) rodando um kernel Linux BSP 4.4 antigo no ArkOS.
+Existem 4 armadilhas fatais nesse ambiente:
+
+1. **A Armadilha do DRM Master (Jogo não abre / Tela Preta):**
+   - No kernel 4.4 da Rockchip, quando você escolhe um jogo no EmulationStation, ele fecha/solta o vídeo e o emulador (RetroArch, PPSSPP, Drastic) tenta assumir o controle exclusivo de `/dev/dri/card0`.
+   - **Regra de ouro:** Se o `r36s-agent` mantiver `/dev/dri/card0` ou um handle GEM/DMA-BUF aberto continuamente, o kernel não dispara o `drm_lastclose()` ou nega o `drmSetMaster` do emulador — o jogo trava ou volta para o menu. O comportamento atual em `DrmReader::capture` (abrir, chamar `DRM_IOCTL_DROP_MASTER`, exportar FD, copiar e fechar tudo em ~1ms) deve ser preservado intacto.
+
+2. **Por que NÃO usar o encoder de hardware (VPU/MPP ou RGA) do RK3326:**
+   - Grandes empresas usam H.264/HEVC via hardware. Porém, no RK3326 sob ArkOS, a unidade VPU (`librockchip_mpp`) e o acelerador 2D (RGA) compartilham a reserva de memória física contígua (CMA / ION) com os emuladores e com o player de vídeo (`ffplay`).
+   - Se o daemon alocar contextos MPP/RGA em background, emuladores pesados (PSP, N64, Dreamcast) sofrem Out-Of-Memory na CMA ou conflito de registradores `/dev/rga`, travando o console.
+
+3. **Coerência de Cache ARM (Dados falsos ou rasgados):**
+   - A GPU Mali escreve na RAM via DMA sem avisar o cache L1/L2 da CPU.
+   - Remover o `poll(dma_fd)` ou o `DMA_BUF_IOCTL_SYNC` em `framebuffer.rs:299-325` faz a CPU ler lixo do cache (faixas pretas ou tearing).
+
+4. **USB 2.0 dwc2 + g_ether (Queda de conexão):**
+   - O controlador USB OTG (`dwc2`) do RK3326 é limitado a USB 2.0 (~15–25 MB/s reais) e gera alta carga de interrupções (IRQ) no núcleo CPU0.
+   - Rajadas descontroladas causam FIFO overrun e derrubam a interface `usb0`.
+
+---
+
 ## 🐧 The ArkOS Distribution (Linux 4.4.189 aarch64)
 
 ArkOS for the R36S is derived from Ubuntu 19.10 / Debian Buster, running an out-of-tree Rockchip vendor BSP kernel: **Linux 4.4.189-rk3326 (aarch64)**.
