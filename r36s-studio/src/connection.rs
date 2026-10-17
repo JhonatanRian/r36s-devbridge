@@ -64,6 +64,7 @@ pub struct ConnectionManager {
     pub gamepad_listening: Arc<AtomicBool>,
     pub gamepad_input_enabled: Arc<AtomicBool>,
     pub gamepad_state: Arc<Mutex<GamepadState>>,
+    pub egui_ctx: Arc<Mutex<Option<egui::Context>>>,
     cmd_sender: Sender<ClientCommand>,
 }
 
@@ -91,6 +92,7 @@ impl ConnectionManager {
         let gamepad_listening = Arc::new(AtomicBool::new(true));
         let gamepad_input_enabled = Arc::new(AtomicBool::new(false));
         let gamepad_state = Arc::new(Mutex::new(GamepadState::default()));
+        let egui_ctx = Arc::new(Mutex::new(None));
 
         let (cmd_tx, cmd_rx) = channel::<ClientCommand>();
 
@@ -114,6 +116,7 @@ impl ConnectionManager {
             gamepad_listening: Arc::clone(&gamepad_listening),
             gamepad_input_enabled: Arc::clone(&gamepad_input_enabled),
             gamepad_state: Arc::clone(&gamepad_state),
+            egui_ctx: Arc::clone(&egui_ctx),
             cmd_sender: cmd_tx,
         };
 
@@ -175,6 +178,7 @@ impl ConnectionManager {
         let vid_diag = Arc::clone(&diag_logs);
         let vid_conn = Arc::clone(&video_connected);
         let received = Arc::clone(&last_video_frame);
+        let egui_ctx_vid = Arc::clone(&egui_ctx);
 
         thread::spawn(move || {
             Self::video_worker(
@@ -185,10 +189,15 @@ impl ConnectionManager {
                 vid_diag,
                 vid_conn,
                 received,
+                egui_ctx_vid,
             );
         });
 
         mgr
+    }
+
+    pub fn set_egui_ctx(&self, ctx: egui::Context) {
+        *self.egui_ctx.lock().unwrap() = Some(ctx);
     }
 
     pub fn send_command(&self, cmd: ClientCommand) {
@@ -200,7 +209,7 @@ impl ConnectionManager {
         let new_state = !current;
         self.is_streaming.store(new_state, Ordering::Relaxed);
         if new_state {
-            self.send_command(ClientCommand::StartStream { target_fps: 30 });
+            self.send_command(ClientCommand::StartStream { target_fps: 60 });
         } else {
             self.send_command(ClientCommand::StopStream);
             let mut fps = self.current_fps.lock().unwrap();
@@ -537,7 +546,7 @@ impl ConnectionManager {
                     if is_streaming.load(Ordering::Relaxed) {
                         if Self::send_raw_cmd(
                             &stream,
-                            &ClientCommand::StartStream { target_fps: 30 },
+                            &ClientCommand::StartStream { target_fps: 60 },
                             &bytes_tx,
                         )
                         .is_ok()
@@ -834,6 +843,7 @@ impl ConnectionManager {
         diag: Arc<Mutex<Vec<String>>>,
         video_connected: Arc<AtomicBool>,
         received: Arc<Mutex<Option<Instant>>>,
+        egui_ctx: Arc<Mutex<Option<egui::Context>>>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, VIDEO_PORT).parse().unwrap();
@@ -958,6 +968,10 @@ impl ConnectionManager {
                                         let mut lock = current_frame.lock().unwrap();
                                         *lock = Some(Arc::new(frame));
                                         *received.lock().unwrap() = Some(Instant::now());
+                                    }
+
+                                    if let Some(ctx) = egui_ctx.lock().unwrap().as_ref() {
+                                        ctx.request_repaint();
                                     }
                                 }
                                 Err(e) => {

@@ -30,9 +30,12 @@ pub struct DevBridgeApp {
 }
 
 impl DevBridgeApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let connection = ConnectionManager::new();
+        connection.set_egui_ctx(cc.egui_ctx.clone());
+
         Self {
-            connection: ConnectionManager::new(),
+            connection,
             viewport: ViewportRenderer::new(),
             telemetry: TelemetryDashboard::new(),
             gamepad_panel: GamepadPanel::new(),
@@ -47,18 +50,20 @@ impl DevBridgeApp {
 
 impl eframe::App for DevBridgeApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        // Taxa de repintura controlada para fluidez e baixo consumo de CPU
+        // Arquitetura orientada a eventos: o streaming de vídeo solicita repintura imediata
+        // via `ctx.request_repaint()` assim que um novo quadro é decodificado no `video_worker`.
+        // Mantemos cadência rápida para gamepad interativo e fallback conservador para telemetria/watchdog.
         let is_streaming = self.connection.is_streaming.load(Ordering::Relaxed);
         let is_gamepad_listening = self.connection.gamepad_listening.load(Ordering::Relaxed);
-        if is_streaming
-            || is_gamepad_listening
-            || self
-                .connection
-                .gamepad_input_enabled
-                .load(Ordering::Relaxed)
-        {
-            ctx.request_repaint_after(Duration::from_millis(30)); // ~33 FPS
+        let is_gamepad_input = self.connection.gamepad_input_enabled.load(Ordering::Relaxed);
+
+        if is_gamepad_listening || is_gamepad_input {
+            ctx.request_repaint_after(Duration::from_millis(30)); // ~33 FPS para feedback de botões
+        } else if is_streaming {
+            // Heartbeat de segurança caso o streaming fique ocioso ou perca quadros
+            ctx.request_repaint_after(Duration::from_millis(100));
         } else {
+            // Repintura conservadora para atualização periódica de status e métricas
             ctx.request_repaint_after(Duration::from_millis(150));
         }
 

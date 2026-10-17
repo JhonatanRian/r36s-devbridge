@@ -231,7 +231,7 @@ impl AgentServer {
                         ServerResponse::Metrics(data)
                     }
                     ClientCommand::StartStream { target_fps: fps } => {
-                        let fps = if fps == 0 || fps > 60 { 30 } else { fps };
+                        let fps = if fps == 0 || fps > 60 { 60 } else { fps };
                         target_fps.store(fps, Ordering::Relaxed);
                         streaming_flag.store(true, Ordering::Relaxed);
                         ServerResponse::StreamStatus { active: true, fps }
@@ -428,7 +428,7 @@ impl AgentServer {
                     let active_session_cl = Arc::clone(&active_video_session);
 
                     thread::spawn(move || {
-                        let mut adaptive_fps = 30u32;
+                        let mut adaptive_fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 60);
                         let mut work_ewma_ms = 0.0f64;
                         let mut last_adaptation = Instant::now();
                         let mut frame_index: u32 = 0;
@@ -487,9 +487,9 @@ impl AgentServer {
                                 continue;
                             }
 
-                            let requested_fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 30);
+                            let requested_fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 60);
                             let fps = requested_fps.min(adaptive_fps);
-                            let frame_duration = Duration::from_millis(1000 / fps as u64);
+                            let frame_duration = Duration::from_micros(1_000_000 / fps as u64);
 
                             // Controle anti-buffer-bloat TCP: se a fila de saída do socket tiver mais de 64KB pendentes,
                             // o receptor ou a rede ainda estão drenando o frame anterior. Pulamos o envio deste ciclo para
