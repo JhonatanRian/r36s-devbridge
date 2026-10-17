@@ -23,7 +23,10 @@ impl ProcessManager {
         if let Ok(cmdline) = std::fs::read_to_string(format!("/proc/{}/cmdline", pid)) {
             let lower = cmdline.to_lowercase();
             if lower.contains("systemd") || lower.contains("udevd") || lower.contains("dbus") {
-                return Err(format!("Operação negada: o processo {} é um serviço essencial do sistema", pid));
+                return Err(format!(
+                    "Operação negada: o processo {} é um serviço essencial do sistema",
+                    pid
+                ));
             }
         }
 
@@ -52,16 +55,25 @@ impl ProcessManager {
                     .status();
                 if let Ok(st) = is_active {
                     if st.success() {
-                        return Ok("EmulationStation reiniciado com sucesso via systemd".to_string());
+                        return Ok(
+                            "EmulationStation reiniciado com sucesso via systemd".to_string()
+                        );
                     }
                 }
             }
         }
 
         // Fallback: finaliza o processo para que o supervisor do ArkOS (emulationstation.sh) recarregue
-        let _ = Command::new("pkill").arg("-15").arg("-f").arg("/usr/bin/emulationstation/emulationstation").output();
+        let _ = Command::new("pkill")
+            .arg("-15")
+            .arg("-f")
+            .arg("/usr/bin/emulationstation/emulationstation")
+            .output();
         std::thread::sleep(std::time::Duration::from_millis(1500));
-        let check_pid = Command::new("pgrep").arg("-f").arg("/usr/bin/emulationstation/emulationstation").output();
+        let check_pid = Command::new("pgrep")
+            .arg("-f")
+            .arg("/usr/bin/emulationstation/emulationstation")
+            .output();
         if let Ok(out) = check_pid {
             if !out.stdout.is_empty() {
                 return Ok("Processo EmulationStation re-spawned com sucesso".to_string());

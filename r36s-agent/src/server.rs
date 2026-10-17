@@ -41,7 +41,10 @@ impl AgentServer {
     }
 
     pub fn start(&self) {
-        println!("[r36s-agent] Iniciando servidor DevBridge v{}...", PROTOCOL_VERSION);
+        println!(
+            "[r36s-agent] Iniciando servidor DevBridge v{}...",
+            env!("CARGO_PKG_VERSION")
+        );
         println!("[r36s-agent] Porta de Controle: {}", CONTROL_PORT);
         println!("[r36s-agent] Porta de Vídeo:    {}", VIDEO_PORT);
 
@@ -61,21 +64,24 @@ impl AgentServer {
             );
         });
 
-        // Watchdog seguro para manter interface usb0 UP com IP estático 192.168.7.2 sem overhead
+        // Watchdog seguro para manter interface usb0 UP com IP estático 192.168.7.2 e recuperar de suspensão/sleep
         thread::spawn(|| {
             let _ = std::process::Command::new("systemctl")
                 .args(["start", "ssh.service"])
                 .output();
             loop {
-                thread::sleep(Duration::from_secs(4));
+                thread::sleep(Duration::from_secs(3));
+                // Module recovery belongs to the ordered systemd service, never this watchdog.
+                if std::path::Path::new("/run/devbridge-suspending").exists() {
+                    continue;
+                }
                 if std::path::Path::new("/sys/class/net/usb0").exists() {
                     // Verifica se já possui o IP correto antes de reexecutar ip
-                    let has_ip = std::fs::read_to_string("/proc/net/dev").is_ok()
-                        && std::process::Command::new("/sbin/ip")
-                            .args(["-o", "-4", "addr", "show", "dev", "usb0"])
-                            .output()
-                            .map(|o| String::from_utf8_lossy(&o.stdout).contains("192.168.7.2"))
-                            .unwrap_or(false);
+                    let has_ip = std::process::Command::new("/sbin/ip")
+                        .args(["-o", "-4", "addr", "show", "dev", "usb0"])
+                        .output()
+                        .map(|o| String::from_utf8_lossy(&o.stdout).contains("192.168.7.2"))
+                        .unwrap_or(false);
 
                     if !has_ip {
                         let _ = std::process::Command::new("/sbin/ip")
@@ -94,13 +100,15 @@ impl AgentServer {
             .expect("Falha ao abrir porta de controle");
         println!("[r36s-agent] Porta de controle {} escutando.", CONTROL_PORT);
 
+        let mut next_control_id = 0u32;
         for stream in listener.incoming() {
             match stream {
                 Ok(stream) => {
                     let streaming_flag = Arc::clone(&self.streaming_enabled);
                     let target_fps = Arc::clone(&self.target_fps);
                     let control_id_gen = Arc::clone(&self.active_control_id);
-                    let session_id = control_id_gen.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
+                    next_control_id = next_control_id.wrapping_add(1);
+                    let session_id = next_control_id;
                     let metrics = Arc::clone(&self.metrics_collector);
                     let gamepad = Arc::clone(&self.gamepad);
                     thread::spawn(move || {
@@ -132,21 +140,28 @@ impl AgentServer {
         gamepad: Arc<crate::gamepad::GamepadService>,
     ) {
         let peer_addr = stream.peer_addr().ok();
-        println!("[r36s-agent] Cliente de controle conectado (sessão {}): {:?}", session_id, peer_addr);
+        println!(
+            "[r36s-agent] Cliente de controle conectado (sessão {}): {:?}",
+            session_id, peer_addr
+        );
 
         // Validação de segurança: permitir somente loopback ou rede USB 192.168.7.*
         if let Some(ref addr) = peer_addr {
             let ip = addr.ip();
-            let is_allowed = ip.is_loopback() || match ip {
-                std::net::IpAddr::V4(v4) => {
-                    let oct = v4.octets();
-                    oct[0] == 192 && oct[1] == 168 && oct[2] == 7
-                }
-                _ => false,
-            };
+            let is_allowed = ip.is_loopback()
+                || match ip {
+                    std::net::IpAddr::V4(v4) => {
+                        let oct = v4.octets();
+                        oct[0] == 192 && oct[1] == 168 && oct[2] == 7
+                    }
+                    _ => false,
+                };
 
             if !is_allowed {
-                eprintln!("[r36s-agent] Conexão rejeitada por segurança (IP não autorizado: {})", ip);
+                eprintln!(
+                    "[r36s-agent] Conexão rejeitada por segurança (IP não autorizado: {})",
+                    ip
+                );
                 return;
             }
         }
@@ -156,12 +171,19 @@ impl AgentServer {
         let mut writer = stream;
         let mut deploy_mgr = DeployManager::new();
 
+        let mut handshaken = false;
+        let _ = reader
+            .get_ref()
+            .set_read_timeout(Some(Duration::from_secs(5)));
         let mut line = String::new();
         while let Ok(bytes_read) = reader.read_line(&mut line) {
             if bytes_read == 0 {
                 break;
             }
 
+            if handshaken && active_control_id.load(Ordering::SeqCst) != session_id {
+                break;
+            }
             let trimmed = line.trim();
             if trimmed.is_empty() {
                 line.clear();
@@ -169,14 +191,34 @@ impl AgentServer {
             }
 
             let response = match serde_json::from_str::<ClientCommand>(trimmed) {
+                Ok(cmd)
+                    if !handshaken
+                        && !matches!(
+                            cmd,
+                            ClientCommand::Handshake { .. } | ClientCommand::Ping
+                        ) =>
+                {
+                    ServerResponse::Error {
+                        message: "Handshake necessário".into(),
+                    }
+                }
                 Ok(cmd) => match cmd {
-                    ClientCommand::Handshake { client_version, client_id } => {
-                        println!("[r36s-agent] Handshake recebido: id={}, versão={}", client_id, client_version);
+                    ClientCommand::Handshake {
+                        client_version,
+                        client_id,
+                    } => {
+                        println!(
+                            "[r36s-agent] Handshake recebido: id={}, versão={}",
+                            client_id, client_version
+                        );
+                        active_control_id.store(session_id, Ordering::SeqCst);
+                        handshaken = true;
                         let (fb_w, fb_h, fb_bpp, fb_fmt) = metrics.get_fb_info();
                         ServerResponse::HandshakeAck {
                             agent_version: env!("CARGO_PKG_VERSION").to_string(),
                             protocol_version: PROTOCOL_VERSION.to_string(),
                             compatible: true,
+                            capabilities: vec!["gamepad-v2".into()],
                             fb_width: fb_w,
                             fb_height: fb_h,
                             fb_bpp: fb_bpp,
@@ -196,7 +238,10 @@ impl AgentServer {
                     }
                     ClientCommand::StopStream => {
                         streaming_flag.store(false, Ordering::Relaxed);
-                        ServerResponse::StreamStatus { active: false, fps: 0 }
+                        ServerResponse::StreamStatus {
+                            active: false,
+                            fps: 0,
+                        }
                     }
                     ClientCommand::DeployStart {
                         relative_path,
@@ -211,7 +256,10 @@ impl AgentServer {
                         },
                         Err(e) => ServerResponse::DeployError { error: e },
                     },
-                    ClientCommand::DeployChunk { chunk_index, data_base64 } => {
+                    ClientCommand::DeployChunk {
+                        chunk_index,
+                        data_base64,
+                    } => {
                         let chunk_bytes = match base64_decode(&data_base64) {
                             Ok(b) => b,
                             Err(e) => {
@@ -234,19 +282,25 @@ impl AgentServer {
                     }
                     ClientCommand::DeployFinish => match deploy_mgr.finish() {
                         Ok((path, hash)) => {
-                            if path.contains("r36s-devbridge/payload.zip") {
-                                let payload_path = path.clone();
-                                thread::spawn(move || {
-                                    thread::sleep(Duration::from_millis(800));
-                                    let script = format!(
-                                        "TMP_U=$(mktemp -d) && unzip -q -o '{}' -d $TMP_U && cp -f $TMP_U/r36s-agent /usr/local/bin/r36s-agent && chmod 755 /usr/local/bin/r36s-agent && rm -rf $TMP_U && systemctl restart r36s-agent",
-                                        payload_path
-                                    );
-                                    let _ = std::process::Command::new("/bin/sh")
-                                        .arg("-c")
-                                        .arg(&script)
-                                        .output();
-                                });
+                            if std::path::Path::new(&path).ends_with("r36s-devbridge/payload.zip") {
+                                // A separate systemd unit survives replacement/restart of this agent.
+                                let result = std::process::Command::new("systemd-run")
+                                    .args([
+                                        "--unit=r36s-devbridge-update",
+                                        "--collect",
+                                        "--no-block",
+                                        "/usr/bin/python3",
+                                        "/usr/local/share/devbridge/install_payload.py",
+                                        "--archive",
+                                        &path,
+                                        "--activate",
+                                    ])
+                                    .output();
+                                if !result.map_or(false, |o| o.status.success()) {
+                                    ServerResponse::DeployError { error: "Payload recebido, mas não foi possível iniciar a atualização transacional. Execute o Port.".into() }.write_to(&mut writer);
+                                    line.clear();
+                                    continue;
+                                }
                             }
                             ServerResponse::DeploySuccess { path, sha256: hash }
                         }
@@ -261,7 +315,10 @@ impl AgentServer {
                             Ok(_) => ServerResponse::KillResult {
                                 pid,
                                 success: true,
-                                message: format!("Processo {} finalizado com sinal {}", pid, signal),
+                                message: format!(
+                                    "Processo {} finalizado com sinal {}",
+                                    pid, signal
+                                ),
                             },
                             Err(e) => ServerResponse::KillResult {
                                 pid,
@@ -282,9 +339,15 @@ impl AgentServer {
                     },
                     ClientCommand::SetGamepadMonitor { enabled } => {
                         gamepad.set_listening(enabled);
-                        ServerResponse::GamepadAck {
-                            success: true,
-                            message: format!("Monitoramento de controles: {}", if enabled { "ATIVADO" } else { "DESATIVADO" }),
+                        ServerResponse::GamepadStateResponse(gamepad.get_state())
+                    }
+                    ClientCommand::SetGamepadInput { enabled } => {
+                        match gamepad.set_input(session_id, enabled) {
+                            Ok(()) => ServerResponse::GamepadStateResponse(gamepad.get_state()),
+                            Err(message) => ServerResponse::GamepadAck {
+                                success: false,
+                                message,
+                            },
                         }
                     }
                     ClientCommand::GetGamepadState => {
@@ -292,7 +355,7 @@ impl AgentServer {
                         ServerResponse::GamepadStateResponse(state)
                     }
                     ClientCommand::InjectGamepadInput { action } => {
-                        match gamepad.inject_action(&action) {
+                        match gamepad.inject_action(session_id, &action) {
                             Ok(_) => ServerResponse::GamepadAck {
                                 success: true,
                                 message: "Comando de controle injetado com sucesso".to_string(),
@@ -313,11 +376,16 @@ impl AgentServer {
             line.clear();
         }
 
+        gamepad.disconnect(session_id);
         // Somente desativa o streaming se esta ainda for a sessão de controle ativa mais recente
-        if active_control_id.load(Ordering::SeqCst) == session_id {
+        if handshaken && active_control_id.load(Ordering::SeqCst) == session_id {
             streaming_flag.store(false, Ordering::Relaxed);
+            gamepad.set_listening(false);
         }
-        println!("[r36s-agent] Cliente de controle desconectado (sessão {}).", session_id);
+        println!(
+            "[r36s-agent] Cliente de controle desconectado (sessão {}).",
+            session_id
+        );
     }
 
     fn video_stream_worker(
@@ -333,10 +401,16 @@ impl AgentServer {
         for stream in listener.incoming() {
             match stream {
                 Ok(mut stream) => {
-                    let session_id = active_video_session.fetch_add(1, Ordering::SeqCst).wrapping_add(1);
-                    println!("[r36s-agent] Cliente de vídeo conectado (sessão {}): {:?}", session_id, stream.peer_addr());
+                    let session_id = active_video_session
+                        .fetch_add(1, Ordering::SeqCst)
+                        .wrapping_add(1);
+                    println!(
+                        "[r36s-agent] Cliente de vídeo conectado (sessão {}): {:?}",
+                        session_id,
+                        stream.peer_addr()
+                    );
                     let _ = stream.set_nodelay(true);
-                    let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+                    let _ = stream.set_write_timeout(Some(Duration::from_millis(250)));
 
                     // Garante que o streaming esteja ativo ao conectar no socket 7366
                     streaming_flag.store(true, Ordering::Relaxed);
@@ -354,9 +428,27 @@ impl AgentServer {
                     let active_session_cl = Arc::clone(&active_video_session);
 
                     thread::spawn(move || {
+                        let mut adaptive_fps = 30u32;
+                        let mut work_ewma_ms = 0.0f64;
+                        let mut last_adaptation = Instant::now();
                         let mut frame_index: u32 = 0;
+                        let send_buffer: libc::c_int = 64 * 1024;
+                        unsafe {
+                            libc::setsockopt(
+                                stream.as_raw_fd(),
+                                libc::SOL_SOCKET,
+                                libc::SO_SNDBUF,
+                                (&send_buffer as *const libc::c_int).cast(),
+                                std::mem::size_of_val(&send_buffer) as _,
+                            );
+                        }
+                        if stream.set_nonblocking(true).is_err() {
+                            return;
+                        }
                         let mut next_deadline = Instant::now();
-                        let mut comp_buffer = Vec::with_capacity(lz4_flex::block::get_maximum_output_size(640 * 480 * 4));
+                        let mut comp_buffer = Vec::with_capacity(
+                            lz4_flex::block::get_maximum_output_size(640 * 480 * 4),
+                        );
 
                         let diag_enabled = std::env::var_os("DEVBRIDGE_DIAG").is_some();
                         let mut diag_last_report = Instant::now();
@@ -365,6 +457,10 @@ impl AgentServer {
                         let mut diag_skips = 0u64;
                         let mut diag_cap_us = 0u64;
                         let mut diag_send_us = 0u64;
+                        let mut diag_sync_us = 0u64;
+                        let mut diag_copy_us = 0u64;
+                        let mut diag_compress_us = 0u64;
+                        let mut diag_bytes = 0u64;
 
                         loop {
                             // Se uma nova conexão de vídeo chegou no socket, esta sessão é preempcionada e encerra imediatamente
@@ -385,20 +481,23 @@ impl AgentServer {
                                     Err(_) => break, // Erro de conexão
                                     _ => {}
                                 }
-                                let _ = stream.set_nonblocking(false);
+
                                 thread::sleep(Duration::from_millis(60));
                                 next_deadline = Instant::now();
                                 continue;
                             }
 
-                            let fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 60);
+                            let requested_fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 30);
+                            let fps = requested_fps.min(adaptive_fps);
                             let frame_duration = Duration::from_millis(1000 / fps as u64);
 
                             // Controle anti-buffer-bloat TCP: se a fila de saída do socket tiver mais de 64KB pendentes,
                             // o receptor ou a rede ainda estão drenando o frame anterior. Pulamos o envio deste ciclo para
-                            // evitar enfileiramento no kernel e garantir que o cliente receba sempre o frame mais atual (< 16ms).
+                            // evitar enfileiramento no kernel limitar acúmulo de quadros antigos. O prazo total de cada envio é verificado abaixo.
                             let mut pending_bytes: libc::c_int = 0;
-                            let _ = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut pending_bytes) };
+                            let _ = unsafe {
+                                libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut pending_bytes)
+                            };
                             if pending_bytes > 64 * 1024 {
                                 if diag_enabled {
                                     diag_skips += 1;
@@ -407,12 +506,24 @@ impl AgentServer {
                                 continue;
                             }
 
-                            let t_cap = if diag_enabled { Some(Instant::now()) } else { None };
+                            let work_started = Instant::now();
+                            let t_cap = if diag_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
 
                             // Captura e compressão in-place no buffer pré-alocado (zero alocações por frame)
                             let (width, height, bpp, format, flags, comp_len) = {
                                 let mut reader = fb_reader_cl.lock().unwrap();
                                 let (w, h, fmt, flg, len) = reader.capture_frame(&mut comp_buffer);
+                                if diag_enabled {
+                                    let (sync, copy, compress) = reader.capture_timing();
+                                    diag_sync_us += sync;
+                                    diag_copy_us += copy;
+                                    diag_compress_us += compress;
+                                    diag_bytes += len as u64;
+                                }
                                 (w, h, reader.bpp, fmt, flg, len)
                             }; // O Mutex fb_reader_cl é liberado aqui antes do envio pela rede!
                             metrics_cl.set_fb_info(width, height, bpp, format);
@@ -436,35 +547,66 @@ impl AgentServer {
                                 comp_len as u32,
                             );
 
-                            let t_send = if diag_enabled { Some(Instant::now()) } else { None };
+                            let t_send = if diag_enabled {
+                                Some(Instant::now())
+                            } else {
+                                None
+                            };
 
-                            // Envia cabeçalho (20 bytes)
-                            let header_bytes = header.to_bytes();
-                            if stream.write_all(&header_bytes).is_err() {
+                            let sent_at = Instant::now();
+                            let deadline = sent_at + Duration::from_millis(250);
+                            if write_before(&mut stream, &header.to_bytes(), deadline).is_err()
+                                || write_before(&mut stream, &comp_buffer[..comp_len], deadline)
+                                    .is_err()
+                            {
+                                eprintln!("[r36s-agent] Vídeo: prazo de envio expirou ou conexão encerrou; descartando sessão {}.", session_id);
                                 break;
                             }
-
-                            // Se payload comprimido não estiver vazio (flags != 1 e comp_len > 0), envia dados
-                            if comp_len > 0 {
-                                if stream.write_all(&comp_buffer[..comp_len]).is_err() {
-                                    break;
-                                }
+                            let work_ms = work_started.elapsed().as_secs_f64() * 1000.0;
+                            work_ewma_ms = if work_ewma_ms == 0.0 {
+                                work_ms
+                            } else {
+                                work_ewma_ms * 0.8 + work_ms * 0.2
+                            };
+                            // Reassess once a second; a single costly frame must not pin a later game at 5 FPS.
+                            if last_adaptation.elapsed() >= Duration::from_secs(1) {
+                                let capacity = (950.0 / work_ewma_ms.max(1.0)) as u32;
+                                adaptive_fps = if capacity < adaptive_fps {
+                                    capacity.clamp(5, requested_fps)
+                                } else {
+                                    (adaptive_fps + 5).min(capacity).min(requested_fps)
+                                };
+                                last_adaptation = Instant::now();
                             }
-
                             if let Some(t) = t_send {
                                 diag_send_us += t.elapsed().as_micros() as u64;
                             }
 
                             // Relatório diagnóstico agregado a cada 5s sem poluir logs por quadro
-                            if diag_enabled && diag_last_report.elapsed() >= Duration::from_secs(5) {
+                            if diag_enabled && diag_last_report.elapsed() >= Duration::from_secs(5)
+                            {
                                 let el_secs = diag_last_report.elapsed().as_secs_f64();
                                 let fps_eff = diag_frames as f64 / el_secs;
-                                let avg_cap_ms = if diag_frames > 0 { (diag_cap_us as f64 / diag_frames as f64) / 1000.0 } else { 0.0 };
-                                let avg_send_ms = if diag_frames > 0 { (diag_send_us as f64 / diag_frames as f64) / 1000.0 } else { 0.0 };
+                                let avg_cap_ms = if diag_frames > 0 {
+                                    (diag_cap_us as f64 / diag_frames as f64) / 1000.0
+                                } else {
+                                    0.0
+                                };
+                                let avg_send_ms = if diag_frames > 0 {
+                                    (diag_send_us as f64 / diag_frames as f64) / 1000.0
+                                } else {
+                                    0.0
+                                };
                                 eprintln!(
                                     "[DEVBRIDGE_DIAG] 5s: {:.1} FPS (total: {}, unchanged: {}, tcp_skips: {}) | avg cap: {:.2}ms, send: {:.2}ms",
                                     fps_eff, diag_frames, diag_unchanged, diag_skips, avg_cap_ms, avg_send_ms
                                 );
+                                eprintln!("[DEVBRIDGE_DIAG] sync_us={} copy_us={} compress_us={} payload_bytes={} interval_s={:.2} queue_bytes={} fps_target={}",
+                                    diag_sync_us, diag_copy_us, diag_compress_us, diag_bytes, el_secs, pending_bytes, fps);
+                                diag_sync_us = 0;
+                                diag_copy_us = 0;
+                                diag_compress_us = 0;
+                                diag_bytes = 0;
                                 diag_last_report = Instant::now();
                                 diag_frames = 0;
                                 diag_unchanged = 0;
@@ -482,7 +624,10 @@ impl AgentServer {
                                 next_deadline = now + frame_duration;
                             }
                         }
-                        println!("[r36s-agent] Cliente de vídeo desconectado (sessão {}).", session_id);
+                        println!(
+                            "[r36s-agent] Cliente de vídeo desconectado (sessão {}).",
+                            session_id
+                        );
                     });
                 }
                 Err(e) => {
@@ -543,4 +688,73 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
         }
     }
     Ok(out)
+}
+
+/// Bound the entire frame, including partial writes. A failed frame requires a fresh TCP session.
+fn write_before(
+    stream: &mut TcpStream,
+    mut bytes: &[u8],
+    deadline: Instant,
+) -> std::io::Result<()> {
+    while !bytes.is_empty() {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::TimedOut, "video frame deadline")
+            })?;
+        match stream.write(bytes) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => bytes = &bytes[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                let mut poll = libc::pollfd {
+                    fd: stream.as_raw_fd(),
+                    events: libc::POLLOUT,
+                    revents: 0,
+                };
+                let result =
+                    unsafe { libc::poll(&mut poll, 1, remaining.as_millis().clamp(1, 250) as i32) };
+                if result < 0
+                    && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+                {
+                    return Err(std::io::Error::last_os_error());
+                }
+                if poll.revents & (libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0 {
+                    return Err(std::io::ErrorKind::BrokenPipe.into());
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod transport_tests {
+    use super::*;
+    #[test]
+    fn stalled_receiver_cannot_extend_frame_deadline() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut sender = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (_receiver, _) = listener.accept().unwrap();
+        sender.set_nonblocking(true).unwrap();
+        let size: libc::c_int = 4096;
+        unsafe {
+            libc::setsockopt(
+                sender.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&size as *const libc::c_int).cast(),
+                std::mem::size_of_val(&size) as _,
+            );
+        }
+        let begin = Instant::now();
+        let result = write_before(
+            &mut sender,
+            &vec![42; 16 * 1024 * 1024],
+            begin + Duration::from_millis(80),
+        );
+        assert!(result.is_err());
+        assert!(begin.elapsed() < Duration::from_millis(400));
+    }
 }

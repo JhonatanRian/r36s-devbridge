@@ -1,6 +1,6 @@
 use crate::protocol::{
-    FORMAT_BGRA8888_LZ4, FORMAT_RGB565_LZ4, FORMAT_RGBA8888_LZ4,
-    FRAME_FLAG_FB_UNAVAILABLE, FRAME_FLAG_KEYFRAME, FRAME_FLAG_UNCHANGED,
+    FORMAT_BGRA8888_LZ4, FORMAT_RGB565_LZ4, FORMAT_RGBA8888_LZ4, FRAME_FLAG_FB_UNAVAILABLE,
+    FRAME_FLAG_KEYFRAME, FRAME_FLAG_UNCHANGED,
 };
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -150,6 +150,7 @@ pub enum DrmState {
 }
 
 pub struct DrmReader {
+    timing: (u64, u64),
     plane_ids: Vec<u32>,
 }
 
@@ -157,6 +158,7 @@ impl DrmReader {
     pub fn new() -> Self {
         Self {
             plane_ids: Vec::with_capacity(16),
+            timing: (0, 0),
         }
     }
 
@@ -200,6 +202,7 @@ impl DrmReader {
     }
 
     pub fn capture(&mut self, packed_buffer: &mut Vec<u8>) -> Option<(u16, u16, u8)> {
+        self.timing = (0, 0);
         let card = File::open("/dev/dri/card0")
             .or_else(|_| File::open("/dev/dri/card1"))
             .ok()?;
@@ -215,7 +218,9 @@ impl DrmReader {
         }
 
         let mut pres: DrmModeGetPlaneRes = unsafe { std::mem::zeroed() };
-        if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres) } < 0 || pres.count_planes == 0 {
+        if unsafe { libc::ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &mut pres) } < 0
+            || pres.count_planes == 0
+        {
             return None;
         }
 
@@ -265,10 +270,20 @@ impl DrmReader {
         let bpp = if fb.bpp > 0 { fb.bpp as u8 } else { 32 };
         let bytes_per_pixel = (bpp as usize) / 8;
         let row_bytes = (width as usize) * bytes_per_pixel;
+        if !matches!(bpp, 16 | 32)
+            || width == 0
+            || height == 0
+            || fb.width > 4096
+            || fb.height > 4096
+            || pitch < row_bytes
+        {
+            Self::gem_close(fd, fb.handle);
+            return None;
+        }
 
         let mut prime: DrmPrimeHandle = unsafe { std::mem::zeroed() };
         prime.handle = fb.handle;
-        prime.flags = 0;
+        prime.flags = libc::O_CLOEXEC as u32;
         prime.fd = -1;
 
         let prime_res = unsafe { libc::ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &mut prime) };
@@ -280,19 +295,34 @@ impl DrmReader {
 
         let dma_fd = prime.fd;
 
+        let sync_started = Instant::now();
         // 1. Sincronização explícita: espera até 10ms se a GPU estiver finalizando a renderização do buffer
         let mut pfd = libc::pollfd {
             fd: dma_fd,
             events: libc::POLLIN,
             revents: 0,
         };
-        let _ = unsafe { libc::poll(&mut pfd, 1, 10) };
+        let ready = unsafe { libc::poll(&mut pfd, 1, 10) };
+        if ready <= 0
+            || pfd.revents & libc::POLLIN == 0
+            || pfd.revents & (libc::POLLERR | libc::POLLNVAL) != 0
+        {
+            unsafe {
+                libc::close(dma_fd);
+            }
+            return None;
+        }
 
         // 2. Coerência de cache: sinaliza início de leitura da CPU no DMA-BUF (invalida D-cache ARM)
         let mut sync_start = DmaBufSync {
             flags: DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ,
         };
-        let _ = unsafe { libc::ioctl(dma_fd, DMA_BUF_IOCTL_SYNC as _, &mut sync_start) };
+        if !dma_sync(dma_fd, &mut sync_start) {
+            unsafe {
+                libc::close(dma_fd);
+            }
+            return None;
+        }
 
         let mmap_len = (pitch * (height as usize) + 4095) & !4095;
         let map_ptr = unsafe {
@@ -310,13 +340,15 @@ impl DrmReader {
             let mut sync_end = DmaBufSync {
                 flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
             };
-            let _ = unsafe { libc::ioctl(dma_fd, DMA_BUF_IOCTL_SYNC as _, &mut sync_end) };
+            let _ = dma_sync(dma_fd, &mut sync_end);
             unsafe {
                 libc::close(dma_fd);
             }
             return None;
         }
 
+        self.timing.0 = sync_started.elapsed().as_micros() as u64;
+        let copy_started = Instant::now();
         let total_frame_bytes = row_bytes * (height as usize);
         if packed_buffer.len() != total_frame_bytes {
             packed_buffer.resize(total_frame_bytes, 0);
@@ -331,18 +363,21 @@ impl DrmReader {
             for y in 0..(height as usize) {
                 let src_off = y * pitch;
                 let dst_off = y * row_bytes;
-                if src_off + row_bytes <= src_slice.len() && dst_off + row_bytes <= packed_buffer.len() {
+                if src_off + row_bytes <= src_slice.len()
+                    && dst_off + row_bytes <= packed_buffer.len()
+                {
                     packed_buffer[dst_off..dst_off + row_bytes]
                         .copy_from_slice(&src_slice[src_off..src_off + row_bytes]);
                 }
             }
         }
 
+        self.timing.1 = copy_started.elapsed().as_micros() as u64;
         // 3. Finaliza leitura da CPU no DMA-BUF
         let mut sync_end = DmaBufSync {
             flags: DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ,
         };
-        let _ = unsafe { libc::ioctl(dma_fd, DMA_BUF_IOCTL_SYNC as _, &mut sync_end) };
+        let sync_ok = dma_sync(dma_fd, &mut sync_end);
 
         unsafe {
             libc::munmap(map_ptr, mmap_len);
@@ -358,11 +393,16 @@ impl DrmReader {
             FORMAT_RGB565_LZ4
         };
 
-        Some((width, height, format))
+        if sync_ok {
+            Some((width, height, format))
+        } else {
+            None
+        }
     }
 }
 
 pub struct FramebufferReader {
+    compression_us: u64,
     drm_reader: DrmReader,
     pub width: u16,
     pub height: u16,
@@ -384,6 +424,7 @@ impl FramebufferReader {
     pub fn new() -> Self {
         Self {
             drm_reader: DrmReader::new(),
+            compression_us: 0,
             width: 640,
             height: 480,
             bpp: 16,
@@ -407,15 +448,29 @@ impl FramebufferReader {
         self.transition_start = None;
     }
 
+    pub fn capture_timing(&self) -> (u64, u64, u64) {
+        (
+            self.drm_reader.timing.0,
+            self.drm_reader.timing.1,
+            self.compression_us,
+        )
+    }
+
     pub fn capture_frame(&mut self, comp_out: &mut Vec<u8>) -> (u16, u16, u8, u8, usize) {
+        self.compression_us = 0;
         // 1. Prioridade absoluta: Captura direta do plane DRM KMS ativo com até 2 tentativas rápidas (1ms)
         for _ in 0..2 {
-            if let Some((drm_w, drm_h, drm_fmt)) = self.drm_reader.capture(&mut self.packed_buffer) {
+            if let Some((drm_w, drm_h, drm_fmt)) = self.drm_reader.capture(&mut self.packed_buffer)
+            {
                 if drm_w != self.width || drm_h != self.height || drm_fmt != self.format {
                     self.width = drm_w;
                     self.height = drm_h;
                     self.format = drm_fmt;
-                    self.bpp = if drm_fmt == FORMAT_BGRA8888_LZ4 || drm_fmt == FORMAT_RGBA8888_LZ4 { 32 } else { 16 };
+                    self.bpp = if drm_fmt == FORMAT_BGRA8888_LZ4 || drm_fmt == FORMAT_RGBA8888_LZ4 {
+                        32
+                    } else {
+                        16
+                    };
                     self.force_keyframe = true;
                     self.prev_frame_buffer.clear();
                 }
@@ -432,7 +487,13 @@ impl FramebufferReader {
         if state == DrmState::ActiveKms {
             // Cliente KMS ativo em transição (ex.: troca rápida de modo ou app iniciando).
             // Reporta indisponibilidade transitória imediatamente sem falsificar UNCHANGED.
-            return (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, 0);
+            return (
+                self.width,
+                self.height,
+                self.format,
+                FRAME_FLAG_FB_UNAVAILABLE,
+                0,
+            );
         }
 
         // 3. Fallback seguro para /dev/fb0 via pread() (menus de Ports com dialog, console fbcon)
@@ -444,7 +505,13 @@ impl FramebufferReader {
         if std::env::var("DEVBRIDGE_ALLOW_MOCK").is_ok() {
             self.generate_mock_frame(comp_out)
         } else {
-            (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, 0)
+            (
+                self.width,
+                self.height,
+                self.format,
+                FRAME_FLAG_FB_UNAVAILABLE,
+                0,
+            )
         }
     }
 
@@ -460,9 +527,24 @@ impl FramebufferReader {
         }
         let finfo_ok = unsafe { libc::ioctl(fd, 0x4602, &mut finfo) == 0 };
 
-        let width = if vinfo.xres > 0 { vinfo.xres as u16 } else { 640 };
-        let height = if vinfo.yres > 0 { vinfo.yres as u16 } else { 480 };
-        let bpp = if vinfo.bits_per_pixel > 0 { vinfo.bits_per_pixel as u8 } else { 16 };
+        let width = if vinfo.xres > 0 {
+            vinfo.xres as u16
+        } else {
+            640
+        };
+        let height = if vinfo.yres > 0 {
+            vinfo.yres as u16
+        } else {
+            480
+        };
+        let bpp = if vinfo.bits_per_pixel > 0 {
+            vinfo.bits_per_pixel as u8
+        } else {
+            16
+        };
+        if !matches!(bpp, 16 | 32) || vinfo.xres > 4096 || vinfo.yres > 4096 {
+            return None;
+        }
         let bytes_per_pixel = (bpp as usize) / 8;
 
         let line_length = if finfo_ok && finfo.line_length > 0 {
@@ -471,6 +553,9 @@ impl FramebufferReader {
             (width as usize) * bytes_per_pixel
         };
 
+        if line_length < (width as usize + vinfo.xoffset as usize) * bytes_per_pixel {
+            return None;
+        }
         let format = if bpp == 32 {
             if vinfo.red.offset == 16 && vinfo.blue.offset == 0 {
                 FORMAT_BGRA8888_LZ4
@@ -503,12 +588,17 @@ impl FramebufferReader {
         let start_offset = (yoffset * line_length + xoffset * bytes_per_pixel) as u64;
 
         if line_length == row_bytes && xoffset == 0 {
-            file.read_exact_at(&mut self.packed_buffer[..total_frame_bytes], start_offset).ok()?;
+            file.read_exact_at(&mut self.packed_buffer[..total_frame_bytes], start_offset)
+                .ok()?;
         } else {
             for y in 0..(height as usize) {
                 let src_off = start_offset + (y * line_length) as u64;
                 let dst_off = y * row_bytes;
-                file.read_exact_at(&mut self.packed_buffer[dst_off..dst_off + row_bytes], src_off).ok()?;
+                file.read_exact_at(
+                    &mut self.packed_buffer[dst_off..dst_off + row_bytes],
+                    src_off,
+                )
+                .ok()?;
             }
         }
 
@@ -533,7 +623,13 @@ impl FramebufferReader {
 
         if is_unchanged {
             // Quadro 100% idêntico: flag = 1, payload comprimido vazio (0 bytes)
-            return (self.width, self.height, self.format, FRAME_FLAG_UNCHANGED, 0);
+            return (
+                self.width,
+                self.height,
+                self.format,
+                FRAME_FLAG_UNCHANGED,
+                0,
+            );
         }
 
         // Garante que o buffer de saída tenha capacidade suficiente para o pior caso do LZ4
@@ -542,16 +638,32 @@ impl FramebufferReader {
             comp_out.resize(max_compressed_len, 0);
         }
 
+        let compress_started = Instant::now();
         let compressed_size = match lz4_flex::block::compress_into(&self.packed_buffer, comp_out) {
             Ok(size) => size,
-            Err(_) => return (self.width, self.height, self.format, FRAME_FLAG_FB_UNAVAILABLE, 0),
+            Err(_) => {
+                return (
+                    self.width,
+                    self.height,
+                    self.format,
+                    FRAME_FLAG_FB_UNAVAILABLE,
+                    0,
+                )
+            }
         };
 
+        self.compression_us = compress_started.elapsed().as_micros() as u64;
         // Troca os ponteiros de buffer em O(1) (< 5 ns) sem copiar 1.2 MB de RAM!
         // Na próxima captura, self.packed_buffer apontará para o buffer antigo e será sobrescrito diretamente.
         std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer);
 
-        (self.width, self.height, self.format, FRAME_FLAG_KEYFRAME, compressed_size)
+        (
+            self.width,
+            self.height,
+            self.format,
+            FRAME_FLAG_KEYFRAME,
+            compressed_size,
+        )
     }
 
     fn generate_mock_frame(&mut self, comp_out: &mut Vec<u8>) -> (u16, u16, u8, u8, usize) {
@@ -588,5 +700,44 @@ impl FramebufferReader {
         }
         let written = lz4_flex::block::compress_into(&raw, comp_out).unwrap_or(0);
         (self.width, self.height, FORMAT_RGB565_LZ4, 0, written)
+    }
+}
+
+// Cache coherence is separate from producer ownership. Never fabricate missing pixels.
+fn dma_sync(fd: libc::c_int, sync: &mut DmaBufSync) -> bool {
+    for _ in 0..3 {
+        if unsafe { libc::ioctl(fd, DMA_BUF_IOCTL_SYNC as _, sync as *mut DmaBufSync) } == 0 {
+            return true;
+        }
+        match std::io::Error::last_os_error().raw_os_error() {
+            Some(libc::EINTR) | Some(libc::EAGAIN) => continue,
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod regression_tests {
+    use super::*;
+    #[test]
+    fn legitimate_black_band_and_native_color_are_preserved() {
+        let mut reader = FramebufferReader::new();
+        reader.width = 32;
+        reader.height = 64;
+        reader.bpp = 32;
+        reader.format = FORMAT_BGRA8888_LZ4;
+        reader.packed_buffer = vec![137; 32 * 64 * 4];
+        let mut compressed = Vec::new();
+        reader.compress_and_return_frame(&mut compressed);
+        reader.packed_buffer = reader.prev_frame_buffer.clone();
+        reader.packed_buffer[20 * 32 * 4..40 * 32 * 4].fill(0);
+        let expected = reader.packed_buffer.clone();
+        let (_, _, format, _, size) = reader.compress_and_return_frame(&mut compressed);
+        assert_eq!(format, FORMAT_BGRA8888_LZ4);
+        assert_eq!(
+            lz4_flex::decompress(&compressed[..size], expected.len()).unwrap(),
+            expected
+        );
     }
 }

@@ -64,46 +64,10 @@ fn test_framebuffer_mock_and_lz4() {
 }
 
 #[test]
-fn test_gamepad_service_listening_and_injection() {
-    use r36s_agent::gamepad::GamepadService;
-    use r36s_agent::protocol::*;
-
-    let service = GamepadService::new_mock();
-    assert!(!service.is_listening());
-
-    service.set_listening(true);
-    assert!(service.is_listening());
-
-    let state = service.get_state();
-    assert_eq!(state.buttons, 0);
-
-    // Test button press injection
-    service.inject_action(&GamepadInputAction::Button {
-        mask: BTN_MASK_A,
-        pressed: true,
-    }).unwrap();
-
-    let state_after = service.get_state();
-    assert_eq!(state_after.buttons & BTN_MASK_A, BTN_MASK_A);
-
-    // Test button release injection
-    service.inject_action(&GamepadInputAction::Button {
-        mask: BTN_MASK_A,
-        pressed: false,
-    }).unwrap();
-
-    let state_released = service.get_state();
-    assert_eq!(state_released.buttons & BTN_MASK_A, 0);
-
-    // Test axis injection
-    service.inject_action(&GamepadInputAction::Axis {
-        left_x: 16000,
-        left_y: -16000,
-        right_x: 0,
-        right_y: 0,
-    }).unwrap();
-
-    let state_axis = service.get_state();
-    assert_eq!(state_axis.left_x, 16000);
-    assert_eq!(state_axis.left_y, -16000);
+fn gamepad_rejects_input_without_session() {
+    let service = r36s_agent::gamepad::GamepadService::new();
+    assert!(!service.get_state().input_enabled);
+    assert!(service.inject_action(7, &GamepadInputAction::Button {
+        mask: BTN_MASK_A, pressed: true,
+    }).is_err());
 }

@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 pub struct MetricsCollector {
     last_cpu_times: Mutex<Option<(u64, u64)>>, // (total, idle)
     last_proc_times: Mutex<HashMap<u32, (u64, Instant)>>, // pid -> (ticks, instant)
-    fb_info: Mutex<(u16, u16, u8, u8)>, // (width, height, bpp, format)
+    fb_info: Mutex<(u16, u16, u8, u8)>,        // (width, height, bpp, format)
     page_size_kb: u64,
     clk_tck: f32,
 }
@@ -16,11 +16,19 @@ impl MetricsCollector {
     pub fn new() -> Self {
         let page_size_kb = unsafe {
             let ps = libc::sysconf(libc::_SC_PAGESIZE);
-            if ps > 0 { (ps as u64) / 1024 } else { 4 }
+            if ps > 0 {
+                (ps as u64) / 1024
+            } else {
+                4
+            }
         };
         let clk_tck = unsafe {
             let tck = libc::sysconf(libc::_SC_CLK_TCK);
-            if tck > 0 { tck as f32 } else { 100.0 }
+            if tck > 0 {
+                tck as f32
+            } else {
+                100.0
+            }
         };
 
         Self {
@@ -98,7 +106,9 @@ impl MetricsCollector {
                         let idle_diff = idle_all.saturating_sub(prev_idle);
                         *last = Some((total, idle_all));
                         if total_diff > 0 {
-                            let usage = (total_diff.saturating_sub(idle_diff) as f32 / total_diff as f32) * 100.0;
+                            let usage = (total_diff.saturating_sub(idle_diff) as f32
+                                / total_diff as f32)
+                                * 100.0;
                             return usage.clamp(0.0, 100.0);
                         }
                     } else {
@@ -113,8 +123,14 @@ impl MetricsCollector {
     fn collect_cpu_freqs() -> Vec<u32> {
         let mut freqs = Vec::new();
         for cpu_idx in 0..8 {
-            let path1 = format!("/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq", cpu_idx);
-            let path2 = format!("/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_cur_freq", cpu_idx);
+            let path1 = format!(
+                "/sys/devices/system/cpu/cpu{}/cpufreq/scaling_cur_freq",
+                cpu_idx
+            );
+            let path2 = format!(
+                "/sys/devices/system/cpu/cpu{}/cpufreq/cpuinfo_cur_freq",
+                cpu_idx
+            );
 
             let val_str = fs::read_to_string(&path1).or_else(|_| fs::read_to_string(&path2));
             if let Ok(content) = val_str {
@@ -259,7 +275,8 @@ impl MetricsCollector {
                         if let Ok(stat_content) = fs::read_to_string(stat_path) {
                             if let Some(rparen_pos) = stat_content.rfind(')') {
                                 let after_paren = &stat_content[rparen_pos + 1..];
-                                let stat_parts: Vec<&str> = after_paren.split_whitespace().collect();
+                                let stat_parts: Vec<&str> =
+                                    after_paren.split_whitespace().collect();
                                 // Campo 14 utime = índice 11 após parêntese; Campo 15 stime = índice 12
                                 if stat_parts.len() >= 13 {
                                     let utime: u64 = stat_parts[11].parse().unwrap_or(0);
@@ -267,12 +284,15 @@ impl MetricsCollector {
                                     let total_ticks = utime + stime;
                                     new_proc_times.insert(pid, (total_ticks, now));
 
-                                    if let Some(&(prev_ticks, prev_time)) = last_proc_times.get(&pid) {
+                                    if let Some(&(prev_ticks, prev_time)) =
+                                        last_proc_times.get(&pid)
+                                    {
                                         let tick_diff = total_ticks.saturating_sub(prev_ticks);
                                         let time_diff = now.duration_since(prev_time).as_secs_f32();
                                         if time_diff > 0.05 {
                                             let clk_tck = self.clk_tck;
-                                            cpu_percent = ((tick_diff as f32 / clk_tck) / time_diff) * 100.0;
+                                            cpu_percent =
+                                                ((tick_diff as f32 / clk_tck) / time_diff) * 100.0;
                                             cpu_percent = cpu_percent.clamp(0.0, 400.0);
                                         }
                                     }

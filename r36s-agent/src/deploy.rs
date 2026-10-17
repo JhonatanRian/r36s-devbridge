@@ -54,9 +54,13 @@ impl DeployManager {
             return Err("Partição de ROMs (/roms ou /roms2) não encontrada no console".to_string());
         };
 
-        let canon_base = base_dir
-            .canonicalize()
-            .map_err(|e| format!("Falha ao resolver caminho base {}: {}", base_dir.display(), e))?;
+        let canon_base = base_dir.canonicalize().map_err(|e| {
+            format!(
+                "Falha ao resolver caminho base {}: {}",
+                base_dir.display(),
+                e
+            )
+        })?;
 
         // Sanitização rigorosa de caminho para prevenir path traversal
         let clean_rel: PathBuf = relative_path
@@ -70,14 +74,18 @@ impl DeployManager {
             .ok_or_else(|| "Nome de arquivo inválido".to_string())?;
 
         let target_dir = base_dir.join(clean_rel);
-        fs::create_dir_all(&target_dir).map_err(|e| format!("Falha ao criar diretório {}: {}", target_dir.display(), e))?;
+        fs::create_dir_all(&target_dir)
+            .map_err(|e| format!("Falha ao criar diretório {}: {}", target_dir.display(), e))?;
 
         let canon_target = target_dir
             .canonicalize()
             .map_err(|e| format!("Falha ao validar destino {}: {}", target_dir.display(), e))?;
 
         if !canon_target.starts_with(&canon_base) {
-            return Err("Violação de segurança: tentativa de gravação fora do diretório de ROMs".to_string());
+            return Err(
+                "Violação de segurança: tentativa de gravação fora do diretório de ROMs"
+                    .to_string(),
+            );
         }
 
         let dest_path = canon_target.join(clean_filename);
@@ -86,9 +94,11 @@ impl DeployManager {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_millis();
-        let tmp_path = canon_target.join(format!(".{}.{}_{}.upload.tmp", clean_filename, pid, now_ms));
+        let tmp_path =
+            canon_target.join(format!(".{}.{}_{}.upload.tmp", clean_filename, pid, now_ms));
 
-        let file = File::create(&tmp_path).map_err(|e| format!("Falha ao criar arquivo temporário: {}", e))?;
+        let file = File::create(&tmp_path)
+            .map_err(|e| format!("Falha ao criar arquivo temporário: {}", e))?;
 
         self.current_session = Some(DeploySession {
             dest_path,
@@ -155,8 +165,10 @@ impl DeployManager {
         }
 
         if let Some(mut file) = session.file.take() {
-            file.flush().map_err(|e| format!("Erro no flush em disco: {}", e))?;
-            file.sync_all().map_err(|e| format!("Erro no sync_all em disco: {}", e))?;
+            file.flush()
+                .map_err(|e| format!("Erro no flush em disco: {}", e))?;
+            file.sync_all()
+                .map_err(|e| format!("Erro no sync_all em disco: {}", e))?;
             drop(file);
         }
 
@@ -174,7 +186,8 @@ impl DeployManager {
                 #[cfg(unix)]
                 {
                     use std::os::unix::fs::PermissionsExt;
-                    let _ = fs::set_permissions(&session.tmp_path, fs::Permissions::from_mode(0o755));
+                    let _ =
+                        fs::set_permissions(&session.tmp_path, fs::Permissions::from_mode(0o755));
                 }
             }
         }
