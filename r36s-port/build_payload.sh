@@ -14,7 +14,7 @@ if [ -n "${SUDO_USER:-}" ]; then
 fi
 [ -d "$HOME/.cargo/bin" ] && export PATH="$HOME/.cargo/bin:$PATH"
 
-if [ ! -f "$AGENT_BIN" ]; then
+if [ "${DEVBRIDGE_AGENT_BUILT:-0}" != 1 ]; then
     echo "Compilando r36s-agent para aarch64 musl (binário 100% estático)..."
     (cd "$PROJECT_ROOT/r36s-agent" && cargo build --release --target aarch64-unknown-linux-musl)
 fi
@@ -24,10 +24,16 @@ trap 'rm -rf "$TMP_DIR"' EXIT
 cp "$AGENT_BIN" "$TMP_DIR/r36s-agent"
 chmod 755 "$TMP_DIR/r36s-agent"
 cp "$SERVICE_FILE" "$TMP_DIR/r36s-agent.service"
+cp "$DIR/install_payload.py" "$TMP_DIR/install_payload.py"
+INSTALLER_SHA="$(sha256sum "$DIR/install_payload.py" | awk '{print $1}')"
+VERSION="$(sed -n 's/^version = "\([^"]*\)"/\1/p' "$PROJECT_ROOT/r36s-agent/Cargo.toml" | head -1)"
+SERVICE_SHA="$(sha256sum "$SERVICE_FILE" | awk '{print $1}')"
 AGENT_SHA="$(sha256sum "$AGENT_BIN" | awk '{print $1}')"
 cat << EOF_MANIFEST > "$TMP_DIR/manifest.json"
 {
-  "version": "0.2.0",
+  "version": "$VERSION",
+  "installer_sha256": "$INSTALLER_SHA",
+  "service_sha256": "$SERVICE_SHA",
   "protocol_version": "0.2.0",
   "architecture": "aarch64",
   "build_timestamp": "$(date -u +'%Y-%m-%dT%H:%M:%SZ')",
@@ -36,5 +42,5 @@ cat << EOF_MANIFEST > "$TMP_DIR/manifest.json"
 EOF_MANIFEST
 
 rm -f "$OUT_ZIP"
-(cd "$TMP_DIR" && zip -q -9 "$OUT_ZIP" r36s-agent r36s-agent.service manifest.json)
+(cd "$TMP_DIR" && zip -q -9 "$OUT_ZIP" r36s-agent r36s-agent.service manifest.json install_payload.py)
 echo "Payload gerado com sucesso em: $OUT_ZIP ($(ls -lh "$OUT_ZIP" | awk '{print $5}'))"

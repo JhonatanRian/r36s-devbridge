@@ -184,6 +184,10 @@ uninstall_and_restore() {
     print_header
     log "${C_YELLOW}[!] Iniciando desinstalação e restauração do sistema...${C_RESET}"
 
+    # Remove all DevBridge-owned resume integration, preserving shared USB MAC configuration.
+    if [ -f /usr/local/share/devbridge/install_payload.py ]; then
+        python3 /usr/local/share/devbridge/install_payload.py --uninstall || return 1
+    fi
     # 1. Parar e remover serviço e binário
     systemctl stop r36s-agent.service 2>/dev/null || true
     systemctl disable r36s-agent.service 2>/dev/null || true
@@ -191,12 +195,7 @@ uninstall_and_restore() {
     systemctl daemon-reload
     udevadm control --reload-rules 2>/dev/null || true
 
-    # 2. Limpar módulos persistentes de /etc/modules
-    if [ -f /etc/modules ]; then
-        sed -i '/^dwc2$/d' /etc/modules 2>/dev/null || true
-        sed -i '/^g_ether$/d' /etc/modules 2>/dev/null || true
-        log "${C_GREEN}[OK] Módulos dwc2 e g_ether removidos de /etc/modules.${C_RESET}"
-    fi
+    # Shared /etc/modules entries may belong to USB SSH; preserve them.
 
     # 3. Restaurar DTB original se existir backup verificado
     local dtb
@@ -297,23 +296,8 @@ install_or_update() {
     fi
 
     log "\n${C_BOLD}[3/5] Configurando módulos persistentes e rede USB Gadget...${C_RESET}"
-    if [ -f /etc/modules ]; then
-        grep -q '^dwc2' /etc/modules 2>/dev/null || echo 'dwc2' >> /etc/modules
-        grep -q '^g_ether' /etc/modules 2>/dev/null || echo 'g_ether' >> /etc/modules
-        log "${C_GREEN}[OK] Módulos dwc2 e g_ether registrados em /etc/modules.${C_RESET}"
-    fi
-    mkdir -p /etc/udev/rules.d
-    cat << 'EOF_UDEV' > /etc/udev/rules.d/99-r36s-devbridge-usb0.rules
-SUBSYSTEM=="net", ACTION=="add", KERNEL=="usb0", RUN+="/sbin/ip link set dev usb0 up", RUN+="/sbin/ip -4 address replace 192.168.7.2/24 dev usb0"
-EOF_UDEV
-    udevadm control --reload-rules 2>/dev/null || true
 
-    # NetworkManager não deve substituir o IP fixo da interface gadget.
-    mkdir -p /etc/NetworkManager/conf.d
-    cat << 'EOF_NM' > /etc/NetworkManager/conf.d/99-r36s-devbridge-usb0.conf
-[keyfile]
-unmanaged-devices=interface-name:usb0
-EOF_NM
+    # USB identity, udev, NetworkManager and resume recovery are installed transactionally.
 
     # ArkOS mantém journald mascarado nesta imagem; usa arquivo de log rotativo.
     mkdir -p /etc/logrotate.d
@@ -332,20 +316,10 @@ EOF_LOGROTATE
     if [ -f "$PAYLOAD_ZIP" ]; then
         TMP_EXTRACT="$(mktemp -d)"
         if unzip -q -o "$PAYLOAD_ZIP" -d "$TMP_EXTRACT" 2>/dev/null; then
-            if [ -f "$TMP_EXTRACT/r36s-agent" ]; then
-                cp -f "$TMP_EXTRACT/r36s-agent" /usr/local/bin/r36s-agent
-                chmod 755 /usr/local/bin/r36s-agent
-                log "${C_GREEN}[OK] Binário r36s-agent instalado em /usr/local/bin.${C_RESET}"
-            else
-                log "${C_RED}[ERRO] Binário r36s-agent ausente no payload.zip.${C_RESET}"
+            if ! python3 "$DEVBRIDGE_DIR/install_payload.py" "$TMP_EXTRACT" --activate; then
+                log "${C_RED}[ERRO] Payload rejeitado ou ativação falhou. Consulte o log.${C_RESET}"
                 rm -rf "$TMP_EXTRACT"
-                wait_and_finish 5 1
-            fi
-
-            if [ -f "$TMP_EXTRACT/r36s-agent.service" ]; then
-                cp -f "$TMP_EXTRACT/r36s-agent.service" /etc/systemd/system/r36s-agent.service
-                chmod 644 /etc/systemd/system/r36s-agent.service
-                log "${C_GREEN}[OK] Serviço r36s-agent.service instalado no systemd.${C_RESET}"
+                wait_and_finish 8 1
             fi
             rm -rf "$TMP_EXTRACT"
         else
@@ -353,26 +327,17 @@ EOF_LOGROTATE
             log "${C_RED}[ERRO] Falha ao extrair payload.zip.${C_RESET}"
             wait_and_finish 5 1
         fi
-    elif [ -f "$DEVBRIDGE_DIR/r36s-agent" ]; then
-        cp -f "$DEVBRIDGE_DIR/r36s-agent" /usr/local/bin/r36s-agent
-        chmod 755 /usr/local/bin/r36s-agent
-        log "${C_GREEN}[OK] Binário r36s-agent instalado a partir da pasta.${C_RESET}"
     else
         log "${C_RED}[ERRO] payload.zip ou r36s-agent não encontrado em $DEVBRIDGE_DIR.${C_RESET}"
         wait_and_finish 5 1
     fi
 
-    log "\n${C_BOLD}[5/5] Ativando serviço r36s-agent...${C_RESET}"
-    systemctl daemon-reload
+    log "\n${C_BOLD}[5/5] Habilitando serviço r36s-agent no boot...${C_RESET}"
     if ! systemctl enable r36s-agent.service 2>/dev/null; then
         log "${C_RED}[ERRO] Não foi possível habilitar o serviço no boot.${C_RESET}"
         wait_and_finish 8 1
     fi
-    if ! systemctl --no-block restart r36s-agent.service 2>/dev/null; then
-        log "${C_RED}[ERRO] Não foi possível solicitar o início do serviço.${C_RESET}"
-        wait_and_finish 8 1
-    fi
-    # O restart com --no-block apenas enfileira o trabalho; confirme o listener.
+    # install_payload.py --activate já recarregou o systemd, reiniciou o serviço e validou hash + Ping/Pong.
     local attempt service_ready=0
     for attempt in {1..15}; do
         if systemctl is-active --quiet r36s-agent.service &&
@@ -519,22 +484,17 @@ elif systemctl is-active --quiet r36s-agent.service 2>/dev/null || [ -f /usr/loc
         1)
             show_infobox "Rede USB" "Reaplicando configuracao de rede USB e reiniciando servico...\nAguarde..." 6 54
             log "Verificando componentes e atualizações no payload..."
+            payload_activated=0
             if [ -f "$PAYLOAD_ZIP" ]; then
                 TMP_CHK="$(mktemp -d)"
                 if unzip -q -o "$PAYLOAD_ZIP" -d "$TMP_CHK" 2>/dev/null; then
-                    if [ -f "$TMP_CHK/r36s-agent" ]; then
-                        if ! cmp -s "$TMP_CHK/r36s-agent" /usr/local/bin/r36s-agent 2>/dev/null; then
-                            log "${C_GREEN}[ATUALIZAÇÃO] Instalando nova versão do r36s-agent a partir do payload...${C_RESET}"
-                            cp -f "$TMP_CHK/r36s-agent" /usr/local/bin/r36s-agent
-                            chmod 755 /usr/local/bin/r36s-agent
-                        fi
-                    fi
-                    if [ -f "$TMP_CHK/r36s-agent.service" ]; then
-                        cp -f "$TMP_CHK/r36s-agent.service" /etc/systemd/system/r36s-agent.service
-                        chmod 644 /etc/systemd/system/r36s-agent.service
+                    if ! python3 "$DEVBRIDGE_DIR/install_payload.py" "$TMP_CHK" --activate; then
+                        rm -rf "$TMP_CHK"
+                        log "Falha na atualização verificada; versão anterior preservada quando disponível."
+                        wait_and_finish 8 1
                     fi
                     rm -rf "$TMP_CHK"
-                    systemctl daemon-reload
+                    payload_activated=1
                 fi
             fi
             log "Reaplicando configuração de rede USB..."
@@ -543,9 +503,11 @@ elif systemctl is-active --quiet r36s-agent.service 2>/dev/null || [ -f /usr/loc
                 ip -4 address replace 192.168.7.2/24 dev usb0 2>/dev/null || true
                 log "${C_GREEN}[OK] Interface usb0 reconfigurada em 192.168.7.2/24.${C_RESET}"
             fi
-            systemctl --no-block restart r36s-agent.service 2>/dev/null || true
+            if [ "$payload_activated" -eq 0 ]; then
+                systemctl restart r36s-agent.service 2>/dev/null || true
+            fi
             show_msgbox "Rede USB Concluída" "\
-Rede USB configurada com sucesso!\n\
+Configuração de rede reaplicada.\nVerifique a conexão USB no PC.\n\
 IP do console: 192.168.7.2\n\
 Porta Controle: 7365 | Porta Video: 7366\n\
 \n\
