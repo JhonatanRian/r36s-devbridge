@@ -12,7 +12,9 @@ use app::DevBridgeApp;
 use eframe::NativeOptions;
 
 fn main() -> eframe::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("warn,r36s_studio=info"));
+    env_logger::init_from_env(
+        env_logger::Env::default().default_filter_or("warn,r36s_studio=info"),
+    );
 
     let native_options = NativeOptions {
         viewport: egui::ViewportBuilder::default()

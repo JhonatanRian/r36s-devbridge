@@ -163,7 +163,8 @@ impl DeployTab {
                 Ok(0) => break,
                 Ok(n) => hasher.update(&buf[..n]),
                 Err(e) => {
-                    *status.lock().unwrap() = Some(format!("ERRO: Falha ao ler arquivo local: {}", e));
+                    *status.lock().unwrap() =
+                        Some(format!("ERRO: Falha ao ler arquivo local: {}", e));
                     is_uploading.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -171,14 +172,18 @@ impl DeployTab {
         }
 
         let sha256 = format!("{:x}", hasher.finalize());
-        *status.lock().unwrap() = Some("Conectando ao R36S para transferência direta...".to_string());
+        *status.lock().unwrap() =
+            Some("Conectando ao R36S para transferência direta...".to_string());
 
         let target_addr: std::net::SocketAddr = "192.168.7.2:7365".parse().unwrap();
         let stream_res = TcpStream::connect_timeout(&target_addr, Duration::from_secs(4));
         let mut stream = match stream_res {
             Ok(s) => s,
             Err(e) => {
-                *status.lock().unwrap() = Some(format!("ERRO: Não foi possível conectar ao R36S (timeout): {}", e));
+                *status.lock().unwrap() = Some(format!(
+                    "ERRO: Não foi possível conectar ao R36S (timeout): {}",
+                    e
+                ));
                 is_uploading.store(false, Ordering::Relaxed);
                 return;
             }
@@ -208,7 +213,8 @@ impl DeployTab {
 
         let mut resp_str = String::new();
         if reader.read_line(&mut resp_str).is_err() || resp_str.is_empty() {
-            *status.lock().unwrap() = Some("ERRO: R36S não respondeu ao comando de início de deploy".to_string());
+            *status.lock().unwrap() =
+                Some("ERRO: R36S não respondeu ao comando de início de deploy".to_string());
             is_uploading.store(false, Ordering::Relaxed);
             return;
         }
@@ -221,7 +227,8 @@ impl DeployTab {
                 return;
             }
             _ => {
-                *status.lock().unwrap() = Some("ERRO: Resposta inesperada do R36S ao iniciar deploy".to_string());
+                *status.lock().unwrap() =
+                    Some("ERRO: Resposta inesperada do R36S ao iniciar deploy".to_string());
                 is_uploading.store(false, Ordering::Relaxed);
                 return;
             }
@@ -245,7 +252,8 @@ impl DeployTab {
                 Ok(0) => break, // Fim do arquivo
                 Ok(bytes) => bytes,
                 Err(e) => {
-                    *status.lock().unwrap() = Some(format!("ERRO de leitura local durante upload: {}", e));
+                    *status.lock().unwrap() =
+                        Some(format!("ERRO de leitura local durante upload: {}", e));
                     is_uploading.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -260,14 +268,16 @@ impl DeployTab {
             let mut chunk_json = serde_json::to_string(&chunk_cmd).unwrap();
             chunk_json.push('\n');
             if let Err(e) = stream.write_all(chunk_json.as_bytes()) {
-                *status.lock().unwrap() = Some(format!("ERRO ao transmitir chunk {}: {}", chunk_idx, e));
+                *status.lock().unwrap() =
+                    Some(format!("ERRO ao transmitir chunk {}: {}", chunk_idx, e));
                 is_uploading.store(false, Ordering::Relaxed);
                 return;
             }
 
             resp_str.clear();
             if reader.read_line(&mut resp_str).is_err() || resp_str.is_empty() {
-                *status.lock().unwrap() = Some(format!("ERRO: Conexão interrompida no chunk {}", chunk_idx));
+                *status.lock().unwrap() =
+                    Some(format!("ERRO: Conexão interrompida no chunk {}", chunk_idx));
                 is_uploading.store(false, Ordering::Relaxed);
                 return;
             }
@@ -275,12 +285,16 @@ impl DeployTab {
             match serde_json::from_str::<ServerResponse>(&resp_str) {
                 Ok(ServerResponse::DeployProgress { .. }) => {}
                 Ok(ServerResponse::DeployError { error }) => {
-                    *status.lock().unwrap() = Some(format!("ERRO no chunk {}: {}", chunk_idx, error));
+                    *status.lock().unwrap() =
+                        Some(format!("ERRO no chunk {}: {}", chunk_idx, error));
                     is_uploading.store(false, Ordering::Relaxed);
                     return;
                 }
                 _ => {
-                    *status.lock().unwrap() = Some(format!("ERRO: Resposta inválida para o chunk {}", chunk_idx));
+                    *status.lock().unwrap() = Some(format!(
+                        "ERRO: Resposta inválida para o chunk {}",
+                        chunk_idx
+                    ));
                     is_uploading.store(false, Ordering::Relaxed);
                     return;
                 }
@@ -322,7 +336,11 @@ impl DeployTab {
 
         match serde_json::from_str::<ServerResponse>(&resp_str) {
             Ok(ServerResponse::DeploySuccess { path, sha256 }) => {
-                let short_hash = if sha256.len() >= 8 { &sha256[0..8] } else { &sha256 };
+                let short_hash = if sha256.len() >= 8 {
+                    &sha256[0..8]
+                } else {
+                    &sha256
+                };
                 *status.lock().unwrap() = Some(format!(
                     "Sucesso! Arquivo {} gravado em {} (SHA-256: {})",
                     filename, path, short_hash
@@ -333,7 +351,8 @@ impl DeployTab {
                 *status.lock().unwrap() = Some(format!("ERRO na validação final: {}", error));
             }
             _ => {
-                *status.lock().unwrap() = Some("ERRO: Resposta inesperada na finalização do deploy".to_string());
+                *status.lock().unwrap() =
+                    Some("ERRO: Resposta inesperada na finalização do deploy".to_string());
             }
         }
 
@@ -347,8 +366,16 @@ fn base64_encode(data: &[u8]) -> String {
     let mut i = 0;
     while i < data.len() {
         let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() { data[i + 1] as u32 } else { 0 };
-        let b2 = if i + 2 < data.len() { data[i + 2] as u32 } else { 0 };
+        let b1 = if i + 1 < data.len() {
+            data[i + 1] as u32
+        } else {
+            0
+        };
+        let b2 = if i + 2 < data.len() {
+            data[i + 2] as u32
+        } else {
+            0
+        };
 
         let triple = (b0 << 16) | (b1 << 8) | b2;
 

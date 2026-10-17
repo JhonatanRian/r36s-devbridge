@@ -5,17 +5,18 @@ use std::path::PathBuf;
 use std::time::Instant;
 
 #[derive(PartialEq, Clone, Copy, Debug)]
-pub enum ViewportScale {
-    Fit,       // Ajusta dinamicamente preservando 4:3
-    Scale1x,   // 640x480
-    Scale1_5x, // 960x720
-    Scale2x,   // 1280x960
+pub enum ViewportMode {
+    Handheld,   // Modo Portátil: Console R36S virtual com controles
+    Display4x3, // Modo 4:3: Display clássico adaptável ocupando toda a janela
 }
 
 pub struct ViewportRenderer {
     texture: Option<TextureHandle>,
     last_frame_index: u32,
-    scale_mode: ViewportScale,
+    last_frame_time: Option<Instant>,
+    received: Option<Instant>,
+    screenshot_result: Option<std::sync::mpsc::Receiver<String>>,
+    pub mode: ViewportMode,
     nearest_filter: bool,
     screenshot_notice: Option<(String, Instant)>,
 }
@@ -25,7 +26,10 @@ impl ViewportRenderer {
         Self {
             texture: None,
             last_frame_index: 0,
-            scale_mode: ViewportScale::Fit,
+            last_frame_time: None,
+            received: None,
+            screenshot_result: None,
+            mode: ViewportMode::Handheld,
             nearest_filter: true,
             screenshot_notice: None,
         }
@@ -38,7 +42,8 @@ impl ViewportRenderer {
                 return;
             }
 
-            if frame.frame_index != self.last_frame_index {
+            if self.texture.is_none() || Some(frame.timestamp) != self.last_frame_time {
+                self.last_frame_time = Some(frame.timestamp);
                 self.last_frame_index = frame.frame_index;
 
                 let color_image = ColorImage::from_rgba_unmultiplied(
@@ -62,161 +67,171 @@ impl ViewportRenderer {
         }
     }
 
-    pub fn render(
-        &mut self,
-        ui: &mut Ui,
-        is_streaming: bool,
-        video_connected: bool,
-        frame_opt: Option<&DecodedFrame>,
-    ) {
-        ui.vertical(|ui| {
-            // Barra de controles do Viewport responsiva
-            ui.horizontal_wrapped(|ui| {
-                ui.label(egui::RichText::new("🖥 Viewport 4:3").strong());
+    pub fn set_received(&mut self, received: Option<Instant>) {
+        self.received = received;
+    }
 
-                ui.separator();
-
-                ui.radio_value(&mut self.scale_mode, ViewportScale::Fit, "Ajustar (4:3)");
-                ui.radio_value(&mut self.scale_mode, ViewportScale::Scale1x, "1x (640x480)");
-                ui.radio_value(&mut self.scale_mode, ViewportScale::Scale1_5x, "1.5x (960x720)");
-                ui.radio_value(&mut self.scale_mode, ViewportScale::Scale2x, "2x (1280x960)");
-
-                ui.separator();
-
-                ui.checkbox(&mut self.nearest_filter, "Nearest (Pixel-Art)");
-
-                ui.separator();
-
-                if is_streaming {
-                    ui.colored_label(Color32::from_rgb(0, 220, 100), "● Transmitindo");
-                } else {
-                    ui.colored_label(Color32::GRAY, "○ Pausado");
-                }
-
-                if let Some(frame) = frame_opt {
-                    if ui.button("📷 Screenshot").clicked() {
-                        self.save_screenshot(frame);
-                    }
-                }
-            });
-
-            if let Some((msg, time)) = &self.screenshot_notice {
-                if time.elapsed().as_secs() < 4 {
-                    ui.colored_label(Color32::from_rgb(100, 255, 100), msg);
-                }
-            }
-
+    pub fn controls(&mut self, ui: &mut Ui, frame_available: bool, take_screenshot: &mut bool) {
+        if let Some(result) = self
+            .screenshot_result
+            .as_ref()
+            .and_then(|rx| rx.try_recv().ok())
+        {
+            self.screenshot_notice = Some((result, Instant::now()));
+            self.screenshot_result = None;
+        }
+        ui.horizontal_wrapped(|ui| {
+            ui.selectable_value(&mut self.mode, ViewportMode::Handheld, "🎮 Modo Portátil");
+            ui.selectable_value(
+                &mut self.mode,
+                ViewportMode::Display4x3,
+                "📺 Modo 4:3 (Tela Cheia)",
+            );
             ui.separator();
-
-            // Área de exibição do Framebuffer com ajuste dinâmico ou scroll em escalas fixas
-            let available = ui.available_size();
-            let frame_w = frame_opt.map(|f| f.width as f32).unwrap_or(640.0);
-            let frame_h = frame_opt.map(|f| f.height as f32).unwrap_or(480.0);
-            let aspect = frame_w / frame_h;
-
-            let (target_w, target_h) = match self.scale_mode {
-                ViewportScale::Scale1x => (frame_w, frame_h),
-                ViewportScale::Scale1_5x => (frame_w * 1.5, frame_h * 1.5),
-                ViewportScale::Scale2x => (frame_w * 2.0, frame_h * 2.0),
-                ViewportScale::Fit => {
-                    let avail_w = available.x.max(160.0);
-                    let avail_h = available.y.max(120.0);
-                    let mut w = avail_w;
-                    let mut h = w / aspect;
-                    if h > avail_h {
-                        h = avail_h;
-                        w = h * aspect;
-                    }
-                    (w, h)
-                }
-            };
-
-            let draw_viewport = |ui: &mut Ui| {
-                let (rect, _response) = ui.allocate_exact_size(Vec2::new(target_w, target_h), egui::Sense::hover());
-
-                if let Some(tex) = &self.texture {
-                    let mut mesh = egui::Mesh::with_texture(tex.id());
-                    mesh.add_rect_with_uv(
-                        rect,
-                        egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                        Color32::WHITE,
-                    );
-                    ui.painter().add(mesh);
-                } else {
-                    ui.painter().rect_filled(rect, 4.0, Color32::from_rgb(18, 20, 24));
-                    ui.painter().text(
-                        rect.center(),
-                        egui::Align2::CENTER_CENTER,
-                        if is_streaming {
-                            if video_connected {
-                                "Canal de vídeo conectado. Aguardando primeiro quadro do console..."
-                            } else {
-                                "Conectando ao canal de vídeo do R36S (porta 7366)..."
-                            }
-                        } else {
-                            "Streaming pausado. Clique em 'Iniciar Stream' para exibir a tela."
-                        },
-                        egui::FontId::proportional(15.0),
-                        Color32::GRAY,
-                    );
-                }
-            };
-
-            if self.scale_mode == ViewportScale::Fit {
-                ui.centered_and_justified(|ui| {
-                    draw_viewport(ui);
-                });
-            } else {
-                egui::ScrollArea::both()
-                    .auto_shrink([false; 2])
-                    .show(ui, |ui| {
-                        ui.centered_and_justified(|ui| {
-                            draw_viewport(ui);
-                        });
-                    });
+            ui.weak("Shaders podem reduzir a fluidez do stream.");
+            if ui
+                .checkbox(&mut self.nearest_filter, "Nearest (Pixel-Art)")
+                .changed()
+            {
+                self.texture = None; // Re-upload once with the selected sampler.
             }
+            if frame_available && self.screenshot_result.is_none() {
+                if ui.button("📸 Screenshot").clicked() {
+                    *take_screenshot = true;
+                }
+            }
+        });
+        if let Some((msg, t)) = &self.screenshot_notice {
+            if t.elapsed().as_secs() < 4 {
+                ui.label(msg);
+            }
+        }
+    }
+
+    pub fn console_width(&self, available: Vec2) -> f32 {
+        available.x.min(available.y / 1.58).max(280.0)
+    }
+
+    pub fn paint_display_4x3(&self, ui: &mut Ui, connected: bool, streaming: bool, video: bool) {
+        let available = ui.available_size();
+        let target_ratio = 4.0 / 3.0;
+        let (w, h) = if available.x / available.y > target_ratio {
+            (available.y * target_ratio, available.y)
+        } else {
+            (available.x, available.x / target_ratio)
+        };
+        ui.centered_and_justified(|ui| {
+            let (rect, _resp) = ui.allocate_exact_size(egui::vec2(w, h), egui::Sense::hover());
+            let painter = ui.painter_at(rect);
+            self.paint_screen(&painter, rect, connected, streaming, video);
         });
     }
 
-    fn save_screenshot(&mut self, frame: &DecodedFrame) {
-        let timestamp = chrono_or_fallback_timestamp();
-        let shots_dir = PathBuf::from("screenshots");
-        if let Err(e) = std::fs::create_dir_all(&shots_dir) {
-            self.screenshot_notice = Some((format!("Erro ao criar pasta screenshots: {}", e), Instant::now()));
+    pub fn paint_screen(
+        &self,
+        painter: &egui::Painter,
+        rect: egui::Rect,
+        connected: bool,
+        streaming: bool,
+        video: bool,
+    ) {
+        painter.rect_filled(rect, 0.0, Color32::from_rgb(12, 15, 19));
+        // Se já tivermos uma textura válida decodificada, mantemos ela visível para evitar piscadas
+        if connected
+            && streaming
+            && self
+                .received
+                .map_or(false, |t| t.elapsed().as_secs_f32() < 1.0)
+        {
+            if let Some(tex) = &self.texture {
+                let ratio = tex.size()[0] as f32 / tex.size()[1] as f32;
+                let w = rect.width().min(rect.height() * ratio);
+                let target = egui::Rect::from_center_size(rect.center(), egui::vec2(w, w / ratio));
+                painter.image(
+                    tex.id(),
+                    target,
+                    egui::Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
+                    Color32::WHITE,
+                );
+                if !video {
+                    painter.text(
+                        rect.left_top() + egui::vec2(8.0, 8.0),
+                        egui::Align2::LEFT_TOP,
+                        "Reconectando — última imagem",
+                        egui::FontId::proportional(12.0),
+                        Color32::YELLOW,
+                    );
+                }
+                return;
+            }
+        }
+        let message = if !connected {
+            "Conecte o R36S pela porta OTG"
+        } else if !streaming {
+            "Stream pausado\nClique em Iniciar Stream"
+        } else if !video {
+            "Conectando vídeo…"
+        } else if self.texture.is_some() {
+            "Vídeo temporariamente indisponível\nAguardando novo quadro…"
+        } else {
+            "Aguardando primeiro quadro…"
+        };
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            message,
+            egui::FontId::proportional((rect.width() / 25.0).clamp(10.0, 18.0)),
+            Color32::GRAY,
+        );
+    }
+
+    pub fn clear(&mut self) {
+        self.texture = None;
+        self.last_frame_index = 0;
+        self.last_frame_time = None;
+    }
+
+    pub fn save_screenshot(&mut self, frame: std::sync::Arc<DecodedFrame>) {
+        if self.screenshot_result.is_some() {
             return;
         }
-        let final_path = shots_dir.join(format!("r36s_screenshot_{}.ppm", timestamp));
-        let tmp_path = shots_dir.join(format!(".r36s_screenshot_{}.tmp", timestamp));
-
-        let write_res = (|| -> Result<(), std::io::Error> {
-            use std::io::Write;
-            let mut file = File::create(&tmp_path)?;
-            writeln!(file, "P6\n{} {}\n255", frame.width, frame.height)?;
-            for chunk in frame.rgba_data.chunks_exact(4) {
-                file.write_all(&[chunk[0], chunk[1], chunk[2]])?;
-            }
-            file.flush()?;
-            file.sync_all()?;
-            drop(file);
-            std::fs::rename(&tmp_path, &final_path)?;
-            Ok(())
-        })();
-
-        match write_res {
-            Ok(()) => {
-                self.screenshot_notice = Some((format!("Screenshot salva em: {}", final_path.display()), Instant::now()));
-            }
-            Err(e) => {
-                let _ = std::fs::remove_file(&tmp_path);
-                self.screenshot_notice = Some((format!("Erro ao salvar screenshot: {}", e), Instant::now()));
-            }
-        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.screenshot_result = Some(rx);
+        std::thread::spawn(move || {
+            let result = write_screenshot(&frame);
+            let message = match result {
+                Ok(path) => format!("Screenshot salva em: {}", path.display()),
+                Err(error) => format!("Erro ao salvar screenshot: {}", error),
+            };
+            let _ = tx.send(message);
+        });
     }
 }
 
-fn chrono_or_fallback_timestamp() -> u64 {
-    std::time::SystemTime::now()
+fn write_screenshot(frame: &DecodedFrame) -> std::io::Result<PathBuf> {
+    use std::io::Write;
+    let dir = PathBuf::from("screenshots");
+    std::fs::create_dir_all(&dir)?;
+    let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
-        .as_secs()
+        .as_nanos();
+    let path = dir.join(format!("r36s_screenshot_{}.ppm", stamp));
+    let temp = dir.join(format!(".r36s_screenshot_{}.tmp", stamp));
+    let result = (|| {
+        let mut file = File::create(&temp)?;
+        let mut buffer = Vec::with_capacity(32 + frame.rgba_data.len() / 4 * 3);
+        write!(&mut buffer, "P6\n{} {}\n255\n", frame.width, frame.height)?;
+        for pixel in frame.rgba_data.chunks_exact(4) {
+            buffer.extend_from_slice(&pixel[..3]);
+        }
+        file.write_all(&buffer)?;
+        file.sync_all()?;
+        std::fs::rename(&temp, &path)?;
+        Ok(path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(temp);
+    }
+    result
 }

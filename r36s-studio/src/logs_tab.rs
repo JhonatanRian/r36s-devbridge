@@ -18,7 +18,8 @@ impl LogsTab {
             filter_query: String::new(),
             auto_refresh: true,
             last_refresh: Instant::now(),
-            cached_content: "Clique em 'Atualizar Logs' ou aguarde a primeira sincronização...".to_string(),
+            cached_content: "Clique em 'Atualizar Logs' ou aguarde a primeira sincronização..."
+                .to_string(),
         }
     }
 
@@ -31,22 +32,71 @@ impl LogsTab {
                 egui::ComboBox::from_label("")
                     .selected_text(&self.selected_log_type)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.selected_log_type, "active_game".to_string(), "🎮 Jogo / Port Ativo (dinâmico)");
-                        ui.selectable_value(&mut self.selected_log_type, "run".to_string(), "🚀 Execução / Runcommand (run.log)");
-                        ui.selectable_value(&mut self.selected_log_type, "emulationstation".to_string(), "🕹 EmulationStation (es_log.txt)");
-                        ui.selectable_value(&mut self.selected_log_type, "retroarch".to_string(), "👾 RetroArch (retroarch.log)");
-                        ui.selectable_value(&mut self.selected_log_type, "agent".to_string(), "📡 DevBridge Daemon (r36s-agent.log)");
-                        ui.selectable_value(&mut self.selected_log_type, "dmesg".to_string(), "🐧 Kernel (dmesg)");
-                        ui.selectable_value(&mut self.selected_log_type, "syslog".to_string(), "📋 Sistema (syslog / messages)");
-                        ui.selectable_value(&mut self.selected_log_type, "ppsspp".to_string(), "PPSSPP (PSP)");
-                        ui.selectable_value(&mut self.selected_log_type, "drastic".to_string(), "DraStic (NDS)");
-                        ui.selectable_value(&mut self.selected_log_type, "mupen64plus".to_string(), "Mupen64Plus (N64)");
-                        ui.selectable_value(&mut self.selected_log_type, "port".to_string(), "Port / Instalador (install.log)");
-                        ui.selectable_value(&mut self.selected_log_type, "java".to_string(), "Java / FreeJ2ME (java.log)");
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "active_game".to_string(),
+                            "🎮 Jogo / Port Ativo (dinâmico)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "run".to_string(),
+                            "🚀 Execução / Runcommand (run.log)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "emulationstation".to_string(),
+                            "🕹 EmulationStation (es_log.txt)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "retroarch".to_string(),
+                            "👾 RetroArch (retroarch.log)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "agent".to_string(),
+                            "📡 DevBridge Daemon (r36s-agent.log)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "dmesg".to_string(),
+                            "🐧 Kernel (dmesg)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "syslog".to_string(),
+                            "📋 Sistema (syslog / messages)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "ppsspp".to_string(),
+                            "PPSSPP (PSP)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "drastic".to_string(),
+                            "DraStic (NDS)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "mupen64plus".to_string(),
+                            "Mupen64Plus (N64)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "port".to_string(),
+                            "Port / Instalador (install.log)",
+                        );
+                        ui.selectable_value(
+                            &mut self.selected_log_type,
+                            "java".to_string(),
+                            "Java / FreeJ2ME (java.log)",
+                        );
                     });
 
                 if self.selected_log_type != prev_source {
-                    self.cached_content = format!("Carregando logs de {}...", self.selected_log_type);
+                    self.cached_content =
+                        format!("Carregando logs de {}...", self.selected_log_type);
                     *conn.last_logs.lock().unwrap() = None;
                     self.request_logs(conn);
                 }

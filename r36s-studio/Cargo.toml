@@ -1,6 +1,6 @@
 [package]
 name = "r36s-studio"
-version = "0.2.6"
+version = "0.2.9"
 edition = "2021"
 authors = ["DevBridge Team"]
 description = "Desktop Developer Studio for R36S ArkOS (Telemetry, 640x480 Viewport, Deploy and Logs)"

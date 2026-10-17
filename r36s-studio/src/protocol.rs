@@ -92,6 +92,9 @@ pub enum ClientCommand {
         enabled: bool,
     },
     GetGamepadState,
+    SetGamepadInput {
+        enabled: bool,
+    },
     InjectGamepadInput {
         action: GamepadInputAction,
     },
@@ -104,6 +107,8 @@ pub enum ServerResponse {
         agent_version: String,
         protocol_version: String,
         compatible: bool,
+        #[serde(default)]
+        capabilities: Vec<String>,
         fb_width: u16,
         fb_height: u16,
         fb_bpp: u8,
@@ -151,29 +156,41 @@ pub enum ServerResponse {
 }
 
 // Constantes de bitmask dos botões do Gamepad do R36S
-pub const BTN_MASK_DPAD_UP: u32    = 1 << 0;
-pub const BTN_MASK_DPAD_DOWN: u32  = 1 << 1;
-pub const BTN_MASK_DPAD_LEFT: u32  = 1 << 2;
+pub const BTN_MASK_DPAD_UP: u32 = 1 << 0;
+pub const BTN_MASK_DPAD_DOWN: u32 = 1 << 1;
+pub const BTN_MASK_DPAD_LEFT: u32 = 1 << 2;
 pub const BTN_MASK_DPAD_RIGHT: u32 = 1 << 3;
-pub const BTN_MASK_A: u32          = 1 << 4;
-pub const BTN_MASK_B: u32          = 1 << 5;
-pub const BTN_MASK_X: u32          = 1 << 6;
-pub const BTN_MASK_Y: u32          = 1 << 7;
-pub const BTN_MASK_L1: u32         = 1 << 8;
-pub const BTN_MASK_R1: u32         = 1 << 9;
-pub const BTN_MASK_L2: u32         = 1 << 10;
-pub const BTN_MASK_R2: u32         = 1 << 11;
-pub const BTN_MASK_SELECT: u32     = 1 << 12;
-pub const BTN_MASK_START: u32      = 1 << 13;
-pub const BTN_MASK_FN: u32         = 1 << 14;
-pub const BTN_MASK_L3: u32         = 1 << 15;
-pub const BTN_MASK_R3: u32         = 1 << 16;
-pub const BTN_MASK_VOL_UP: u32     = 1 << 17;
-pub const BTN_MASK_VOL_DOWN: u32   = 1 << 18;
-pub const BTN_MASK_POWER: u32      = 1 << 19;
+pub const BTN_MASK_A: u32 = 1 << 4;
+pub const BTN_MASK_B: u32 = 1 << 5;
+pub const BTN_MASK_X: u32 = 1 << 6;
+pub const BTN_MASK_Y: u32 = 1 << 7;
+pub const BTN_MASK_L1: u32 = 1 << 8;
+pub const BTN_MASK_R1: u32 = 1 << 9;
+pub const BTN_MASK_L2: u32 = 1 << 10;
+pub const BTN_MASK_R2: u32 = 1 << 11;
+pub const BTN_MASK_SELECT: u32 = 1 << 12;
+pub const BTN_MASK_START: u32 = 1 << 13;
+pub const BTN_MASK_FN: u32 = 1 << 14;
+pub const BTN_MASK_L3: u32 = 1 << 15;
+pub const BTN_MASK_R3: u32 = 1 << 16;
+pub const BTN_MASK_VOL_UP: u32 = 1 << 17;
+pub const BTN_MASK_VOL_DOWN: u32 = 1 << 18;
+pub const BTN_MASK_POWER: u32 = 1 << 19;
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct GamepadState {
+    #[serde(default)]
+    pub available: bool,
+    #[serde(default)]
+    pub input_enabled: bool,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub sequence: u64,
+    #[serde(default)]
+    pub transitions: Vec<ButtonTransition>,
+    #[serde(default)]
+    pub overflow: bool,
     pub listening: bool,
     pub device_name: String,
     pub buttons: u32,
@@ -184,10 +201,24 @@ pub struct GamepadState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct ButtonTransition {
+    pub sequence: u64,
+    pub buttons: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum GamepadInputAction {
-    Button { mask: u32, pressed: bool },
-    Axis { left_x: i16, left_y: i16, right_x: i16, right_y: i16 },
+    Button {
+        mask: u32,
+        pressed: bool,
+    },
+    Axis {
+        left_x: i16,
+        left_y: i16,
+        right_x: i16,
+        right_y: i16,
+    },
 }
 
 #[repr(C, packed)]
@@ -204,7 +235,14 @@ pub struct VideoFrameHeader {
 }
 
 impl VideoFrameHeader {
-    pub fn new(frame_index: u32, width: u16, height: u16, format: u8, flags: u8, size: u32) -> Self {
+    pub fn new(
+        frame_index: u32,
+        width: u16,
+        height: u16,
+        format: u8,
+        flags: u8,
+        size: u32,
+    ) -> Self {
         Self {
             magic: VIDEO_MAGIC,
             frame_index: frame_index.to_le(),

@@ -50,7 +50,13 @@ impl eframe::App for DevBridgeApp {
         // Taxa de repintura controlada para fluidez e baixo consumo de CPU
         let is_streaming = self.connection.is_streaming.load(Ordering::Relaxed);
         let is_gamepad_listening = self.connection.gamepad_listening.load(Ordering::Relaxed);
-        if is_streaming || is_gamepad_listening {
+        if is_streaming
+            || is_gamepad_listening
+            || self
+                .connection
+                .gamepad_input_enabled
+                .load(Ordering::Relaxed)
+        {
             ctx.request_repaint_after(Duration::from_millis(30)); // ~33 FPS
         } else {
             ctx.request_repaint_after(Duration::from_millis(150));
@@ -68,11 +74,19 @@ impl eframe::App for DevBridgeApp {
         // Instantâneos rápidos dos Mutexes para liberar threads de rede imediatamente
         let status_snapshot = self.connection.status.lock().unwrap().clone();
         let metrics_snapshot = self.connection.metrics.lock().unwrap().clone();
-        let frame_snapshot = self.connection.current_frame.lock().unwrap().clone();
         let throughput = *self.connection.throughput_kbps.lock().unwrap();
 
-        // Atualiza textura do viewport e histórico da telemetria
-        self.viewport.update_frame(ctx, frame_snapshot.as_ref());
+        // Clone only the immutable frame reference; GPU upload never holds the network lock.
+        let frame_snapshot = self.connection.current_frame.lock().unwrap().clone();
+        let received = *self.connection.last_video_frame.lock().unwrap();
+        self.viewport.set_received(received);
+        let frame_available =
+            frame_snapshot.is_some() && received.map_or(false, |t| t.elapsed().as_secs_f32() < 1.0);
+        if matches!(status_snapshot, ConnectionStatus::Connected { .. }) && is_streaming {
+            self.viewport.update_frame(ctx, frame_snapshot.as_deref());
+        } else {
+            self.viewport.clear();
+        }
         self.telemetry.update_metrics(metrics_snapshot.as_ref());
 
         // Barra Superior (Header & Navegação Responsiva)
@@ -86,21 +100,41 @@ impl eframe::App for DevBridgeApp {
                 // Status Badge
                 match &status_snapshot {
                     ConnectionStatus::Searching { usb_detected, .. } => {
-                        let color = if *usb_detected { Color32::from_rgb(255, 200, 0) } else { Color32::from_rgb(255, 80, 80) };
-                        let label = if *usb_detected { "🟡 USB Detectado" } else { "🔴 Buscando R36S..." };
+                        let color = if *usb_detected {
+                            Color32::from_rgb(255, 200, 0)
+                        } else {
+                            Color32::from_rgb(255, 80, 80)
+                        };
+                        let label = if *usb_detected {
+                            "🟡 USB Detectado"
+                        } else {
+                            "🔴 Buscando R36S..."
+                        };
                         ui.colored_label(color, RichText::new(label).strong());
                     }
                     ConnectionStatus::Connecting { stage, .. } => {
-                        ui.colored_label(Color32::from_rgb(255, 200, 0), RichText::new(format!("🟡 {}", stage)).strong());
+                        ui.colored_label(
+                            Color32::from_rgb(255, 200, 0),
+                            RichText::new(format!("🟡 {}", stage)).strong(),
+                        );
                     }
-                    ConnectionStatus::Connected { target, latency_ms, .. } => {
+                    ConnectionStatus::Connected {
+                        target, latency_ms, ..
+                    } => {
                         ui.colored_label(
                             Color32::from_rgb(0, 220, 100),
-                            RichText::new(format!("🟢 Conectado em {} ({:.1}ms)", target, latency_ms)).strong(),
+                            RichText::new(format!(
+                                "🟢 Conectado em {} ({:.1}ms)",
+                                target, latency_ms
+                            ))
+                            .strong(),
                         );
                     }
                     ConnectionStatus::Error { message } => {
-                        ui.colored_label(Color32::from_rgb(255, 80, 80), RichText::new(format!("Erro: {}", message)).strong());
+                        ui.colored_label(
+                            Color32::from_rgb(255, 80, 80),
+                            RichText::new(format!("Erro: {}", message)).strong(),
+                        );
                     }
                 }
 
@@ -130,7 +164,11 @@ impl eframe::App for DevBridgeApp {
                 ui.separator();
 
                 // Botões de Abas limpos e diretos (sem right_to_left overlap)
-                ui.selectable_value(&mut self.current_tab, ActiveTab::ViewportAndTelemetry, "🖥 Monitor & Tela");
+                ui.selectable_value(
+                    &mut self.current_tab,
+                    ActiveTab::ViewportAndTelemetry,
+                    "🖥 Monitor & Tela",
+                );
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Deploy, "📦 Deploy");
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Logs, "📜 Logs");
                 ui.selectable_value(&mut self.current_tab, ActiveTab::Processes, "⚙ Processos");
@@ -141,9 +179,13 @@ impl eframe::App for DevBridgeApp {
         // Barra Inferior (Footer)
         egui::TopBottomPanel::bottom("bottom_panel").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(RichText::new("ArkOS R36S Toolkit • RK3326 Cortex-A35 • Mali-G31").small());
+                ui.label(
+                    RichText::new("ArkOS R36S Toolkit • RK3326 Cortex-A35 • Mali-G31").small(),
+                );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(RichText::new("DevBridge v0.2.0 • Protocolo Conectado").small());
+                    ui.label(
+                        RichText::new(concat!("DevBridge v", env!("CARGO_PKG_VERSION"))).small(),
+                    );
                 });
             });
         });
@@ -176,27 +218,56 @@ impl eframe::App for DevBridgeApp {
                 });
         }
 
+        self.gamepad_panel.guard(
+            &self.connection,
+            self.current_tab == ActiveTab::ViewportAndTelemetry
+                && ctx.input(|i| i.focused)
+                && matches!(status_snapshot, ConnectionStatus::Connected { .. }),
+        );
+
         // Painel Central: ocupa todo o espaço restante da tela do notebook
-        egui::CentralPanel::default().show(ctx, |ui| {
-            match self.current_tab {
-                ActiveTab::ViewportAndTelemetry => {
-                    let video_connected = self.connection.video_connected.load(Ordering::Relaxed);
-                    self.viewport.render(
-                        ui,
-                        is_streaming,
-                        video_connected,
-                        frame_snapshot.as_ref(),
-                    );
+        egui::CentralPanel::default().show(ctx, |ui| match self.current_tab {
+            ActiveTab::ViewportAndTelemetry => {
+                let mut take_screenshot = false;
+                let previous_mode = self.viewport.mode;
+                self.viewport
+                    .controls(ui, frame_available, &mut take_screenshot);
+                if previous_mode != self.viewport.mode {
+                    self.gamepad_panel.release(&self.connection);
                 }
-                ActiveTab::Deploy => {
-                    self.deploy_tab.render(ui, &self.connection);
+                if take_screenshot {
+                    if let Some(frame) = frame_snapshot.as_ref() {
+                        self.viewport.save_screenshot(std::sync::Arc::clone(frame));
+                    }
                 }
-                ActiveTab::Logs => {
-                    self.logs_tab.render(ui, &self.connection);
+
+                match self.viewport.mode {
+                    crate::viewport::ViewportMode::Handheld => {
+                        self.gamepad_panel
+                            .console(ui, &self.connection, &self.viewport);
+                    }
+                    crate::viewport::ViewportMode::Display4x3 => {
+                        let connected =
+                            matches!(status_snapshot, ConnectionStatus::Connected { .. });
+                        self.viewport.paint_display_4x3(
+                            ui,
+                            connected,
+                            is_streaming,
+                            self.connection.video_connected.load(Ordering::Relaxed),
+                        );
+                        self.gamepad_panel.interact_keyboard(ui, &self.connection);
+                    }
                 }
-                ActiveTab::Processes => {
-                    self.process_tab.render(ui, &self.connection, metrics_snapshot.as_ref());
-                }
+            }
+            ActiveTab::Deploy => {
+                self.deploy_tab.render(ui, &self.connection);
+            }
+            ActiveTab::Logs => {
+                self.logs_tab.render(ui, &self.connection);
+            }
+            ActiveTab::Processes => {
+                self.process_tab
+                    .render(ui, &self.connection, metrics_snapshot.as_ref());
             }
         });
     }

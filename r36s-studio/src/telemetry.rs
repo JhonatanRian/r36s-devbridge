@@ -39,31 +39,49 @@ impl TelemetryDashboard {
     ) {
         ui.vertical(|ui| {
             // Cartão de Conexão & Throughput
-            ui.group(|ui| {
-                match status {
-                    ConnectionStatus::Searching { usb_detected, message } => {
-                        let icon = if *usb_detected { "🟡" } else { "🔴" };
-                        ui.label(RichText::new(format!("{} Status da Conexão", icon)).strong());
-                        ui.label(RichText::new(message).small());
-                    }
-                    ConnectionStatus::Connecting { target, stage } => {
-                        ui.label(RichText::new("🟡 Conectando ao R36S...").strong());
-                        ui.label(RichText::new(format!("{}: {}", target, stage)).small());
-                    }
-                    ConnectionStatus::Connected { target, latency_ms, agent_version } => {
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new("🟢 R36S Conectado").color(Color32::from_rgb(0, 220, 100)).strong());
-                            ui.label(RichText::new(format!("v{}", agent_version)).small());
-                        });
-                        ui.horizontal(|ui| {
-                            ui.label(RichText::new(format!("{} ({:.1} ms)", target, latency_ms)).small());
-                            ui.separator();
-                            ui.label(RichText::new(format!("{:.1} KB/s", throughput_kbps)).small().color(Color32::from_rgb(120, 200, 255)));
-                        });
-                    }
-                    ConnectionStatus::Error { message } => {
-                        ui.colored_label(Color32::from_rgb(255, 80, 80), RichText::new(format!("Erro: {}", message)).strong());
-                    }
+            ui.group(|ui| match status {
+                ConnectionStatus::Searching {
+                    usb_detected,
+                    message,
+                } => {
+                    let icon = if *usb_detected { "🟡" } else { "🔴" };
+                    ui.label(RichText::new(format!("{} Status da Conexão", icon)).strong());
+                    ui.label(RichText::new(message).small());
+                }
+                ConnectionStatus::Connecting { target, stage } => {
+                    ui.label(RichText::new("🟡 Conectando ao R36S...").strong());
+                    ui.label(RichText::new(format!("{}: {}", target, stage)).small());
+                }
+                ConnectionStatus::Connected {
+                    target,
+                    latency_ms,
+                    agent_version,
+                } => {
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new("🟢 R36S Conectado")
+                                .color(Color32::from_rgb(0, 220, 100))
+                                .strong(),
+                        );
+                        ui.label(RichText::new(format!("v{}", agent_version)).small());
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label(
+                            RichText::new(format!("{} ({:.1} ms)", target, latency_ms)).small(),
+                        );
+                        ui.separator();
+                        ui.label(
+                            RichText::new(format!("{:.1} KB/s", throughput_kbps))
+                                .small()
+                                .color(Color32::from_rgb(120, 200, 255)),
+                        );
+                    });
+                }
+                ConnectionStatus::Error { message } => {
+                    ui.colored_label(
+                        Color32::from_rgb(255, 80, 80),
+                        RichText::new(format!("Erro: {}", message)).strong(),
+                    );
                 }
             });
 
@@ -115,7 +133,11 @@ impl TelemetryDashboard {
                             }
                         });
                     } else {
-                        ui.label(RichText::new("Frequências: Indisponíveis").small().color(Color32::GRAY));
+                        ui.label(
+                            RichText::new("Frequências: Indisponíveis")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
                     }
 
                     // Temperatura Real
@@ -148,7 +170,10 @@ impl TelemetryDashboard {
                     ui.horizontal(|ui| {
                         ui.label(RichText::new("💾 Memória RAM").strong());
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(format!("{} / {} MB", metrics.ram_used_mb, metrics.ram_total_mb));
+                            ui.label(format!(
+                                "{} / {} MB",
+                                metrics.ram_used_mb, metrics.ram_total_mb
+                            ));
                         });
                     });
 
@@ -193,15 +218,20 @@ impl TelemetryDashboard {
             } else {
                 ui.group(|ui| {
                     ui.label("Aguardando dados de telemetria do R36S...");
-                    ui.label(RichText::new("Plugue o cabo USB OTG com o Port DevBridge ativado.").small());
+                    ui.label(
+                        RichText::new("Plugue o cabo USB OTG com o Port DevBridge ativado.")
+                            .small(),
+                    );
                 });
             }
         });
     }
 
     fn render_cpu_graph(&self, ui: &mut Ui) {
-        let (rect, _response) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 2.0, Color32::from_rgb(15, 18, 22));
+        let (rect, _response) =
+            ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), egui::Sense::hover());
+        ui.painter()
+            .rect_filled(rect, 2.0, Color32::from_rgb(15, 18, 22));
 
         if self.cpu_history.len() < 2 {
             return;
