@@ -121,3 +121,173 @@ fn test_keyframe_and_delta_xor_decoding() {
         assert_eq!(chunk[3], 255); // Alpha sempre opaco
     }
 }
+
+#[test]
+fn test_async_gamepad_push_events_concurrent_with_telemetry() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::mpsc::channel;
+    use std::sync::{Arc, Mutex};
+    use std::time::{Duration, Instant};
+    use r36s_studio::connection::{ConnectionManager, ConnectionStatus};
+    use r36s_studio::protocol::*;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let (cmd_tx, cmd_rx) = channel::<ClientCommand>();
+    let status = Arc::new(Mutex::new(ConnectionStatus::Connected {
+        target: addr.to_string(),
+        latency_ms: 1.0,
+        agent_version: "0.2.9".into(),
+    }));
+    let metrics = Arc::new(Mutex::new(None));
+    let logs = Arc::new(Mutex::new(None));
+    let deploy_status = Arc::new(Mutex::new(None));
+    let proc_result = Arc::new(Mutex::new(None));
+    let diag = Arc::new(Mutex::new(Vec::new()));
+    let bytes_tx = Arc::new(AtomicU64::new(0));
+    let bytes_rx = Arc::new(AtomicU64::new(0));
+    let gamepad_listening = Arc::new(AtomicBool::new(true));
+    let gamepad_state = Arc::new(Mutex::new(GamepadState::default()));
+    let gamepad_supported = Arc::new(AtomicBool::new(true));
+
+    let gamepad_state_clone = Arc::clone(&gamepad_state);
+    let metrics_clone = Arc::clone(&metrics);
+
+    // Mock daemon server thread
+    let server_handle = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        stream.set_nodelay(true).unwrap();
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+        // 1. Simula envio assíncrono imediato de evento Push do Gamepad vindo do daemon
+        let push_event = ServerResponse::GamepadStateResponse(GamepadState {
+            available: true,
+            input_enabled: false,
+            error: None,
+            sequence: 101,
+            transitions: vec![ButtonTransition {
+                sequence: 101,
+                buttons: BTN_MASK_A | BTN_MASK_DPAD_UP,
+            }],
+            overflow: false,
+            listening: true,
+            device_name: "odroidgo2-joypad".into(),
+            buttons: BTN_MASK_A | BTN_MASK_DPAD_UP,
+            left_x: 12000,
+            left_y: -8000,
+            right_x: 0,
+            right_y: 0,
+        });
+        let mut push_json = serde_json::to_string(&push_event).unwrap();
+        push_json.push('\n');
+        stream.write_all(push_json.as_bytes()).unwrap();
+        stream.flush().unwrap();
+
+        // 2. Lê requisições do cliente (ex: Ping ou GetMetrics)
+        let mut line = String::new();
+        while reader.read_line(&mut line).unwrap() > 0 {
+            let cmd: ClientCommand = serde_json::from_str(line.trim()).unwrap();
+            line.clear();
+            match cmd {
+                ClientCommand::Ping => {
+                    let mut resp = serde_json::to_string(&ServerResponse::Pong).unwrap();
+                    resp.push('\n');
+                    stream.write_all(resp.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                }
+                ClientCommand::GetMetrics => {
+                    let mut resp = serde_json::to_string(&ServerResponse::Metrics(SystemMetrics {
+                        timestamp: 12345,
+                        cpu_usage: 15.0,
+                        cpu_freq_mhz: vec![1200],
+                        cpu_temp_c: Some(45.0),
+                        ram_used_mb: 256,
+                        ram_total_mb: 1024,
+                        mali_gpu_load: None,
+                        mali_gpu_freq_mhz: None,
+                        active_game: None,
+                        running_processes: vec![],
+                        fb_width: 640,
+                        fb_height: 480,
+                        fb_bpp: 16,
+                        fb_format: 1,
+                    }))
+                    .unwrap();
+                    resp.push('\n');
+                    stream.write_all(resp.as_bytes()).unwrap();
+                    stream.flush().unwrap();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    });
+
+    let client_stream = TcpStream::connect(addr).unwrap();
+    client_stream.set_nodelay(true).unwrap();
+    let client_reader = BufReader::new(client_stream.try_clone().unwrap());
+
+    // Executa a sessão de controle do Studio em thread separada
+    let session_handle = std::thread::spawn(move || {
+        ConnectionManager::run_control_session(
+            client_stream,
+            client_reader,
+            &cmd_rx,
+            &status,
+            &metrics,
+            &logs,
+            &deploy_status,
+            &proc_result,
+            &diag,
+            &bytes_tx,
+            &bytes_rx,
+            &gamepad_listening,
+            &gamepad_state,
+            &gamepad_supported,
+        );
+    });
+
+    // Aguarda atualização reativa do gamepad pelo evento push (< 1ms)
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(2) {
+        let st = gamepad_state_clone.lock().unwrap();
+        if st.sequence == 101 && st.buttons == (BTN_MASK_A | BTN_MASK_DPAD_UP) {
+            assert_eq!(st.left_x, 12000);
+            assert_eq!(st.left_y, -8000);
+            break;
+        }
+        drop(st);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    let final_st = gamepad_state_clone.lock().unwrap().clone();
+    assert_eq!(final_st.sequence, 101);
+    assert_eq!(final_st.buttons, BTN_MASK_A | BTN_MASK_DPAD_UP);
+    assert_eq!(final_st.left_x, 12000);
+    assert_eq!(final_st.left_y, -8000);
+
+    // Envia comando de telemetria GetMetrics através do canal
+    cmd_tx.send(ClientCommand::GetMetrics).unwrap();
+
+    let start_metrics = Instant::now();
+    while start_metrics.elapsed() < Duration::from_secs(2) {
+        let m = metrics_clone.lock().unwrap();
+        if m.is_some() {
+            assert_eq!(m.as_ref().unwrap().ram_total_mb, 1024);
+            break;
+        }
+        drop(m);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+
+    assert!(metrics_clone.lock().unwrap().is_some());
+
+    // Encerra sessão
+    drop(cmd_tx);
+    server_handle.join().unwrap();
+    session_handle.join().unwrap();
+}
+

@@ -130,7 +130,7 @@ impl AgentServer {
         }
     }
 
-    fn handle_control_client(
+    pub fn handle_control_client(
         stream: TcpStream,
         streaming_flag: Arc<AtomicBool>,
         target_fps: Arc<AtomicU32>,
@@ -168,7 +168,15 @@ impl AgentServer {
 
         let _ = stream.set_nodelay(true);
         let mut reader = BufReader::new(stream.try_clone().unwrap());
-        let mut writer = stream;
+        let (tx, rx) = std::sync::mpsc::channel::<ServerResponse>();
+        let mut writer_stream = stream;
+        let writer_handle = thread::spawn(move || {
+            while let Ok(response) = rx.recv() {
+                if response.write_to(&mut writer_stream).is_err() {
+                    break;
+                }
+            }
+        });
         let mut deploy_mgr = DeployManager::new();
 
         let mut handshaken = false;
@@ -176,17 +184,25 @@ impl AgentServer {
             .get_ref()
             .set_read_timeout(Some(Duration::from_secs(5)));
         let mut line = String::new();
-        while let Ok(bytes_read) = reader.read_line(&mut line) {
-            if bytes_read == 0 {
-                break;
-            }
-
+        loop {
             if handshaken && active_control_id.load(Ordering::SeqCst) != session_id {
                 break;
             }
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
+                    continue;
+                }
+                Err(_) => break,
+            }
+
             let trimmed = line.trim();
             if trimmed.is_empty() {
-                line.clear();
                 continue;
             }
 
@@ -263,11 +279,9 @@ impl AgentServer {
                         let chunk_bytes = match base64_decode(&data_base64) {
                             Ok(b) => b,
                             Err(e) => {
-                                ServerResponse::DeployError {
+                                let _ = tx.send(ServerResponse::DeployError {
                                     error: format!("Chunk {} base64 inválido: {}", chunk_index, e),
-                                }
-                                .write_to(&mut writer);
-                                line.clear();
+                                });
                                 continue;
                             }
                         };
@@ -297,8 +311,7 @@ impl AgentServer {
                                     ])
                                     .output();
                                 if !result.map_or(false, |o| o.status.success()) {
-                                    ServerResponse::DeployError { error: "Payload recebido, mas não foi possível iniciar a atualização transacional. Execute o Port.".into() }.write_to(&mut writer);
-                                    line.clear();
+                                    let _ = tx.send(ServerResponse::DeployError { error: "Payload recebido, mas não foi possível iniciar a atualização transacional. Execute o Port.".into() });
                                     continue;
                                 }
                             }
@@ -338,6 +351,14 @@ impl AgentServer {
                         },
                     },
                     ClientCommand::SetGamepadMonitor { enabled } => {
+                        if enabled {
+                            let tx_push = tx.clone();
+                            gamepad.set_listener(Some(Arc::new(move |state| {
+                                let _ = tx_push.send(ServerResponse::GamepadStateResponse(state));
+                            })));
+                        } else {
+                            gamepad.set_listener(None);
+                        }
                         gamepad.set_listening(enabled);
                         ServerResponse::GamepadStateResponse(gamepad.get_state())
                     }
@@ -372,16 +393,22 @@ impl AgentServer {
                 },
             };
 
-            response.write_to(&mut writer);
-            line.clear();
+            if tx.send(response).is_err() {
+                break;
+            }
         }
 
+        if handshaken && active_control_id.load(Ordering::SeqCst) == session_id {
+            gamepad.set_listener(None);
+        }
         gamepad.disconnect(session_id);
         // Somente desativa o streaming se esta ainda for a sessão de controle ativa mais recente
         if handshaken && active_control_id.load(Ordering::SeqCst) == session_id {
             streaming_flag.store(false, Ordering::Relaxed);
             gamepad.set_listening(false);
         }
+        drop(tx);
+        let _ = writer_handle.join();
         println!(
             "[r36s-agent] Cliente de controle desconectado (sessão {}).",
             session_id
@@ -643,12 +670,13 @@ impl AgentServer {
 }
 
 impl ServerResponse {
-    pub fn write_to(&self, writer: &mut TcpStream) {
+    pub fn write_to(&self, writer: &mut TcpStream) -> std::io::Result<()> {
         if let Ok(mut json) = serde_json::to_string(self) {
             json.push('\n');
-            let _ = writer.write_all(json.as_bytes());
-            let _ = writer.flush();
+            writer.write_all(json.as_bytes())?;
+            writer.flush()?;
         }
+        Ok(())
     }
 }
 

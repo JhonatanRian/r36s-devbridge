@@ -572,6 +572,17 @@ impl ConnectionManager {
                             let mut ack_line = String::new();
                             if let Ok(n) = reader.read_line(&mut ack_line) {
                                 bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
+                                Self::process_response(
+                                    &ack_line,
+                                    &metrics,
+                                    &logs,
+                                    &deploy_status,
+                                    &proc_result,
+                                    &diag,
+                                    &gamepad_state,
+                                    &status,
+                                    &Arc::new(Mutex::new(None)),
+                                );
                             }
                         }
                     }
@@ -606,9 +617,9 @@ impl ConnectionManager {
         }
     }
 
-    fn run_control_session(
+    pub fn run_control_session(
         stream: TcpStream,
-        mut reader: BufReader<TcpStream>,
+        reader: BufReader<TcpStream>,
         cmd_rx: &Receiver<ClientCommand>,
         status: &Arc<Mutex<ConnectionStatus>>,
         metrics: &Arc<Mutex<Option<SystemMetrics>>>,
@@ -618,125 +629,105 @@ impl ConnectionManager {
         diag: &Arc<Mutex<Vec<String>>>,
         bytes_tx: &Arc<AtomicU64>,
         bytes_rx: &Arc<AtomicU64>,
-        gamepad_listening: &Arc<AtomicBool>,
+        _gamepad_listening: &Arc<AtomicBool>,
         gamepad_state: &Arc<Mutex<GamepadState>>,
-        gamepad_supported: &Arc<AtomicBool>,
+        _gamepad_supported: &Arc<AtomicBool>,
     ) {
-        let mut last_metrics_req = Instant::now();
-        let mut last_gamepad_req = Instant::now();
-        let mut response_buf = String::new();
+        let is_running = Arc::new(AtomicBool::new(true));
+        let pending_ping_start = Arc::new(Mutex::new(None));
 
-        loop {
-            // Processa comandos pendentes na fila
+        let is_running_reader = Arc::clone(&is_running);
+        let metrics_reader = Arc::clone(metrics);
+        let logs_reader = Arc::clone(logs);
+        let deploy_status_reader = Arc::clone(deploy_status);
+        let proc_result_reader = Arc::clone(proc_result);
+        let diag_reader = Arc::clone(diag);
+        let gamepad_state_reader = Arc::clone(gamepad_state);
+        let status_reader = Arc::clone(status);
+        let bytes_rx_reader = Arc::clone(bytes_rx);
+        let pending_ping_reader = Arc::clone(&pending_ping_start);
+
+        let reader_handle = thread::spawn(move || {
+            let mut reader = reader;
+            let mut line = String::new();
+            while is_running_reader.load(Ordering::Relaxed) {
+                line.clear();
+                match reader.read_line(&mut line) {
+                    Ok(0) => {
+                        break;
+                    }
+                    Ok(n) => {
+                        bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
+                        Self::process_response(
+                            &line,
+                            &metrics_reader,
+                            &logs_reader,
+                            &deploy_status_reader,
+                            &proc_result_reader,
+                            &diag_reader,
+                            &gamepad_state_reader,
+                            &status_reader,
+                            &pending_ping_reader,
+                        );
+                    }
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::Interrupted {
+                            break;
+                        }
+                    }
+                }
+            }
+            is_running_reader.store(false, Ordering::Relaxed);
+        });
+
+        let mut last_metrics_req = Instant::now();
+        while is_running.load(Ordering::Relaxed) {
+            match cmd_rx.recv_timeout(Duration::from_millis(20)) {
+                Ok(cmd) => {
+                    if Self::send_raw_cmd(&stream, &cmd, bytes_tx).is_err() {
+                        is_running.store(false, Ordering::Relaxed);
+                        break;
+                    }
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    is_running.store(false, Ordering::Relaxed);
+                    break;
+                }
+            }
+
             while let Ok(cmd) = cmd_rx.try_recv() {
                 if Self::send_raw_cmd(&stream, &cmd, bytes_tx).is_err() {
-                    return;
-                }
-                response_buf.clear();
-                if matches!(reader.read_line(&mut response_buf), Ok(n) if n > 0) {
-                    bytes_rx.fetch_add(response_buf.len() as u64, Ordering::Relaxed);
-                    Self::process_response(
-                        &response_buf,
-                        metrics,
-                        logs,
-                        deploy_status,
-                        proc_result,
-                        diag,
-                        gamepad_state,
-                    );
-                } else {
-                    return;
+                    is_running.store(false, Ordering::Relaxed);
+                    break;
                 }
             }
 
-            // Polling de gamepad se gamepad_listening estiver ativo (~35ms = ~28 Hz)
-            if gamepad_supported.load(Ordering::Relaxed)
-                && gamepad_listening.load(Ordering::Relaxed)
-                && last_gamepad_req.elapsed() >= Duration::from_millis(35)
-            {
-                last_gamepad_req = Instant::now();
-                if Self::send_raw_cmd(&stream, &ClientCommand::GetGamepadState, bytes_tx).is_err() {
-                    return;
-                }
-                response_buf.clear();
-                match reader.read_line(&mut response_buf) {
-                    Ok(n) if n > 0 => {
-                        bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
-                        Self::process_response(
-                            &response_buf,
-                            metrics,
-                            logs,
-                            deploy_status,
-                            proc_result,
-                            diag,
-                            gamepad_state,
-                        );
-                    }
-                    _ => return, // Desconectou
-                }
+            if !is_running.load(Ordering::Relaxed) {
+                break;
             }
 
-            // Coleta periódica de métricas a cada 1s
+            // Coleta periódica de métricas a cada 1s (com cálculo de RTT por Ping/Pong)
             if last_metrics_req.elapsed() >= Duration::from_millis(1000) {
                 last_metrics_req = Instant::now();
-                let start_ping = Instant::now();
+                *pending_ping_start.lock().unwrap() = Some(Instant::now());
                 if Self::send_raw_cmd(&stream, &ClientCommand::Ping, bytes_tx).is_err() {
-                    return;
+                    is_running.store(false, Ordering::Relaxed);
+                    break;
                 }
-                response_buf.clear();
-                if reader.read_line(&mut response_buf).unwrap_or(0) == 0 {
-                    return;
-                }
-                bytes_rx.fetch_add(response_buf.len() as u64, Ordering::Relaxed);
-                if !matches!(
-                    serde_json::from_str::<ServerResponse>(&response_buf),
-                    Ok(ServerResponse::Pong)
-                ) {
-                    return;
-                }
-                let ping_ms = start_ping.elapsed().as_secs_f32() * 1000.0;
                 if Self::send_raw_cmd(&stream, &ClientCommand::GetMetrics, bytes_tx).is_err() {
-                    return;
-                }
-
-                response_buf.clear();
-                match reader.read_line(&mut response_buf) {
-                    Ok(n) if n > 0 => {
-                        bytes_rx.fetch_add(n as u64, Ordering::Relaxed);
-                        let latency = ping_ms;
-                        {
-                            let mut st = status.lock().unwrap();
-                            if let ConnectionStatus::Connected {
-                                ref mut latency_ms, ..
-                            } = *st
-                            {
-                                *latency_ms = latency;
-                            }
-                        }
-                        Self::process_response(
-                            &response_buf,
-                            metrics,
-                            logs,
-                            deploy_status,
-                            proc_result,
-                            diag,
-                            gamepad_state,
-                        );
-                    }
-                    _ => return, // Desconectou
+                    is_running.store(false, Ordering::Relaxed);
+                    break;
                 }
             }
-
-            let sleep_ms = if gamepad_listening.load(Ordering::Relaxed) {
-                10
-            } else {
-                30
-            };
-            thread::sleep(Duration::from_millis(sleep_ms));
         }
+
+        is_running.store(false, Ordering::Relaxed);
+        let _ = stream.shutdown(std::net::Shutdown::Both);
+        let _ = reader_handle.join();
     }
 
-    fn send_raw_cmd(
+    pub fn send_raw_cmd(
         mut writer: &TcpStream,
         cmd: &ClientCommand,
         bytes_tx: &Arc<AtomicU64>,
@@ -750,7 +741,7 @@ impl ConnectionManager {
         writer.flush()
     }
 
-    fn process_response(
+    pub fn process_response(
         raw: &str,
         metrics: &Arc<Mutex<Option<SystemMetrics>>>,
         logs: &Arc<Mutex<Option<(String, String)>>>,
@@ -758,9 +749,26 @@ impl ConnectionManager {
         proc_result: &Arc<Mutex<Option<(bool, String)>>>,
         diag: &Arc<Mutex<Vec<String>>>,
         gamepad_state: &Arc<Mutex<GamepadState>>,
+        status: &Arc<Mutex<ConnectionStatus>>,
+        pending_ping_start: &Arc<Mutex<Option<Instant>>>,
     ) {
         match serde_json::from_str::<ServerResponse>(raw.trim()) {
             Ok(resp) => match resp {
+                ServerResponse::Pong => {
+                    let latency = {
+                        let mut p = pending_ping_start.lock().unwrap();
+                        p.take().map(|t| t.elapsed().as_secs_f32() * 1000.0)
+                    };
+                    if let Some(latency) = latency {
+                        let mut st = status.lock().unwrap();
+                        if let ConnectionStatus::Connected {
+                            ref mut latency_ms, ..
+                        } = *st
+                        {
+                            *latency_ms = latency;
+                        }
+                    }
+                }
                 ServerResponse::Metrics(data) => {
                     let mut m = metrics.lock().unwrap();
                     *m = Some(data);

@@ -1,0 +1,13 @@
+[workspace]
+members = [
+    "r36s-agent",
+    "r36s-studio",
+]
+resolver = "2"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

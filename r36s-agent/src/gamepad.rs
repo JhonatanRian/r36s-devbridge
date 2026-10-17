@@ -347,7 +347,8 @@ impl EvdevGamepadBackend {
         self.devices = devices;
     }
     fn aggregate(&self, state: &mut GamepadState) {
-        let previous = state.buttons;
+        let previous_buttons = state.buttons;
+        let previous_axes = (state.left_x, state.left_y, state.right_x, state.right_y);
         state.buttons = self.devices.iter().fold(0, |a, d| a | d.committed.buttons);
         if let Some(d) = self.devices.iter().find(|d| d.is_gamepad()) {
             state.available = true;
@@ -364,8 +365,13 @@ impl EvdevGamepadBackend {
             state.right_x = 0;
             state.right_y = 0;
         }
-        if previous != state.buttons {
+        let axes_changed =
+            previous_axes != (state.left_x, state.left_y, state.right_x, state.right_y);
+        let buttons_changed = previous_buttons != state.buttons;
+        if buttons_changed || axes_changed {
             state.sequence = state.sequence.wrapping_add(1);
+        }
+        if buttons_changed {
             if state.transitions.len() == 256 {
                 state.transitions.remove(0);
                 state.overflow = true;
@@ -632,10 +638,13 @@ struct BackendSession {
     backend: EvdevGamepadBackend,
     lease: Option<(u32, Instant)>,
 }
+pub type GamepadListener = Arc<dyn Fn(GamepadState) + Send + Sync>;
+
 pub struct GamepadService {
     backend: Arc<Mutex<BackendSession>>,
     state: Arc<Mutex<GamepadState>>,
     listening: Arc<AtomicBool>,
+    listener: Arc<Mutex<Option<GamepadListener>>>,
 }
 impl GamepadService {
     pub fn new() -> Self {
@@ -645,7 +654,13 @@ impl GamepadService {
         }));
         let state = Arc::new(Mutex::new(GamepadState::default()));
         let listening = Arc::new(AtomicBool::new(false));
-        let (b, s, l) = (backend.clone(), state.clone(), listening.clone());
+        let listener: Arc<Mutex<Option<GamepadListener>>> = Arc::new(Mutex::new(None));
+        let (b, s, l, list) = (
+            backend.clone(),
+            state.clone(),
+            listening.clone(),
+            listener.clone(),
+        );
         thread::spawn(move || loop {
             let poll_work = {
                 let mut session = b.lock().unwrap();
@@ -686,6 +701,7 @@ impl GamepadService {
                 // get_state can drain transitions during poll: merge only newly produced transitions.
                 let mut published = s.lock().unwrap();
                 let old_seq = published.sequence;
+                let old_avail = published.available;
                 let new_events: Vec<_> = next
                     .transitions
                     .iter()
@@ -698,7 +714,24 @@ impl GamepadService {
                     next.transitions.drain(..next.transitions.len() - 256);
                     next.overflow = true;
                 }
+                let state_changed = next.sequence != old_seq || next.available != old_avail;
+                let state_to_push = if state_changed {
+                    let to_send = next.clone();
+                    next.transitions.clear();
+                    next.overflow = false;
+                    Some(to_send)
+                } else {
+                    None
+                };
                 *published = next;
+                drop(published);
+
+                if let Some(st) = state_to_push {
+                    let maybe_cb = list.lock().unwrap().clone();
+                    if let Some(cb) = maybe_cb {
+                        cb(st);
+                    }
+                }
             } else {
                 thread::sleep(Duration::from_millis(100));
             }
@@ -707,6 +740,7 @@ impl GamepadService {
             backend,
             state,
             listening,
+            listener,
         }
     }
     pub fn set_listening(&self, enabled: bool) {
@@ -791,6 +825,15 @@ impl GamepadService {
             return Err("Sessão de envio desativada ou expirada".into());
         }
         session.backend.inject_action(action)
+    }
+    pub fn set_listener(&self, listener: Option<GamepadListener>) {
+        *self.listener.lock().unwrap() = listener;
+    }
+    pub fn notify_listener(&self, state: GamepadState) {
+        let maybe_cb = self.listener.lock().unwrap().clone();
+        if let Some(cb) = maybe_cb {
+            cb(state);
+        }
     }
 }
 
@@ -979,6 +1022,7 @@ mod mode_regression_tests {
                 ..Default::default()
             })),
             listening: Arc::new(AtomicBool::new(false)),
+            listener: Arc::new(Mutex::new(None)),
         };
         service.set_listening(true);
         assert!(!service.get_state().input_enabled);

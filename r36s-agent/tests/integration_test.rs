@@ -130,3 +130,98 @@ fn test_coalesced_video_frame_transmission_and_reception() {
 
     client_handle.join().unwrap();
 }
+
+#[test]
+fn test_gamepad_push_events_and_concurrent_control_stream() {
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicBool, AtomicU32};
+    use std::sync::Arc;
+
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+
+    let streaming_flag = Arc::new(AtomicBool::new(false));
+    let target_fps = Arc::new(AtomicU32::new(30));
+    let active_control_id = Arc::new(AtomicU32::new(0));
+    let metrics = Arc::new(MetricsCollector::new());
+    let gamepad = Arc::new(r36s_agent::gamepad::GamepadService::new());
+    let gamepad_clone = Arc::clone(&gamepad);
+
+    let server_handle = std::thread::spawn(move || {
+        let (stream, _) = listener.accept().unwrap();
+        r36s_agent::server::AgentServer::handle_control_client(
+            stream,
+            streaming_flag,
+            target_fps,
+            active_control_id,
+            1,
+            metrics,
+            gamepad,
+        );
+    });
+
+    let mut stream = TcpStream::connect(addr).unwrap();
+    stream.set_nodelay(true).unwrap();
+    let mut reader = BufReader::new(stream.try_clone().unwrap());
+
+    // 1. Handshake
+    let hs_cmd = serde_json::to_string(&ClientCommand::Handshake {
+        client_version: "0.2.9".into(),
+        client_id: "test-studio".into(),
+    })
+    .unwrap()
+        + "\n";
+    stream.write_all(hs_cmd.as_bytes()).unwrap();
+    let mut line = String::new();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("HandshakeAck"));
+
+    // 2. SetGamepadMonitor { enabled: true }
+    let mon_cmd =
+        serde_json::to_string(&ClientCommand::SetGamepadMonitor { enabled: true }).unwrap() + "\n";
+    stream.write_all(mon_cmd.as_bytes()).unwrap();
+    line.clear();
+    reader.read_line(&mut line).unwrap();
+    assert!(line.contains("GamepadStateResponse"));
+
+    // 3. Emit push event concurrently with sending Ping commands
+    let push_state = GamepadState {
+        available: true,
+        sequence: 42,
+        buttons: BTN_MASK_A,
+        ..Default::default()
+    };
+    gamepad_clone.notify_listener(push_state);
+
+    let ping_cmd = serde_json::to_string(&ClientCommand::Ping).unwrap() + "\n";
+    stream.write_all(ping_cmd.as_bytes()).unwrap();
+
+    // 4. Client should receive both messages (order can be push then pong, or pong then push)
+    let mut received_pong = false;
+    let mut received_gamepad_push = false;
+
+    for _ in 0..2 {
+        line.clear();
+        reader.read_line(&mut line).unwrap();
+        let resp: ServerResponse = serde_json::from_str(line.trim()).unwrap();
+        match resp {
+            ServerResponse::Pong => received_pong = true,
+            ServerResponse::GamepadStateResponse(st) => {
+                if st.sequence == 42 && st.buttons == BTN_MASK_A {
+                    received_gamepad_push = true;
+                }
+            }
+            other => panic!("Resposta inesperada: {:?}", other),
+        }
+    }
+
+    assert!(received_pong, "Deveria ter recebido Pong");
+    assert!(received_gamepad_push, "Deveria ter recebido evento push de Gamepad");
+
+    // Close stream to disconnect cleanly
+    drop(stream);
+    drop(reader);
+    server_handle.join().unwrap();
+}
+
