@@ -55,7 +55,7 @@ echo "Partição root: $ROOT"
 
 # 3. Compilação usando usuário normal para preservar propriedade dos artefatos
 echo -e "\nCompilando e gerando pacote atualizado dist/ports..."
-for cpath in "$HOME/.cargo/bin" "/home/${SUDO_USER:-}/.cargo/bin" /home/user/.cargo/bin /usr/local/bin /usr/bin; do
+for cpath in "$HOME/.cargo/bin" "/home/${SUDO_USER:-}/.cargo/bin" /usr/local/bin /usr/bin; do
     [ -d "$cpath" ] && export PATH="$cpath:$PATH"
 done
 

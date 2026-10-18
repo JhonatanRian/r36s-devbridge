@@ -16,7 +16,6 @@ for cand in \
     "${USER_CARGO:-}" \
     "$HOME/.cargo/bin/cargo" \
     "/home/${SUDO_USER:-$USER}/.cargo/bin/cargo" \
-    /home/user/.cargo/bin/cargo \
     /root/.cargo/bin/cargo \
     /usr/bin/cargo \
     /usr/local/bin/cargo; do
@@ -27,7 +26,30 @@ for cand in \
 done
 
 if ! command -v cargo >/dev/null 2>&1; then
-    echo "ERRO: cargo não encontrado. Artefatos antigos não serão instalados silenciosamente." >&2
+    echo "ERRO: cargo não encontrado no PATH nem no ~/.cargo/bin." >&2
+    echo "Instale o Rust via https://rustup.rs ou configure a variável CARGO_BIN." >&2
+    exit 1
+fi
+
+# Verifica suporte ao target AArch64 MUSL
+if command -v rustup >/dev/null 2>&1; then
+    if ! rustup target list --installed | grep -q "^aarch64-unknown-linux-musl$"; then
+        echo "Aviso: target aarch64-unknown-linux-musl não instalado. Tentando adicionar via rustup..."
+        rustup target add aarch64-unknown-linux-musl || {
+            echo "ERRO: Falha ao adicionar target aarch64-unknown-linux-musl." >&2
+            echo "Execute manualmente: rustup target add aarch64-unknown-linux-musl" >&2
+            exit 1
+        }
+    fi
+fi
+
+# Verifica se o cross-linker está instalado
+if ! command -v aarch64-linux-gnu-gcc >/dev/null 2>&1; then
+    echo "ERRO: Linker cross-compile 'aarch64-linux-gnu-gcc' não encontrado." >&2
+    echo "Instale com:" >&2
+    echo "  Debian/Ubuntu: sudo apt update && sudo apt install -y gcc-aarch64-linux-gnu" >&2
+    echo "  Arch Linux:    sudo pacman -S aarch64-linux-gnu-gcc" >&2
+    echo "  Fedora:        sudo dnf install gcc-aarch64-linux-gnu" >&2
     exit 1
 fi
 

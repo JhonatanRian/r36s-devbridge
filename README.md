@@ -54,7 +54,8 @@ Follow these steps carefully for first-time setup:
 1. Power off your R36S handheld completely.
 2. Eject the MicroSD card containing the **`EASYROMS`** partition (typically TF1 or TF2) and plug it into your computer.
 3. Locate the `ports/` directory inside your ROMs partition (e.g., `/media/<user>/EASYROMS/ports/`).
-4. Copy the contents of the `dist/ports/` folder from this repository into `ports/`:
+4. Copy the contents of the `dist/ports/` folder into `ports/`:
+   *(Note: `dist/ports/` is generated automatically when you run `./build.sh` from source, or can be downloaded ready-to-use as a zip from the GitHub Releases page. If you are running Linux with the SD card mounted, you can simply run `sudo ./install_to_sd.sh` to compile and install in a single step).*
    ```text
    EASYROMS/
    └── ports/
@@ -63,7 +64,6 @@ Follow these steps carefully for first-time setup:
            ├── patch_dtb_usb.py
            └── payload.zip
    ```
-   *(Note: If you are running Linux with the SD card mounted, you can simply run `./install_to_sd.sh` as sudo to automate this).*
 5. Safely eject the MicroSD card from your computer and insert it back into your R36S.
 
 ---

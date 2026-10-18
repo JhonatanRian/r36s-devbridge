@@ -13,3 +13,5 @@ implementation_plan.md
 openspec/
 *.zip
 __pycache__/
+AGENTS.md
+agents/
