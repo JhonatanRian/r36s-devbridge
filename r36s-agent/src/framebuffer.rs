@@ -685,16 +685,12 @@ impl FramebufferReader {
 
         self.compression_us = compress_started.elapsed().as_micros() as u64;
 
-        if is_delta {
-            // Em delta, atualiza o buffer de referência copiando o frame atual
-            self.prev_frame_buffer.copy_from_slice(&self.packed_buffer);
+        // Troca ponteiros de buffer em O(1) (< 5 ns) tanto em delta quanto em keyframe,
+        // economizando ~614 KB de cópia de memória RAM por quadro no R36S.
+        if self.prev_frame_buffer.len() != self.packed_buffer.len() {
+            self.prev_frame_buffer = self.packed_buffer.clone();
         } else {
-            // Em keyframe, troca os ponteiros de buffer em O(1) (< 5 ns)
-            if self.prev_frame_buffer.len() != self.packed_buffer.len() {
-                self.prev_frame_buffer = self.packed_buffer.clone();
-            } else {
-                std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer);
-            }
+            std::mem::swap(&mut self.packed_buffer, &mut self.prev_frame_buffer);
         }
 
         (

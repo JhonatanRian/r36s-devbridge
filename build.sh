@@ -43,7 +43,7 @@ DEVBRIDGE_AGENT_BUILT=1 "$ROOT_DIR/r36s-port/build_payload.sh"
 # 3. Compilar r36s-studio para o PC Host
 echo -e "\n[3/4] Compilando aplicativo desktop r36s-studio (PC)..."
 (cd "$ROOT_DIR/r36s-studio" && cargo build --release)
-install -m 755 "$ROOT_DIR/r36s-studio/target/release/r36s-studio" "$ROOT_DIR/.app.new"
+install -m 755 "$ROOT_DIR/target/release/r36s-studio" "$ROOT_DIR/.app.new"
 mv -f "$ROOT_DIR/.app.new" "$ROOT_DIR/app"
 chmod +x "$ROOT_DIR/app"
 echo "Binário ./app gerado com sucesso na raiz do projeto."

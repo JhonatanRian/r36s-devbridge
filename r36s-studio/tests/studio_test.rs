@@ -247,6 +247,7 @@ fn test_async_gamepad_push_events_concurrent_with_telemetry() {
             &gamepad_listening,
             &gamepad_state,
             &gamepad_supported,
+            &Arc::new(Mutex::new(None)),
         );
     });
 

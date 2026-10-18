@@ -31,7 +31,7 @@ impl AgentServer {
 
         Self {
             streaming_enabled: Arc::new(AtomicBool::new(false)),
-            target_fps: Arc::new(AtomicU32::new(30)),
+            target_fps: Arc::new(AtomicU32::new(60)),
             active_control_id: Arc::new(AtomicU32::new(0)),
             active_video_session: Arc::new(AtomicU32::new(0)),
             metrics_collector: metrics,

@@ -3,7 +3,7 @@ set -Eeuo pipefail
 
 DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(cd -- "$DIR/.." && pwd -P)"
-AGENT_BIN="$PROJECT_ROOT/r36s-agent/target/aarch64-unknown-linux-musl/release/r36s-agent"
+AGENT_BIN="$PROJECT_ROOT/target/aarch64-unknown-linux-musl/release/r36s-agent"
 SERVICE_FILE="$PROJECT_ROOT/r36s-agent/systemd/r36s-agent.service"
 OUT_ZIP="$DIR/payload.zip"
 

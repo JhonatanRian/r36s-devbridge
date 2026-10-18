@@ -150,6 +150,7 @@ impl ConnectionManager {
         let gp_supported_cl = Arc::clone(&gamepad_supported);
         let gp_input_cl = Arc::clone(&gamepad_input_enabled);
         let gp_state_cl = Arc::clone(&gamepad_state);
+        let egui_ctx_ctrl = Arc::clone(&egui_ctx);
 
         thread::spawn(move || {
             Self::control_worker(
@@ -167,6 +168,7 @@ impl ConnectionManager {
                 gp_state_cl,
                 gp_supported_cl,
                 gp_input_cl,
+                egui_ctx_ctrl,
             );
         });
 
@@ -415,6 +417,7 @@ impl ConnectionManager {
         gamepad_state: Arc<Mutex<GamepadState>>,
         gamepad_supported: Arc<AtomicBool>,
         gamepad_input: Arc<AtomicBool>,
+        egui_ctx: Arc<Mutex<Option<egui::Context>>>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, CONTROL_PORT).parse().unwrap();
@@ -582,6 +585,7 @@ impl ConnectionManager {
                                     &gamepad_state,
                                     &status,
                                     &Arc::new(Mutex::new(None)),
+                                    &egui_ctx,
                                 );
                             }
                         }
@@ -602,6 +606,7 @@ impl ConnectionManager {
                         &gamepad_listening,
                         &gamepad_state,
                         &gamepad_supported,
+                        &egui_ctx,
                     );
                 }
                 Err(error) => {
@@ -632,6 +637,7 @@ impl ConnectionManager {
         _gamepad_listening: &Arc<AtomicBool>,
         gamepad_state: &Arc<Mutex<GamepadState>>,
         _gamepad_supported: &Arc<AtomicBool>,
+        egui_ctx: &Arc<Mutex<Option<egui::Context>>>,
     ) {
         let is_running = Arc::new(AtomicBool::new(true));
         let pending_ping_start = Arc::new(Mutex::new(None));
@@ -646,6 +652,7 @@ impl ConnectionManager {
         let status_reader = Arc::clone(status);
         let bytes_rx_reader = Arc::clone(bytes_rx);
         let pending_ping_reader = Arc::clone(&pending_ping_start);
+        let egui_ctx_reader = Arc::clone(egui_ctx);
 
         let reader_handle = thread::spawn(move || {
             let mut reader = reader;
@@ -668,6 +675,7 @@ impl ConnectionManager {
                             &gamepad_state_reader,
                             &status_reader,
                             &pending_ping_reader,
+                            &egui_ctx_reader,
                         );
                     }
                     Err(e) => {
@@ -751,6 +759,7 @@ impl ConnectionManager {
         gamepad_state: &Arc<Mutex<GamepadState>>,
         status: &Arc<Mutex<ConnectionStatus>>,
         pending_ping_start: &Arc<Mutex<Option<Instant>>>,
+        egui_ctx: &Arc<Mutex<Option<egui::Context>>>,
     ) {
         match serde_json::from_str::<ServerResponse>(raw.trim()) {
             Ok(resp) => match resp {
@@ -823,6 +832,9 @@ impl ConnectionManager {
                     }
                     state.transitions = pending;
                     *g = state;
+                    if let Some(ctx) = egui_ctx.lock().unwrap().as_ref() {
+                        ctx.request_repaint();
+                    }
                 }
                 ServerResponse::GamepadAck { success, message } => {
                     if !success {
