@@ -27,12 +27,32 @@ pub struct DevBridgeApp {
     process_tab: ProcessTab,
     current_tab: ActiveTab,
     show_telemetry_panel: bool,
+    hub_server: Option<crate::hub::HubServer>,
 }
 
 impl DevBridgeApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let connection = ConnectionManager::new();
         connection.set_egui_ctx(cc.egui_ctx.clone());
+
+        let lock = match crate::hub::OwnerLock::acquire_studio() {
+            Ok(l) => Some(l),
+            Err(e) => {
+                eprintln!("[r36s-studio] Aviso ao adquirir lock do Studio: {}", e);
+                None
+            }
+        };
+
+        let hub_server = match crate::hub::HubServer::start(std::sync::Arc::new(connection.clone()), lock) {
+            Ok(h) => {
+                println!("[r36s-studio] Co-Pilot Hub iniciado em {:?}", h.socket_path());
+                Some(h)
+            }
+            Err(e) => {
+                eprintln!("[r36s-studio] Falha ao iniciar Hub IPC: {}", e);
+                None
+            }
+        };
 
         Self {
             connection,
@@ -44,6 +64,7 @@ impl DevBridgeApp {
             process_tab: ProcessTab::new(),
             current_tab: ActiveTab::ViewportAndTelemetry,
             show_telemetry_panel: true,
+            hub_server,
         }
     }
 }
@@ -152,6 +173,14 @@ impl eframe::App for DevBridgeApp {
                     "▶ Iniciar Stream"
                 };
                 if ui.button(RichText::new(stream_btn_text).strong()).clicked() {
+                    let will_stream = !is_streaming;
+                    if let Some(ref hub) = self.hub_server {
+                        hub.set_stream_owner(if will_stream {
+                            crate::hub::VideoStreamOwner::UserUi
+                        } else {
+                            crate::hub::VideoStreamOwner::None
+                        });
+                    }
                     self.connection.toggle_streaming();
                 }
 

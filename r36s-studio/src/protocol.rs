@@ -18,7 +18,7 @@ pub const FRAME_FLAG_FB_UNAVAILABLE: u8 = 2;
 pub const FRAME_FLAG_MOCK: u8 = 3;
 pub const FRAME_FLAG_DELTA: u8 = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
@@ -28,7 +28,7 @@ pub struct ProcessInfo {
     pub cpu_percent: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SystemMetrics {
     #[serde(default)]
     pub timestamp: u64,
@@ -54,9 +54,55 @@ pub struct SystemMetrics {
     pub fb_bpp: u8,
     #[serde(default)]
     pub fb_format: u8,
+    #[serde(default)]
+    pub cpu_core_usage: Vec<f32>,
+    #[serde(default)]
+    pub cma_total_mb: u64,
+    #[serde(default)]
+    pub cma_free_mb: u64,
+    #[serde(default)]
+    pub cma_available: bool,
+    #[serde(default)]
+    pub thermal_throttling: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Snapshot de telemetria de alto nível preparado para consumo do Co-Pilot Hub (IPC local)
+/// e do Native MCP Server (Capítulo 2 e 3 do roadmap).
+///
+/// Encapsula a idade da amostra na RAM do PC host e sinalizadores explícitos de disponibilidade,
+/// garantindo que a IA e a GUI consumam o mesmo contrato sem consultar o hardware duas vezes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct TelemetrySnapshot {
+    /// Idade da amostra em segundos em relação ao instante da consulta
+    pub age_secs: u64,
+    /// Indica se a métrica por núcleo (cpu0..cpu3) está ativa e íntegra
+    pub cores_available: bool,
+    /// Indica se os contadores de CMA do kernel estão disponíveis
+    pub cma_available: bool,
+    /// Indica se os dados térmicos foram aferidos com sucesso
+    pub thermal_available: bool,
+    /// Snapshot original das métricas do sistema
+    pub metrics: SystemMetrics,
+}
+
+impl TelemetrySnapshot {
+    pub fn from_metrics(metrics: SystemMetrics, current_timestamp: u64) -> Self {
+        let age_secs = current_timestamp.saturating_sub(metrics.timestamp);
+        let cores_available = !metrics.cpu_core_usage.is_empty();
+        let cma_available = metrics.cma_available;
+        let thermal_available = metrics.thermal_throttling.is_some() || metrics.cpu_temp_c.is_some();
+
+        Self {
+            age_secs,
+            cores_available,
+            cma_available,
+            thermal_available,
+            metrics,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum ClientCommand {
     Handshake {
@@ -74,6 +120,8 @@ pub enum ClientCommand {
         filename: String,
         total_size: u64,
         sha256: String,
+        #[serde(default)]
+        executable: Option<bool>,
     },
     DeployChunk {
         chunk_index: u32,
@@ -99,9 +147,25 @@ pub enum ClientCommand {
     InjectGamepadInput {
         action: GamepadInputAction,
     },
+    RunSandbox {
+        path: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        exclusive_drm: bool,
+    },
+    StopSandbox {
+        #[serde(default)]
+        timeout_ms: u64,
+    },
+    GetSandboxStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServerResponse {
     HandshakeAck {
@@ -150,6 +214,41 @@ pub enum ServerResponse {
     GamepadAck {
         success: bool,
         message: String,
+    },
+    SandboxStartResult {
+        success: bool,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SandboxStopResult {
+        success: bool,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        term_signal: Option<i32>,
+        #[serde(default)]
+        restore_error: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SandboxStatus {
+        running: bool,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        term_signal: Option<i32>,
+        #[serde(default)]
+        uptime_ms: u64,
+        #[serde(default)]
+        stdout_tail: String,
+        #[serde(default)]
+        stderr_tail: String,
+        #[serde(default)]
+        restore_error: Option<String>,
     },
     Error {
         message: String,
@@ -219,6 +318,10 @@ pub enum GamepadInputAction {
         left_y: i16,
         right_x: i16,
         right_y: i16,
+    },
+    Pulse {
+        mask: u32,
+        duration_ms: u16,
     },
 }
 
@@ -295,3 +398,217 @@ impl VideoFrameHeader {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_system_metrics_roundtrip_new_fields() {
+        let metrics = SystemMetrics {
+            timestamp: 123456789,
+            cpu_usage: 45.5,
+            cpu_freq_mhz: vec![1200, 1200, 1200, 1200],
+            cpu_temp_c: Some(55.2),
+            ram_used_mb: 250,
+            ram_total_mb: 1024,
+            mali_gpu_load: Some(12.5),
+            mali_gpu_freq_mhz: Some(500),
+            active_game: Some("RetroArch".to_string()),
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: vec![40.0, 50.0, 42.0, 50.0],
+            cma_total_mb: 16,
+            cma_free_mb: 12,
+            cma_available: true,
+            thermal_throttling: Some(false),
+        };
+
+        let json = serde_json::to_string(&metrics).expect("serialize metrics");
+        let deserialized: SystemMetrics = serde_json::from_str(&json).expect("deserialize metrics");
+
+        assert_eq!(deserialized.timestamp, 123456789);
+        assert_eq!(deserialized.cpu_core_usage, vec![40.0, 50.0, 42.0, 50.0]);
+        assert_eq!(deserialized.cma_total_mb, 16);
+        assert_eq!(deserialized.cma_free_mb, 12);
+        assert!(deserialized.cma_available);
+        assert_eq!(deserialized.thermal_throttling, Some(false));
+    }
+
+    #[test]
+    fn test_system_metrics_legacy_deserialization_defaults() {
+        let legacy_json = r#"{
+            "timestamp": 123456789,
+            "cpu_usage": 35.0,
+            "cpu_freq_mhz": [1000],
+            "cpu_temp_c": 50.0,
+            "ram_used_mb": 300,
+            "ram_total_mb": 1024,
+            "mali_gpu_load": null,
+            "mali_gpu_freq_mhz": null,
+            "active_game": null,
+            "running_processes": [],
+            "fb_width": 640,
+            "fb_height": 480,
+            "fb_bpp": 16,
+            "fb_format": 1
+        }"#;
+
+        let deserialized: SystemMetrics = serde_json::from_str(legacy_json).expect("deserialize legacy metrics");
+        assert!(deserialized.cpu_core_usage.is_empty());
+        assert_eq!(deserialized.cma_total_mb, 0);
+        assert_eq!(deserialized.cma_free_mb, 0);
+        assert!(!deserialized.cma_available);
+        assert_eq!(deserialized.thermal_throttling, None);
+    }
+
+    #[test]
+    fn test_telemetry_snapshot_serialization_and_availability_contract() {
+        let metrics_new = SystemMetrics {
+            timestamp: 1_000,
+            cpu_usage: 50.0,
+            cpu_freq_mhz: vec![1200, 1200, 1200, 1200],
+            cpu_temp_c: Some(60.0),
+            ram_used_mb: 256,
+            ram_total_mb: 1024,
+            mali_gpu_load: None,
+            mali_gpu_freq_mhz: None,
+            active_game: None,
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: vec![45.0, 55.0, 48.0, 52.0],
+            cma_total_mb: 32,
+            cma_free_mb: 16,
+            cma_available: true,
+            thermal_throttling: Some(false),
+        };
+
+        let now = 1_005;
+        let snapshot = TelemetrySnapshot::from_metrics(metrics_new, now);
+        assert_eq!(snapshot.age_secs, 5);
+        assert!(snapshot.cores_available);
+        assert!(snapshot.cma_available);
+        assert!(snapshot.thermal_available);
+
+        // Round-trip JSON do TelemetrySnapshot
+        let json = serde_json::to_string(&snapshot).expect("serialize TelemetrySnapshot");
+        let decoded: TelemetrySnapshot = serde_json::from_str(&json).expect("deserialize TelemetrySnapshot");
+        assert_eq!(decoded, snapshot);
+
+        // Snapshot derivado de métricas legadas (agente antigo)
+        let metrics_legacy = SystemMetrics {
+            timestamp: 1_000,
+            cpu_usage: 20.0,
+            cpu_freq_mhz: vec![],
+            cpu_temp_c: None,
+            ram_used_mb: 200,
+            ram_total_mb: 1024,
+            mali_gpu_load: None,
+            mali_gpu_freq_mhz: None,
+            active_game: None,
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: Vec::new(),
+            cma_total_mb: 0,
+            cma_free_mb: 0,
+            cma_available: false,
+            thermal_throttling: None,
+        };
+
+        let legacy_snapshot = TelemetrySnapshot::from_metrics(metrics_legacy, 1_002);
+        assert_eq!(legacy_snapshot.age_secs, 2);
+        assert!(!legacy_snapshot.cores_available);
+        assert!(!legacy_snapshot.cma_available);
+        assert!(!legacy_snapshot.thermal_available);
+    }
+
+    #[test]
+    fn test_gamepad_input_action_pulse_serialization_roundtrip() {
+        let action = GamepadInputAction::Pulse {
+            mask: BTN_MASK_A | BTN_MASK_START,
+            duration_ms: 80,
+        };
+        let json = serde_json::to_string(&action).expect("serialize pulse");
+        assert_eq!(
+            json,
+            r#"{"type":"Pulse","payload":{"mask":8208,"duration_ms":80}}"#
+        );
+        let deserialized: GamepadInputAction =
+            serde_json::from_str(&json).expect("deserialize pulse");
+        assert_eq!(deserialized, action);
+    }
+
+    #[test]
+    fn test_sandbox_commands_and_responses_roundtrip() {
+        let run_cmd = ClientCommand::RunSandbox {
+            path: "/roms/ports/2048.sh".to_string(),
+            args: vec!["--fullscreen".to_string()],
+            env: vec![("SDL_VIDEODRIVER".to_string(), "KMSDRM".to_string())],
+            cwd: Some("/roms/ports".to_string()),
+            exclusive_drm: true,
+        };
+        let run_json = serde_json::to_string(&run_cmd).expect("serialize RunSandbox");
+        let decoded_run: ClientCommand =
+            serde_json::from_str(&run_json).expect("deserialize RunSandbox");
+        assert_eq!(decoded_run, run_cmd);
+
+        let stop_cmd = ClientCommand::StopSandbox { timeout_ms: 3000 };
+        let stop_json = serde_json::to_string(&stop_cmd).expect("serialize StopSandbox");
+        let decoded_stop: ClientCommand =
+            serde_json::from_str(&stop_json).expect("deserialize StopSandbox");
+        assert_eq!(decoded_stop, stop_cmd);
+
+        let status_cmd = ClientCommand::GetSandboxStatus;
+        let status_json = serde_json::to_string(&status_cmd).expect("serialize GetSandboxStatus");
+        let decoded_status: ClientCommand =
+            serde_json::from_str(&status_json).expect("deserialize GetSandboxStatus");
+        assert_eq!(decoded_status, status_cmd);
+
+        let start_res = ServerResponse::SandboxStartResult {
+            success: true,
+            pid: Some(1234),
+            error: None,
+        };
+        let start_json = serde_json::to_string(&start_res).expect("serialize SandboxStartResult");
+        let decoded_start: ServerResponse =
+            serde_json::from_str(&start_json).expect("deserialize SandboxStartResult");
+        assert_eq!(decoded_start, start_res);
+
+        let stop_res = ServerResponse::SandboxStopResult {
+            success: true,
+            exit_code: Some(0),
+            term_signal: None,
+            restore_error: None,
+            error: None,
+        };
+        let stop_json = serde_json::to_string(&stop_res).expect("serialize SandboxStopResult");
+        let decoded_stop: ServerResponse =
+            serde_json::from_str(&stop_json).expect("deserialize SandboxStopResult");
+        assert_eq!(decoded_stop, stop_res);
+
+        let status_res = ServerResponse::SandboxStatus {
+            running: true,
+            pid: Some(1234),
+            exit_code: None,
+            term_signal: None,
+            uptime_ms: 500,
+            stdout_tail: "running ok\n".to_string(),
+            stderr_tail: String::new(),
+            restore_error: None,
+        };
+        let status_json = serde_json::to_string(&status_res).expect("serialize SandboxStatus");
+        let decoded_status: ServerResponse =
+            serde_json::from_str(&status_json).expect("deserialize SandboxStatus");
+        assert_eq!(decoded_status, status_res);
+    }
+}
+

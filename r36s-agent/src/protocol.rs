@@ -8,6 +8,7 @@ pub const VIDEO_PORT: u16 = 7366;
 pub const VIDEO_MAGIC: [u8; 4] = *b"VID0";
 pub const FORMAT_RGB565_LZ4: u8 = 1;
 pub const FORMAT_RGBA8888_LZ4: u8 = 2;
+#[allow(dead_code)]
 pub const FORMAT_RAW_RGB565: u8 = 3;
 pub const FORMAT_BGRA8888_LZ4: u8 = 4;
 
@@ -15,10 +16,11 @@ pub const FORMAT_BGRA8888_LZ4: u8 = 4;
 pub const FRAME_FLAG_KEYFRAME: u8 = 0;
 pub const FRAME_FLAG_UNCHANGED: u8 = 1;
 pub const FRAME_FLAG_FB_UNAVAILABLE: u8 = 2;
+#[allow(dead_code)]
 pub const FRAME_FLAG_MOCK: u8 = 3;
 pub const FRAME_FLAG_DELTA: u8 = 4;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ProcessInfo {
     pub pid: u32,
     pub name: String,
@@ -28,7 +30,7 @@ pub struct ProcessInfo {
     pub cpu_percent: f32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SystemMetrics {
     #[serde(default)]
     pub timestamp: u64,
@@ -54,9 +56,19 @@ pub struct SystemMetrics {
     pub fb_bpp: u8,
     #[serde(default)]
     pub fb_format: u8,
+    #[serde(default)]
+    pub cpu_core_usage: Vec<f32>,
+    #[serde(default)]
+    pub cma_total_mb: u64,
+    #[serde(default)]
+    pub cma_free_mb: u64,
+    #[serde(default)]
+    pub cma_available: bool,
+    #[serde(default)]
+    pub thermal_throttling: Option<bool>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum ClientCommand {
     Handshake {
@@ -74,6 +86,8 @@ pub enum ClientCommand {
         filename: String,
         total_size: u64,
         sha256: String,
+        #[serde(default)]
+        executable: Option<bool>,
     },
     DeployChunk {
         chunk_index: u32,
@@ -99,9 +113,25 @@ pub enum ClientCommand {
     InjectGamepadInput {
         action: GamepadInputAction,
     },
+    RunSandbox {
+        path: String,
+        #[serde(default)]
+        args: Vec<String>,
+        #[serde(default)]
+        env: Vec<(String, String)>,
+        #[serde(default)]
+        cwd: Option<String>,
+        #[serde(default)]
+        exclusive_drm: bool,
+    },
+    StopSandbox {
+        #[serde(default)]
+        timeout_ms: u64,
+    },
+    GetSandboxStatus,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type", content = "payload")]
 pub enum ServerResponse {
     HandshakeAck {
@@ -150,6 +180,41 @@ pub enum ServerResponse {
     GamepadAck {
         success: bool,
         message: String,
+    },
+    SandboxStartResult {
+        success: bool,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SandboxStopResult {
+        success: bool,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        term_signal: Option<i32>,
+        #[serde(default)]
+        restore_error: Option<String>,
+        #[serde(default)]
+        error: Option<String>,
+    },
+    SandboxStatus {
+        running: bool,
+        #[serde(default)]
+        pid: Option<u32>,
+        #[serde(default)]
+        exit_code: Option<i32>,
+        #[serde(default)]
+        term_signal: Option<i32>,
+        #[serde(default)]
+        uptime_ms: u64,
+        #[serde(default)]
+        stdout_tail: String,
+        #[serde(default)]
+        stderr_tail: String,
+        #[serde(default)]
+        restore_error: Option<String>,
     },
     Error {
         message: String,
@@ -220,6 +285,10 @@ pub enum GamepadInputAction {
         right_x: i16,
         right_y: i16,
     },
+    Pulse {
+        mask: u32,
+        duration_ms: u16,
+    },
 }
 
 #[repr(C, packed)]
@@ -269,6 +338,7 @@ impl VideoFrameHeader {
         bytes
     }
 
+    #[allow(dead_code)]
     pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
         if bytes.len() < 20 {
             return None;
@@ -295,3 +365,175 @@ impl VideoFrameHeader {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_system_metrics_roundtrip_new_fields() {
+        let metrics = SystemMetrics {
+            timestamp: 123456789,
+            cpu_usage: 45.5,
+            cpu_freq_mhz: vec![1200, 1200, 1200, 1200],
+            cpu_temp_c: Some(55.2),
+            ram_used_mb: 250,
+            ram_total_mb: 1024,
+            mali_gpu_load: Some(12.5),
+            mali_gpu_freq_mhz: Some(500),
+            active_game: Some("RetroArch".to_string()),
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: vec![40.0, 50.0, 42.0, 50.0],
+            cma_total_mb: 16,
+            cma_free_mb: 12,
+            cma_available: true,
+            thermal_throttling: Some(false),
+        };
+
+        let json = serde_json::to_string(&metrics).expect("serialize metrics");
+        let deserialized: SystemMetrics = serde_json::from_str(&json).expect("deserialize metrics");
+
+        assert_eq!(deserialized.timestamp, 123456789);
+        assert_eq!(deserialized.cpu_core_usage, vec![40.0, 50.0, 42.0, 50.0]);
+        assert_eq!(deserialized.cma_total_mb, 16);
+        assert_eq!(deserialized.cma_free_mb, 12);
+        assert!(deserialized.cma_available);
+        assert_eq!(deserialized.thermal_throttling, Some(false));
+    }
+
+    #[test]
+    fn test_system_metrics_legacy_deserialization_defaults() {
+        let legacy_json = r#"{
+            "timestamp": 123456789,
+            "cpu_usage": 35.0,
+            "cpu_freq_mhz": [1000],
+            "cpu_temp_c": 50.0,
+            "ram_used_mb": 300,
+            "ram_total_mb": 1024,
+            "mali_gpu_load": null,
+            "mali_gpu_freq_mhz": null,
+            "active_game": null,
+            "running_processes": [],
+            "fb_width": 640,
+            "fb_height": 480,
+            "fb_bpp": 16,
+            "fb_format": 1
+        }"#;
+
+        let deserialized: SystemMetrics = serde_json::from_str(legacy_json).expect("deserialize legacy metrics");
+        assert!(deserialized.cpu_core_usage.is_empty());
+        assert_eq!(deserialized.cma_total_mb, 0);
+        assert_eq!(deserialized.cma_free_mb, 0);
+        assert!(!deserialized.cma_available);
+        assert_eq!(deserialized.thermal_throttling, None);
+    }
+
+    #[test]
+    fn test_gamepad_input_action_pulse_serialization_roundtrip() {
+        let action = GamepadInputAction::Pulse {
+            mask: BTN_MASK_A | BTN_MASK_START,
+            duration_ms: 80,
+        };
+        let json = serde_json::to_string(&action).expect("serialize pulse");
+        assert_eq!(
+            json,
+            r#"{"type":"Pulse","payload":{"mask":8208,"duration_ms":80}}"#
+        );
+        let deserialized: GamepadInputAction =
+            serde_json::from_str(&json).expect("deserialize pulse");
+        assert_eq!(deserialized, action);
+    }
+
+    #[test]
+    fn test_sandbox_commands_serialization_roundtrip() {
+        let run_cmd = ClientCommand::RunSandbox {
+            path: "/roms/ports/test.sh".to_string(),
+            args: vec!["--windowed".to_string(), "arg2".to_string()],
+            env: vec![("ENV_KEY".to_string(), "ENV_VAL".to_string())],
+            cwd: Some("/roms/ports".to_string()),
+            exclusive_drm: true,
+        };
+        let run_json = serde_json::to_string(&run_cmd).expect("serialize RunSandbox");
+        let run_deserialized: ClientCommand =
+            serde_json::from_str(&run_json).expect("deserialize RunSandbox");
+        assert_eq!(run_deserialized, run_cmd);
+
+        // Test with defaults (minimal JSON)
+        let minimal_run_json = r#"{"type":"RunSandbox","payload":{"path":"/bin/ls"}}"#;
+        let minimal_run: ClientCommand =
+            serde_json::from_str(minimal_run_json).expect("deserialize minimal RunSandbox");
+        match minimal_run {
+            ClientCommand::RunSandbox {
+                path,
+                args,
+                env,
+                cwd,
+                exclusive_drm,
+            } => {
+                assert_eq!(path, "/bin/ls");
+                assert!(args.is_empty());
+                assert!(env.is_empty());
+                assert_eq!(cwd, None);
+                assert!(!exclusive_drm);
+            }
+            _ => panic!("Expected RunSandbox variant"),
+        }
+
+        let stop_cmd = ClientCommand::StopSandbox { timeout_ms: 5000 };
+        let stop_json = serde_json::to_string(&stop_cmd).expect("serialize StopSandbox");
+        let stop_deserialized: ClientCommand =
+            serde_json::from_str(&stop_json).expect("deserialize StopSandbox");
+        assert_eq!(stop_deserialized, stop_cmd);
+
+        let status_cmd = ClientCommand::GetSandboxStatus;
+        let status_json = serde_json::to_string(&status_cmd).expect("serialize GetSandboxStatus");
+        let status_deserialized: ClientCommand =
+            serde_json::from_str(&status_json).expect("deserialize GetSandboxStatus");
+        assert_eq!(status_deserialized, status_cmd);
+    }
+
+    #[test]
+    fn test_sandbox_responses_serialization_roundtrip() {
+        let start_res = ServerResponse::SandboxStartResult {
+            success: true,
+            pid: Some(4242),
+            error: None,
+        };
+        let start_json = serde_json::to_string(&start_res).expect("serialize SandboxStartResult");
+        let start_deserialized: ServerResponse =
+            serde_json::from_str(&start_json).expect("deserialize SandboxStartResult");
+        assert_eq!(start_deserialized, start_res);
+
+        let stop_res = ServerResponse::SandboxStopResult {
+            success: true,
+            exit_code: Some(0),
+            term_signal: None,
+            restore_error: None,
+            error: None,
+        };
+        let stop_json = serde_json::to_string(&stop_res).expect("serialize SandboxStopResult");
+        let stop_deserialized: ServerResponse =
+            serde_json::from_str(&stop_json).expect("deserialize SandboxStopResult");
+        assert_eq!(stop_deserialized, stop_res);
+
+        let status_res = ServerResponse::SandboxStatus {
+            running: false,
+            pid: Some(4242),
+            exit_code: None,
+            term_signal: Some(11), // SIGSEGV
+            uptime_ms: 1250,
+            stdout_tail: "initialized\nrendering frame 1\n".to_string(),
+            stderr_tail: "Segmentation fault\n".to_string(),
+            restore_error: None,
+        };
+        let status_json = serde_json::to_string(&status_res).expect("serialize SandboxStatus");
+        let status_deserialized: ServerResponse =
+            serde_json::from_str(&status_json).expect("deserialize SandboxStatus");
+        assert_eq!(status_deserialized, status_res);
+    }
+}
+

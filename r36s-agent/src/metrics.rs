@@ -6,6 +6,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub struct MetricsCollector {
     last_cpu_times: Mutex<Option<(u64, u64)>>, // (total, idle)
+    last_cpu_core_times: Mutex<Option<[(u64, u64); 4]>>, // [(total, idle); 4] cpu0..cpu3
     last_proc_times: Mutex<HashMap<u32, (u64, Instant)>>, // pid -> (ticks, instant)
     known_kthreads: Mutex<HashSet<u32>>,
     cached_processes: Mutex<Option<(Vec<ProcessInfo>, Option<String>, Instant)>>,
@@ -63,6 +64,7 @@ impl MetricsCollector {
 
         Self {
             last_cpu_times: Mutex::new(None),
+            last_cpu_core_times: Mutex::new(None),
             last_proc_times: Mutex::new(HashMap::new()),
             known_kthreads: Mutex::new(HashSet::new()),
             cached_processes: Mutex::new(None),
@@ -135,13 +137,14 @@ impl MetricsCollector {
             .unwrap_or_default()
             .as_secs();
 
-        let cpu_usage = self.calculate_cpu_usage();
+        let (cpu_usage, cpu_core_usage) = self.calculate_cpu_and_cores_usage();
         let cpu_freq_mhz = Self::collect_cpu_freqs();
         let cpu_temp_c = self.collect_cpu_temp();
-        let (ram_used_mb, ram_total_mb) = self.collect_ram();
+        let (ram_used_mb, ram_total_mb, cma_total_mb, cma_free_mb, cma_available) = self.collect_ram_and_cma();
         let (mali_gpu_load, mali_gpu_freq_mhz) = Self::collect_mali_gpu();
         let (running_processes, active_game) = self.get_cached_or_collect_processes();
         let (fb_width, fb_height, fb_bpp, fb_format) = self.get_fb_info();
+        let thermal_throttling = Self::evaluate_thermal_throttling(cpu_temp_c, cpu_usage, &cpu_freq_mhz);
 
         SystemMetrics {
             timestamp,
@@ -158,6 +161,11 @@ impl MetricsCollector {
             fb_height,
             fb_bpp,
             fb_format,
+            cpu_core_usage,
+            cma_total_mb,
+            cma_free_mb,
+            cma_available,
+            thermal_throttling,
         }
     }
 
@@ -219,13 +227,9 @@ impl MetricsCollector {
         None
     }
 
-    pub(crate) fn parse_cpu_stat(content: &str) -> Option<(u64, u64)> {
-        let first_line = content.lines().next()?;
-        let mut parts = first_line.split_whitespace();
-        if parts.next()? != "cpu" {
-            return None;
-        }
-
+    pub(crate) fn parse_cpu_line(line: &str) -> Option<(&str, u64, u64)> {
+        let mut parts = line.split_whitespace();
+        let name = parts.next()?;
         let user: u64 = parts.next()?.parse().ok()?;
         let nice: u64 = parts.next()?.parse().ok()?;
         let system: u64 = parts.next()?.parse().ok()?;
@@ -239,14 +243,93 @@ impl MetricsCollector {
         let non_idle = user + nice + system + irq + softirq + steal;
         let total = idle_all + non_idle;
 
-        Some((total, idle_all))
+        Some((name, total, idle_all))
     }
 
-    fn calculate_cpu_usage(&self) -> f32 {
+    pub(crate) fn parse_stat_cpus(content: &str) -> (Option<(u64, u64)>, Option<[(u64, u64); 4]>) {
+        let ends_with_nl = content.ends_with('\n');
+        let mut lines = content.lines().peekable();
+        let mut global_cpu = None;
+        let mut core_map: [Option<(u64, u64)>; 4] = [None, None, None, None];
+
+        while let Some(line) = lines.next() {
+            let is_last = lines.peek().is_none();
+            if is_last && !ends_with_nl {
+                // Buffer truncado no meio da linha
+                break;
+            }
+
+            if let Some((name, total, idle)) = Self::parse_cpu_line(line) {
+                if name == "cpu" {
+                    global_cpu = Some((total, idle));
+                } else if let Some(idx_str) = name.strip_prefix("cpu") {
+                    if let Ok(idx) = idx_str.parse::<usize>() {
+                        if idx < 4 {
+                            core_map[idx] = Some((total, idle));
+                        }
+                    }
+                }
+            }
+        }
+
+        let cores = match core_map {
+            [Some(c0), Some(c1), Some(c2), Some(c3)] => Some([c0, c1, c2, c3]),
+            _ => None,
+        };
+
+        (global_cpu, cores)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn parse_cpu_stat(content: &str) -> Option<(u64, u64)> {
+        Self::parse_stat_cpus(content).0
+    }
+
+    pub(crate) fn calculate_cores_usage_from_samples(
+        last_cores: &mut Option<[(u64, u64); 4]>,
+        curr_cores: Option<[(u64, u64); 4]>,
+    ) -> Vec<f32> {
+        let mut core_usages = Vec::new();
+        if let Some(curr) = curr_cores {
+            if let Some(prev) = *last_cores {
+                let mut all_valid = true;
+                let mut usages = Vec::with_capacity(4);
+                for i in 0..4 {
+                    let (curr_total, curr_idle) = curr[i];
+                    let (prev_total, prev_idle) = prev[i];
+                    let total_diff = curr_total.saturating_sub(prev_total);
+                    let idle_diff = curr_idle.saturating_sub(prev_idle);
+                    if total_diff == 0 {
+                        all_valid = false;
+                        break;
+                    }
+                    let usage = ((total_diff.saturating_sub(idle_diff) as f32
+                        / total_diff as f32)
+                        * 100.0)
+                        .clamp(0.0, 100.0);
+                    usages.push((usage * 10.0).round() / 10.0);
+                }
+                if all_valid && usages.len() == 4 {
+                    core_usages = usages;
+                }
+            }
+            *last_cores = Some(curr);
+        } else {
+            *last_cores = None;
+        }
+        core_usages
+    }
+
+    fn calculate_cpu_and_cores_usage(&self) -> (f32, Vec<f32>) {
         let mut buf = [0u8; 1024];
+        let mut global_usage = 0.0;
+        let mut core_usages = Vec::new();
+
         if let Some(n) = Self::read_file_at_zero(&self.stat_file, "/proc/stat", &mut buf) {
             if let Ok(stat_content) = std::str::from_utf8(&buf[..n]) {
-                if let Some((total, idle_all)) = Self::parse_cpu_stat(stat_content) {
+                let (global_cpu, cores) = Self::parse_stat_cpus(stat_content);
+
+                if let Some((total, idle_all)) = global_cpu {
                     let mut last = self.last_cpu_times.lock().unwrap();
                     if let Some((prev_total, prev_idle)) = *last {
                         let total_diff = total.saturating_sub(prev_total);
@@ -256,15 +339,24 @@ impl MetricsCollector {
                             let usage = (total_diff.saturating_sub(idle_diff) as f32
                                 / total_diff as f32)
                                 * 100.0;
-                            return usage.clamp(0.0, 100.0);
+                            global_usage = usage.clamp(0.0, 100.0);
                         }
                     } else {
                         *last = Some((total, idle_all));
                     }
                 }
+
+                let mut last_cores = self.last_cpu_core_times.lock().unwrap();
+                core_usages = Self::calculate_cores_usage_from_samples(&mut last_cores, cores);
             }
         }
-        0.0
+
+        (global_usage, core_usages)
+    }
+
+    #[allow(dead_code)]
+    fn calculate_cpu_usage(&self) -> f32 {
+        self.calculate_cpu_and_cores_usage().0
     }
 
     fn collect_cpu_freqs() -> Vec<u32> {
@@ -348,23 +440,89 @@ impl MetricsCollector {
         None
     }
 
-    pub(crate) fn parse_meminfo(content: &str) -> (u64, u64) {
-        let mut total_kb = 0;
-        let mut avail_kb = 0;
-        let mut free_kb = 0;
-        let mut buffers_kb = 0;
-        let mut cached_kb = 0;
+    pub(crate) fn evaluate_thermal_throttling(
+        temp_c: Option<f32>,
+        cpu_usage: f32,
+        freqs_mhz: &[u32],
+    ) -> Option<bool> {
+        if let Some(temp) = temp_c {
+            // Limiar crítico configurado: >= 80 °C indica forte suspeita de throttling térmico
+            if temp >= 80.0 {
+                return Some(true);
+            }
 
-        for line in content.lines() {
+            // Queda de frequência sob carga pesada e temperatura elevada (>= 75 °C)
+            // No RK3326 a frequência máxima é ~1.3-1.5 GHz. Se sob carga pesada (>= 80%)
+            // as frequências caírem para patamares baixos (< 1000 MHz) com temperatura elevada:
+            if temp >= 75.0 && cpu_usage >= 80.0 && !freqs_mhz.is_empty() && freqs_mhz.iter().all(|&f| f > 0 && f < 1000) {
+                return Some(true);
+            }
+
+            // Temperatura monitorada normalmente abaixo de 80 °C sem evidência de limitação
+            return Some(false);
+        }
+
+        None
+    }
+
+    pub(crate) fn parse_meminfo_ext(content: &str) -> (u64, u64, u64, u64, bool) {
+        let ends_with_nl = content.ends_with('\n');
+        let mut lines = content.lines().peekable();
+
+        let mut total_kb: u64 = 0;
+        let mut avail_kb: u64 = 0;
+        let mut free_kb: u64 = 0;
+        let mut buffers_kb: u64 = 0;
+        let mut cached_kb: u64 = 0;
+
+        let mut cma_total_kb: Option<u64> = None;
+        let mut cma_free_kb: Option<u64> = None;
+
+        while let Some(line) = lines.next() {
+            let is_last = lines.peek().is_none();
+            if is_last && !ends_with_nl {
+                // Buffer truncado no meio da linha
+                break;
+            }
+
             let mut parts = line.split_whitespace();
             if let (Some(key), Some(val_str)) = (parts.next(), parts.next()) {
-                let val: u64 = val_str.parse().unwrap_or(0);
                 match key {
-                    "MemTotal:" => total_kb = val,
-                    "MemAvailable:" => avail_kb = val,
-                    "MemFree:" => free_kb = val,
-                    "Buffers:" => buffers_kb = val,
-                    "Cached:" => cached_kb = val,
+                    "MemTotal:" => {
+                        if let Ok(v) = val_str.parse() {
+                            total_kb = v;
+                        }
+                    }
+                    "MemAvailable:" => {
+                        if let Ok(v) = val_str.parse() {
+                            avail_kb = v;
+                        }
+                    }
+                    "MemFree:" => {
+                        if let Ok(v) = val_str.parse() {
+                            free_kb = v;
+                        }
+                    }
+                    "Buffers:" => {
+                        if let Ok(v) = val_str.parse() {
+                            buffers_kb = v;
+                        }
+                    }
+                    "Cached:" => {
+                        if let Ok(v) = val_str.parse() {
+                            cached_kb = v;
+                        }
+                    }
+                    "CmaTotal:" => {
+                        if let Ok(v) = val_str.parse() {
+                            cma_total_kb = Some(v);
+                        }
+                    }
+                    "CmaFree:" => {
+                        if let Ok(v) = val_str.parse() {
+                            cma_free_kb = Some(v);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -378,17 +536,36 @@ impl MetricsCollector {
         };
         let used_mb = used_kb / 1024;
 
+        let (cma_total_mb, cma_free_mb, cma_available) = match (cma_total_kb, cma_free_kb) {
+            (Some(total), Some(free)) if free <= total => {
+                (total / 1024, free / 1024, true)
+            }
+            _ => (0, 0, false),
+        };
+
+        (used_mb, total_mb, cma_total_mb, cma_free_mb, cma_available)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn parse_meminfo(content: &str) -> (u64, u64) {
+        let (used_mb, total_mb, _, _, _) = Self::parse_meminfo_ext(content);
         (used_mb, total_mb)
     }
 
-    fn collect_ram(&self) -> (u64, u64) {
+    fn collect_ram_and_cma(&self) -> (u64, u64, u64, u64, bool) {
         let mut buf = [0u8; 2048];
         if let Some(n) = Self::read_file_at_zero(&self.meminfo_file, "/proc/meminfo", &mut buf) {
             if let Ok(content) = std::str::from_utf8(&buf[..n]) {
-                return Self::parse_meminfo(content);
+                return Self::parse_meminfo_ext(content);
             }
         }
-        (0, 0)
+        (0, 0, 0, 0, false)
+    }
+
+    #[allow(dead_code)]
+    fn collect_ram(&self) -> (u64, u64) {
+        let (used, total, _, _, _) = self.collect_ram_and_cma();
+        (used, total)
     }
 
     fn collect_mali_gpu() -> (Option<f32>, Option<u32>) {
@@ -736,6 +913,53 @@ Cached:          150000 kB\n";
     }
 
     #[test]
+    fn test_parse_cma_accuracy() {
+        // 1. Válido e conversão KiB -> MiB
+        let meminfo_valid = "MemTotal:       1024000 kB\n\
+MemFree:         200000 kB\n\
+CmaTotal:         32768 kB\n\
+CmaFree:           8192 kB\n";
+        let (_, _, cma_total, cma_free, cma_avail) = MetricsCollector::parse_meminfo_ext(meminfo_valid);
+        assert_eq!(cma_total, 32); // 32768 / 1024
+        assert_eq!(cma_free, 8);   // 8192 / 1024
+        assert!(cma_avail);
+
+        // 2. Ausência total de campos CMA
+        let meminfo_no_cma = "MemTotal:       1024000 kB\nMemFree: 200000 kB\n";
+        let (_, _, cma_total0, cma_free0, cma_avail0) = MetricsCollector::parse_meminfo_ext(meminfo_no_cma);
+        assert_eq!(cma_total0, 0);
+        assert_eq!(cma_free0, 0);
+        assert!(!cma_avail0);
+
+        // 3. Apenas CmaTotal presente (CmaFree ausente)
+        let meminfo_partial1 = "MemTotal: 1024000 kB\nCmaTotal: 16384 kB\n";
+        let (_, _, _, _, cma_avail1) = MetricsCollector::parse_meminfo_ext(meminfo_partial1);
+        assert!(!cma_avail1);
+
+        // 4. Apenas CmaFree presente (CmaTotal ausente)
+        let meminfo_partial2 = "MemTotal: 1024000 kB\nCmaFree: 8192 kB\n";
+        let (_, _, _, _, cma_avail2) = MetricsCollector::parse_meminfo_ext(meminfo_partial2);
+        assert!(!cma_avail2);
+
+        // 5. Incoerência: free > total
+        let meminfo_incoherent = "MemTotal: 1024000 kB\nCmaTotal: 8192 kB\nCmaFree: 16384 kB\n";
+        let (_, _, cma_total_inc, cma_free_inc, cma_avail_inc) = MetricsCollector::parse_meminfo_ext(meminfo_incoherent);
+        assert_eq!(cma_total_inc, 0);
+        assert_eq!(cma_free_inc, 0);
+        assert!(!cma_avail_inc);
+
+        // 6. Truncamento sem newline final
+        let meminfo_truncated = "MemTotal: 1024000 kB\nCmaTotal: 16384 kB\nCmaFree: 12"; // sem \n
+        let (_, _, _, _, cma_avail_trunc) = MetricsCollector::parse_meminfo_ext(meminfo_truncated);
+        assert!(!cma_avail_trunc);
+
+        // 7. Campo malformado
+        let meminfo_malformed = "MemTotal: 1024000 kB\nCmaTotal: 16384 kB\nCmaFree: not_a_number kB\n";
+        let (_, _, _, _, cma_avail_mal) = MetricsCollector::parse_meminfo_ext(meminfo_malformed);
+        assert!(!cma_avail_mal);
+    }
+
+    #[test]
     fn test_parse_cpu_temp() {
         // Millidegrees (typical on Linux thermal sysfs, e.g. 48500 = 48.5C)
         assert_eq!(MetricsCollector::parse_cpu_temp("48500\n"), Some(48.5));
@@ -745,6 +969,155 @@ Cached:          150000 kB\n";
         assert_eq!(MetricsCollector::parse_cpu_temp("0\n"), None);
         // Invalid non-numeric
         assert_eq!(MetricsCollector::parse_cpu_temp("invalid"), None);
+    }
+
+    #[test]
+    fn test_evaluate_thermal_throttling() {
+        // 1. Estado Some(true): temperatura alcança ou ultrapassa 80 °C
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(Some(80.0), 30.0, &[1200]),
+            Some(true)
+        );
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(Some(85.5), 95.0, &[600, 600, 600, 600]),
+            Some(true)
+        );
+
+        // 2. Estado Some(true): queda de frequência sob carga (>= 80%) e temperatura elevada (>= 75 °C)
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(Some(76.5), 88.0, &[816, 816, 816, 816]),
+            Some(true)
+        );
+
+        // 3. Estado Some(false): clock baixo em repouso/idle NÃO deve acusar throttling
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(Some(76.0), 15.0, &[600, 600, 600, 600]),
+            Some(false)
+        );
+
+        // 4. Estado Some(false): temperatura elevada mas frequências normais máximas
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(Some(76.0), 90.0, &[1200, 1200, 1200, 1200]),
+            Some(false)
+        );
+
+        // 5. Estado Some(false): operação normal fria
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(Some(55.0), 50.0, &[1200, 1200]),
+            Some(false)
+        );
+
+        // 6. Estado None: sem evidência térmica (sensor indisponível)
+        assert_eq!(
+            MetricsCollector::evaluate_thermal_throttling(None, 90.0, &[600, 600]),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_stat_cpus_and_order() {
+        // Out-of-order cpu cores in /proc/stat
+        let sample = "cpu  400 0 100 500 0 0 0 0 0 0\n\
+cpu2 200 0 50 250 0 0 0 0 0 0\n\
+cpu0 100 0 50 350 0 0 0 0 0 0\n\
+cpu3 300 0 100 100 0 0 0 0 0 0\n\
+cpu1 150 0 50 300 0 0 0 0 0 0\n\
+intr 987654\n";
+
+        let (global, cores) = MetricsCollector::parse_stat_cpus(sample);
+        assert_eq!(global, Some((1000, 500))); // total: 1000, idle: 500
+        assert!(cores.is_some());
+        let c = cores.unwrap();
+        // cpu0: non_idle = 150, idle = 350, total = 500
+        assert_eq!(c[0], (500, 350));
+        // cpu1: non_idle = 200, idle = 300, total = 500
+        assert_eq!(c[1], (500, 300));
+        // cpu2: non_idle = 250, idle = 250, total = 500
+        assert_eq!(c[2], (500, 250));
+        // cpu3: non_idle = 400, idle = 100, total = 500
+        assert_eq!(c[3], (500, 100));
+    }
+
+    #[test]
+    fn test_parse_stat_cpus_truncated_and_missing() {
+        // Missing cpu3
+        let sample_missing = "cpu  100 0 0 100\n\
+cpu0 25 0 0 25\n\
+cpu1 25 0 0 25\n\
+cpu2 25 0 0 25\n";
+        let (_, cores) = MetricsCollector::parse_stat_cpus(sample_missing);
+        assert_eq!(cores, None, "Amostra sem cpu3 deve ser None");
+
+        // Truncated line without trailing newline
+        let sample_truncated = "cpu  100 0 0 100\n\
+cpu0 25 0 0 25\n\
+cpu1 25 0 0 25\n\
+cpu2 25 0 0 25\n\
+cpu3 25 0"; // no newline, cut off
+        let (_, cores2) = MetricsCollector::parse_stat_cpus(sample_truncated);
+        assert_eq!(cores2, None, "Amostra truncada sem newline deve ser descartada");
+
+        // Malformed line
+        let sample_malformed = "cpu  100 0 0 100\n\
+cpu0 25 0 0 25\n\
+cpu1 25 0 0 25\n\
+cpu2 25 0 0 25\n\
+cpu3 25 invalid 0 25\n";
+        let (_, cores3) = MetricsCollector::parse_stat_cpus(sample_malformed);
+        assert_eq!(cores3, None, "Amostra com dados inválidos deve ser None");
+    }
+
+    #[test]
+    fn test_calculate_cores_usage_deltas_delta_zero_and_limits() {
+        let mut last_cores = None;
+
+        let sample1 = Some([
+            (1000, 800), // cpu0
+            (1000, 700), // cpu1
+            (1000, 600), // cpu2
+            (1000, 500), // cpu3
+        ]);
+
+        // Primeira amostra: não há delta anterior, deve retornar vazio
+        let usage1 = MetricsCollector::calculate_cores_usage_from_samples(&mut last_cores, sample1);
+        assert!(usage1.is_empty(), "Primeira amostra deve ser vazia");
+
+        let sample2 = Some([
+            (1100, 850), // diff: total 100, idle 50 -> non_idle 50 -> 50.0%
+            (1100, 720), // diff: total 100, idle 20 -> non_idle 80 -> 80.0%
+            (1100, 690), // diff: total 100, idle 90 -> non_idle 10 -> 10.0%
+            (1100, 500), // diff: total 100, idle 0  -> non_idle 100 -> 100.0%
+        ]);
+
+        // Segunda amostra: 4 cores calculados na ordem
+        let usage2 = MetricsCollector::calculate_cores_usage_from_samples(&mut last_cores, sample2);
+        assert_eq!(usage2, vec![50.0, 80.0, 10.0, 100.0]);
+
+        // Terceira amostra: delta zero (valores idênticos à amostra 2)
+        let usage3 = MetricsCollector::calculate_cores_usage_from_samples(&mut last_cores, sample2);
+        assert!(usage3.is_empty(), "Delta zero deve retornar vazio sem fabricar 0%");
+
+        // Amostra com wrap / total < idle ou valores extremos: clamp 0..100
+        let sample_prev = Some([
+            (1000, 1000),
+            (1000, 1000),
+            (1000, 1000),
+            (1000, 1000),
+        ]);
+        let mut last_cores_clamp = sample_prev;
+        let sample_clamp = Some([
+            (1100, 1200), // idle_diff maior que total_diff (underflow/wrap)
+            (1100, 900),  // total 100, idle 0 -> 100%
+            (1100, 1100), // total 100, idle 100 -> 0%
+            (1100, 1050), // total 100, idle 50 -> 50%
+        ]);
+        let usage_clamp = MetricsCollector::calculate_cores_usage_from_samples(&mut last_cores_clamp, sample_clamp);
+        assert_eq!(usage_clamp, vec![0.0, 100.0, 0.0, 50.0]);
+
+        // Amostra incompleta após amostra válida reseta last_cores
+        let usage_none = MetricsCollector::calculate_cores_usage_from_samples(&mut last_cores_clamp, None);
+        assert!(usage_none.is_empty());
+        assert_eq!(last_cores_clamp, None);
     }
 
     #[test]
@@ -759,3 +1132,4 @@ Cached:          150000 kB\n";
         }
     }
 }
+

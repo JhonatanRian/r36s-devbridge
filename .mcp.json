@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "r36s-devbridge": {
+      "command": "./app",
+      "args": [
+        "--mcp"
+      ]
+    }
+  }
+}

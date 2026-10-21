@@ -2,7 +2,7 @@ use crate::protocol::*;
 use std::fs;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{SocketAddr, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -44,6 +44,7 @@ pub struct DecodedFrame {
     pub timestamp: Instant,
 }
 
+#[derive(Clone)]
 pub struct ConnectionManager {
     pub status: Arc<Mutex<ConnectionStatus>>,
     pub metrics: Arc<Mutex<Option<SystemMetrics>>>,
@@ -61,11 +62,20 @@ pub struct ConnectionManager {
     pub total_bytes_rx: Arc<AtomicU64>,
     pub total_bytes_tx: Arc<AtomicU64>,
     pub gamepad_supported: Arc<AtomicBool>,
+    pub gamepad_pulse_supported: Arc<AtomicBool>,
     pub gamepad_listening: Arc<AtomicBool>,
     pub gamepad_input_enabled: Arc<AtomicBool>,
     pub gamepad_state: Arc<Mutex<GamepadState>>,
+    pub sandbox_supported: Arc<AtomicBool>,
+    pub sandbox_start_result: Arc<Mutex<Option<(bool, Option<u32>, Option<String>)>>>,
+    pub sandbox_stop_result: Arc<Mutex<Option<(bool, Option<i32>, Option<i32>, Option<String>, Option<String>)>>>,
+    pub sandbox_status: Arc<Mutex<Option<ServerResponse>>>,
     pub egui_ctx: Arc<Mutex<Option<egui::Context>>>,
     cmd_sender: Sender<ClientCommand>,
+    pub session_generation: Arc<AtomicU64>,
+    pub sequence_running: Arc<AtomicBool>,
+    pub automation_buttons: Arc<AtomicU32>,
+    pub response_broadcaster: Arc<Mutex<Vec<Sender<(u64, ServerResponse)>>>>,
 }
 
 impl ConnectionManager {
@@ -89,12 +99,22 @@ impl ConnectionManager {
         let total_bytes_rx = Arc::new(AtomicU64::new(0));
         let total_bytes_tx = Arc::new(AtomicU64::new(0));
         let gamepad_supported = Arc::new(AtomicBool::new(false));
+        let gamepad_pulse_supported = Arc::new(AtomicBool::new(false));
         let gamepad_listening = Arc::new(AtomicBool::new(true));
         let gamepad_input_enabled = Arc::new(AtomicBool::new(false));
         let gamepad_state = Arc::new(Mutex::new(GamepadState::default()));
+        let sandbox_supported = Arc::new(AtomicBool::new(false));
+        let sandbox_start_result = Arc::new(Mutex::new(None));
+        let sandbox_stop_result = Arc::new(Mutex::new(None));
+        let sandbox_status = Arc::new(Mutex::new(None));
         let egui_ctx = Arc::new(Mutex::new(None));
 
         let (cmd_tx, cmd_rx) = channel::<ClientCommand>();
+
+        let session_generation = Arc::new(AtomicU64::new(0));
+        let sequence_running = Arc::new(AtomicBool::new(false));
+        let automation_buttons = Arc::new(AtomicU32::new(0));
+        let response_broadcaster = Arc::new(Mutex::new(Vec::new()));
 
         let mgr = Self {
             status: Arc::clone(&status),
@@ -113,11 +133,20 @@ impl ConnectionManager {
             total_bytes_rx: Arc::clone(&total_bytes_rx),
             total_bytes_tx: Arc::clone(&total_bytes_tx),
             gamepad_supported: Arc::clone(&gamepad_supported),
+            gamepad_pulse_supported: Arc::clone(&gamepad_pulse_supported),
             gamepad_listening: Arc::clone(&gamepad_listening),
             gamepad_input_enabled: Arc::clone(&gamepad_input_enabled),
             gamepad_state: Arc::clone(&gamepad_state),
+            sandbox_supported: Arc::clone(&sandbox_supported),
+            sandbox_start_result: Arc::clone(&sandbox_start_result),
+            sandbox_stop_result: Arc::clone(&sandbox_stop_result),
+            sandbox_status: Arc::clone(&sandbox_status),
             egui_ctx: Arc::clone(&egui_ctx),
             cmd_sender: cmd_tx,
+            session_generation: Arc::clone(&session_generation),
+            sequence_running: Arc::clone(&sequence_running),
+            automation_buttons: Arc::clone(&automation_buttons),
+            response_broadcaster: Arc::clone(&response_broadcaster),
         };
 
         // Thread medidora de throughput KB/s
@@ -148,9 +177,18 @@ impl ConnectionManager {
         let bytes_rx_cl = Arc::clone(&total_bytes_rx);
         let gp_listening_cl = Arc::clone(&gamepad_listening);
         let gp_supported_cl = Arc::clone(&gamepad_supported);
+        let gp_pulse_cl = Arc::clone(&gamepad_pulse_supported);
         let gp_input_cl = Arc::clone(&gamepad_input_enabled);
         let gp_state_cl = Arc::clone(&gamepad_state);
         let egui_ctx_ctrl = Arc::clone(&egui_ctx);
+        let session_gen_cl = Arc::clone(&session_generation);
+        let seq_running_cl = Arc::clone(&sequence_running);
+        let auto_btns_cl = Arc::clone(&automation_buttons);
+        let resp_broadcaster_cl = Arc::clone(&response_broadcaster);
+        let sb_supported_cl = Arc::clone(&sandbox_supported);
+        let sb_start_cl = Arc::clone(&sandbox_start_result);
+        let sb_stop_cl = Arc::clone(&sandbox_stop_result);
+        let sb_status_cl = Arc::clone(&sandbox_status);
 
         thread::spawn(move || {
             Self::control_worker(
@@ -167,8 +205,17 @@ impl ConnectionManager {
                 gp_listening_cl,
                 gp_state_cl,
                 gp_supported_cl,
+                gp_pulse_cl,
                 gp_input_cl,
                 egui_ctx_ctrl,
+                session_gen_cl,
+                seq_running_cl,
+                auto_btns_cl,
+                resp_broadcaster_cl,
+                sb_supported_cl,
+                sb_start_cl,
+                sb_stop_cl,
+                sb_status_cl,
             );
         });
 
@@ -196,6 +243,48 @@ impl ConnectionManager {
         });
 
         mgr
+    }
+
+    #[doc(hidden)]
+    pub fn new_mock() -> (Self, Receiver<ClientCommand>) {
+        let (cmd_tx, cmd_rx) = channel::<ClientCommand>();
+        let mgr = Self {
+            status: Arc::new(Mutex::new(ConnectionStatus::Connected {
+                target: "127.0.0.1".into(),
+                latency_ms: 0.1,
+                agent_version: "0.2.9".into(),
+            })),
+            metrics: Arc::new(Mutex::new(None)),
+            current_frame: Arc::new(Mutex::new(None)),
+            last_video_frame: Arc::new(Mutex::new(None)),
+            last_logs: Arc::new(Mutex::new(None)),
+            deploy_status: Arc::new(Mutex::new(None)),
+            deploy_progress: Arc::new(Mutex::new(0.0)),
+            is_streaming: Arc::new(AtomicBool::new(false)),
+            video_connected: Arc::new(AtomicBool::new(false)),
+            current_fps: Arc::new(Mutex::new(0.0)),
+            throughput_kbps: Arc::new(Mutex::new(0.0)),
+            diag_logs: Arc::new(Mutex::new(Vec::new())),
+            last_process_result: Arc::new(Mutex::new(None)),
+            total_bytes_rx: Arc::new(AtomicU64::new(0)),
+            total_bytes_tx: Arc::new(AtomicU64::new(0)),
+            gamepad_supported: Arc::new(AtomicBool::new(true)),
+            gamepad_pulse_supported: Arc::new(AtomicBool::new(true)),
+            gamepad_listening: Arc::new(AtomicBool::new(false)),
+            gamepad_input_enabled: Arc::new(AtomicBool::new(false)),
+            gamepad_state: Arc::new(Mutex::new(GamepadState::default())),
+            sandbox_supported: Arc::new(AtomicBool::new(true)),
+            sandbox_start_result: Arc::new(Mutex::new(None)),
+            sandbox_stop_result: Arc::new(Mutex::new(None)),
+            sandbox_status: Arc::new(Mutex::new(None)),
+            egui_ctx: Arc::new(Mutex::new(None)),
+            cmd_sender: cmd_tx,
+            session_generation: Arc::new(AtomicU64::new(1)),
+            sequence_running: Arc::new(AtomicBool::new(false)),
+            automation_buttons: Arc::new(AtomicU32::new(0)),
+            response_broadcaster: Arc::new(Mutex::new(Vec::new())),
+        };
+        (mgr, cmd_rx)
     }
 
     pub fn set_egui_ctx(&self, ctx: egui::Context) {
@@ -240,10 +329,131 @@ impl ConnectionManager {
             InputMode::Off
         });
     }
-    pub fn send_gamepad_action(&self, action: GamepadInputAction) {
-        if self.gamepad_input_enabled.load(Ordering::Relaxed) {
-            self.send_command(ClientCommand::InjectGamepadInput { action });
+    pub fn is_gamepad_pulse_supported(&self) -> bool {
+        self.gamepad_pulse_supported.load(Ordering::Relaxed)
+    }
+
+    pub fn send_gamepad_action(&self, action: GamepadInputAction) -> bool {
+        if !self.gamepad_input_enabled.load(Ordering::Relaxed) {
+            return false;
         }
+        if matches!(action, GamepadInputAction::Pulse { .. }) && !self.is_gamepad_pulse_supported() {
+            Self::add_diag(
+                &self.diag_logs,
+                "Pulso atômico rejeitado: agente não suporta gamepad-pulse-v1",
+            );
+            return false;
+        }
+        self.send_command(ClientCommand::InjectGamepadInput { action });
+        true
+    }
+
+    pub fn is_sandbox_supported(&self) -> bool {
+        self.sandbox_supported.load(Ordering::Relaxed)
+    }
+
+    pub fn run_sandbox(
+        &self,
+        path: String,
+        args: Vec<String>,
+        env: Vec<(String, String)>,
+        cwd: Option<String>,
+        exclusive_drm: bool,
+    ) {
+        self.send_command(ClientCommand::RunSandbox {
+            path,
+            args,
+            env,
+            cwd,
+            exclusive_drm,
+        });
+    }
+
+    pub fn stop_sandbox(&self, timeout_ms: u64) {
+        self.send_command(ClientCommand::StopSandbox { timeout_ms });
+    }
+
+    pub fn get_sandbox_status(&self) {
+        self.send_command(ClientCommand::GetSandboxStatus);
+    }
+
+    pub fn subscribe_responses(&self) -> Receiver<(u64, ServerResponse)> {
+        let (tx, rx) = channel();
+        self.response_broadcaster.lock().unwrap().push(tx);
+        rx
+    }
+
+    pub fn broadcast_response(&self, gen: u64, resp: &ServerResponse) {
+        let mut subs = self.response_broadcaster.lock().unwrap();
+        subs.retain(|tx| tx.send((gen, resp.clone())).is_ok());
+    }
+
+    pub fn current_input_mode(&self) -> InputMode {
+        if self.gamepad_listening.load(Ordering::Relaxed) {
+            InputMode::Listen
+        } else if self.gamepad_input_enabled.load(Ordering::Relaxed) {
+            InputMode::Send
+        } else {
+            InputMode::Off
+        }
+    }
+
+    pub fn request_repaint(&self) {
+        if let Some(ctx) = self.egui_ctx.lock().unwrap().as_ref() {
+            ctx.request_repaint();
+        }
+    }
+
+    pub fn execute_input_sequence(
+        &self,
+        steps: Vec<crate::sequence::SequenceStep>,
+    ) -> Result<crate::sequence::SequenceHandle, crate::sequence::SequenceError> {
+        {
+            let st = self.status.lock().unwrap();
+            if !matches!(*st, ConnectionStatus::Connected { .. }) {
+                return Err(crate::sequence::SequenceError::NotConnected);
+            }
+        }
+
+        if self
+            .sequence_running
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Err(crate::sequence::SequenceError::AlreadyRunning);
+        }
+
+        let pulse_supported = self.is_gamepad_pulse_supported();
+        if let Err(e) = crate::sequence::validate_sequence(&steps, pulse_supported) {
+            self.sequence_running.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+
+        let prior_mode = self.current_input_mode();
+        let session_gen = self.session_generation.load(Ordering::SeqCst);
+        let cancel_token = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(crate::sequence::SequenceStatus::Pending));
+
+        let cancel_token_worker = Arc::clone(&cancel_token);
+        let status_worker = Arc::clone(&status);
+        let conn_clone = self.clone();
+
+        let thread_handle = thread::spawn(move || {
+            crate::sequence::run_sequence_worker(
+                steps,
+                conn_clone,
+                session_gen,
+                cancel_token_worker,
+                status_worker,
+                prior_mode,
+            )
+        });
+
+        Ok(crate::sequence::SequenceHandle {
+            cancel_token,
+            status,
+            thread_handle: Some(thread_handle),
+        })
     }
 
     fn add_diag(diag: &Arc<Mutex<Vec<String>>>, msg: &str) {
@@ -416,15 +626,32 @@ impl ConnectionManager {
         gamepad_listening: Arc<AtomicBool>,
         gamepad_state: Arc<Mutex<GamepadState>>,
         gamepad_supported: Arc<AtomicBool>,
+        gamepad_pulse_supported: Arc<AtomicBool>,
         gamepad_input: Arc<AtomicBool>,
         egui_ctx: Arc<Mutex<Option<egui::Context>>>,
+        session_generation: Arc<AtomicU64>,
+        sequence_running: Arc<AtomicBool>,
+        automation_buttons: Arc<AtomicU32>,
+        response_broadcaster: Arc<Mutex<Vec<Sender<(u64, ServerResponse)>>>>,
+        sandbox_supported: Arc<AtomicBool>,
+        sandbox_start_result: Arc<Mutex<Option<(bool, Option<u32>, Option<String>)>>>,
+        sandbox_stop_result: Arc<Mutex<Option<(bool, Option<i32>, Option<i32>, Option<String>, Option<String>)>>>,
+        sandbox_status: Arc<Mutex<Option<ServerResponse>>>,
     ) {
         let target_ip = "192.168.7.2";
         let target_addr: SocketAddr = format!("{}:{}", target_ip, CONTROL_PORT).parse().unwrap();
 
         loop {
+            session_generation.fetch_add(1, Ordering::SeqCst);
+            sequence_running.store(false, Ordering::SeqCst);
+            automation_buttons.store(0, Ordering::Relaxed);
             gamepad_supported.store(false, Ordering::Relaxed);
+            gamepad_pulse_supported.store(false, Ordering::Relaxed);
             gamepad_input.store(false, Ordering::Relaxed);
+            sandbox_supported.store(false, Ordering::Relaxed);
+            *sandbox_start_result.lock().unwrap() = None;
+            *sandbox_stop_result.lock().unwrap() = None;
+            *sandbox_status.lock().unwrap() = None;
             *gamepad_state.lock().unwrap() = GamepadState::default();
             *metrics.lock().unwrap() = None;
             while cmd_rx.try_recv().is_ok() {} // Never replay input from a previous session.
@@ -513,6 +740,14 @@ impl ConnectionManager {
                                     capabilities.iter().any(|c| c == "gamepad-v2"),
                                     Ordering::Relaxed,
                                 );
+                                gamepad_pulse_supported.store(
+                                    capabilities.iter().any(|c| c == "gamepad-pulse-v1"),
+                                    Ordering::Relaxed,
+                                );
+                                sandbox_supported.store(
+                                    capabilities.iter().any(|c| c == "sandbox-v1"),
+                                    Ordering::Relaxed,
+                                );
                                 Self::add_diag(
                                     &diag,
                                     &format!(
@@ -586,10 +821,15 @@ impl ConnectionManager {
                                     &status,
                                     &Arc::new(Mutex::new(None)),
                                     &egui_ctx,
+                                    &sandbox_start_result,
+                                    &sandbox_stop_result,
+                                    &sandbox_status,
                                 );
                             }
                         }
                     }
+
+                    let session_gen = session_generation.fetch_add(1, Ordering::SeqCst) + 1;
 
                     Self::run_control_session(
                         stream,
@@ -607,6 +847,11 @@ impl ConnectionManager {
                         &gamepad_state,
                         &gamepad_supported,
                         &egui_ctx,
+                        session_gen,
+                        &response_broadcaster,
+                        &sandbox_start_result,
+                        &sandbox_stop_result,
+                        &sandbox_status,
                     );
                 }
                 Err(error) => {
@@ -638,6 +883,11 @@ impl ConnectionManager {
         gamepad_state: &Arc<Mutex<GamepadState>>,
         _gamepad_supported: &Arc<AtomicBool>,
         egui_ctx: &Arc<Mutex<Option<egui::Context>>>,
+        session_gen: u64,
+        response_broadcaster: &Arc<Mutex<Vec<Sender<(u64, ServerResponse)>>>>,
+        sandbox_start_result: &Arc<Mutex<Option<(bool, Option<u32>, Option<String>)>>>,
+        sandbox_stop_result: &Arc<Mutex<Option<(bool, Option<i32>, Option<i32>, Option<String>, Option<String>)>>>,
+        sandbox_status: &Arc<Mutex<Option<ServerResponse>>>,
     ) {
         let is_running = Arc::new(AtomicBool::new(true));
         let pending_ping_start = Arc::new(Mutex::new(None));
@@ -653,6 +903,10 @@ impl ConnectionManager {
         let bytes_rx_reader = Arc::clone(bytes_rx);
         let pending_ping_reader = Arc::clone(&pending_ping_start);
         let egui_ctx_reader = Arc::clone(egui_ctx);
+        let response_broadcaster_reader = Arc::clone(response_broadcaster);
+        let sandbox_start_reader = Arc::clone(sandbox_start_result);
+        let sandbox_stop_reader = Arc::clone(sandbox_stop_result);
+        let sandbox_status_reader = Arc::clone(sandbox_status);
 
         let reader_handle = thread::spawn(move || {
             let mut reader = reader;
@@ -665,6 +919,10 @@ impl ConnectionManager {
                     }
                     Ok(n) => {
                         bytes_rx_reader.fetch_add(n as u64, Ordering::Relaxed);
+                        if let Ok(resp) = serde_json::from_str::<ServerResponse>(line.trim()) {
+                            let mut subs = response_broadcaster_reader.lock().unwrap();
+                            subs.retain(|tx| tx.send((session_gen, resp.clone())).is_ok());
+                        }
                         Self::process_response(
                             &line,
                             &metrics_reader,
@@ -676,6 +934,9 @@ impl ConnectionManager {
                             &status_reader,
                             &pending_ping_reader,
                             &egui_ctx_reader,
+                            &sandbox_start_reader,
+                            &sandbox_stop_reader,
+                            &sandbox_status_reader,
                         );
                     }
                     Err(e) => {
@@ -760,6 +1021,9 @@ impl ConnectionManager {
         status: &Arc<Mutex<ConnectionStatus>>,
         pending_ping_start: &Arc<Mutex<Option<Instant>>>,
         egui_ctx: &Arc<Mutex<Option<egui::Context>>>,
+        sandbox_start_result: &Arc<Mutex<Option<(bool, Option<u32>, Option<String>)>>>,
+        sandbox_stop_result: &Arc<Mutex<Option<(bool, Option<i32>, Option<i32>, Option<String>, Option<String>)>>>,
+        sandbox_status: &Arc<Mutex<Option<ServerResponse>>>,
     ) {
         match serde_json::from_str::<ServerResponse>(raw.trim()) {
             Ok(resp) => match resp {
@@ -842,6 +1106,37 @@ impl ConnectionManager {
                         let mut state = gamepad_state.lock().unwrap();
                         state.error = Some(message);
                         state.input_enabled = false;
+                    }
+                }
+                ServerResponse::SandboxStartResult {
+                    success,
+                    pid,
+                    error,
+                } => {
+                    let mut r = sandbox_start_result.lock().unwrap();
+                    *r = Some((success, pid, error));
+                    if let Some(ctx) = egui_ctx.lock().unwrap().as_ref() {
+                        ctx.request_repaint();
+                    }
+                }
+                ServerResponse::SandboxStopResult {
+                    success,
+                    exit_code,
+                    term_signal,
+                    restore_error,
+                    error,
+                } => {
+                    let mut r = sandbox_stop_result.lock().unwrap();
+                    *r = Some((success, exit_code, term_signal, restore_error, error));
+                    if let Some(ctx) = egui_ctx.lock().unwrap().as_ref() {
+                        ctx.request_repaint();
+                    }
+                }
+                ServerResponse::SandboxStatus { .. } => {
+                    let mut r = sandbox_status.lock().unwrap();
+                    *r = Some(resp);
+                    if let Some(ctx) = egui_ctx.lock().unwrap().as_ref() {
+                        ctx.request_repaint();
                     }
                 }
                 _ => {}
@@ -1004,23 +1299,12 @@ impl ConnectionManager {
                                     }
 
                                     // Converte para RGBA8888 a partir do buffer de referência reconstruído
-                                    let rgba = match header.format {
-                                        FORMAT_RGB565_LZ4 => Self::rgb565_to_rgba(
-                                            &raw_reference_buffer,
-                                            header.width as usize,
-                                            header.height as usize,
-                                        ),
-                                        FORMAT_BGRA8888_LZ4 => {
-                                            let mut buf = raw_reference_buffer.clone();
-                                            Self::bgra_to_rgba_inplace(&mut buf);
-                                            buf
-                                        }
-                                        _ => {
-                                            let mut buf = raw_reference_buffer.clone();
-                                            Self::sanitize_rgba_alpha(&mut buf);
-                                            buf
-                                        }
-                                    };
+                                    let rgba = Self::decode_raw_to_rgba(
+                                        header.format,
+                                        header.width as usize,
+                                        header.height as usize,
+                                        &raw_reference_buffer,
+                                    );
 
                                     let frame = DecodedFrame {
                                         frame_index: header.frame_index,
@@ -1058,6 +1342,27 @@ impl ConnectionManager {
                     raw_reference_buffer.clear();
                     thread::sleep(Duration::from_millis(500));
                 }
+            }
+        }
+    }
+
+    pub fn decode_raw_to_rgba(
+        format: u8,
+        width: usize,
+        height: usize,
+        raw_buffer: &[u8],
+    ) -> Vec<u8> {
+        match format {
+            FORMAT_RGB565_LZ4 => Self::rgb565_to_rgba(raw_buffer, width, height),
+            FORMAT_BGRA8888_LZ4 => {
+                let mut buf = raw_buffer.to_vec();
+                Self::bgra_to_rgba_inplace(&mut buf);
+                buf
+            }
+            _ => {
+                let mut buf = raw_buffer.to_vec();
+                Self::sanitize_rgba_alpha(&mut buf);
+                buf
             }
         }
     }

@@ -1,9 +1,15 @@
 pub mod app;
+pub mod bridge;
+pub mod cli;
 pub mod connection;
 pub mod deploy_tab;
 pub mod gamepad_panel;
+pub mod hub;
+pub mod ipc;
 pub mod logs_tab;
+pub mod mcp;
 pub mod process_tab;
 pub mod protocol;
+pub mod sequence;
 pub mod telemetry;
 pub mod viewport;

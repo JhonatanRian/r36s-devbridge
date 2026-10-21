@@ -1,12 +1,4 @@
-mod deploy;
-mod framebuffer;
-mod gamepad;
-mod metrics;
-mod process;
-mod protocol;
-mod server;
-
-use server::AgentServer;
+use r36s_agent::server::AgentServer;
 
 fn main() {
     println!("========================================");

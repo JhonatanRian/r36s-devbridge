@@ -9,7 +9,11 @@ r36s-port/payload.zip
 gaps.md
 plan.md
 implementation_plan.md
-.agents/
+plan-chapters.md
+.agents/*
+!.agents/skills/
+.agents/skills/*
+!.agents/skills/r36s-dev/
 openspec/
 *.zip
 __pycache__/

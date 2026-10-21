@@ -40,9 +40,36 @@ fn test_command_json_serialization() {
 #[test]
 fn test_metrics_collector() {
     let collector = MetricsCollector::new();
-    let metrics = collector.collect();
-    assert!(metrics.ram_total_mb > 0, "RAM total deve ser maior que 0");
-    assert!(metrics.cpu_usage >= 0.0 && metrics.cpu_usage <= 100.0, "Uso de CPU deve estar entre 0 e 100");
+    let metrics1 = collector.collect();
+    assert!(metrics1.ram_total_mb > 0, "RAM total deve ser maior que 0");
+    assert!(metrics1.cpu_usage >= 0.0 && metrics1.cpu_usage <= 100.0, "Uso de CPU deve estar entre 0 e 100");
+
+    // Primeira amostra: cpu_core_usage deve iniciar vazio pois ainda não há delta
+    assert!(metrics1.cpu_core_usage.is_empty(), "Primeira amostra não deve inventar dados de núcleo");
+
+    // Simula intervalo e executa segunda coleta
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    let metrics2 = collector.collect();
+    assert!(metrics2.ram_total_mb > 0);
+    assert!(metrics2.cpu_usage >= 0.0 && metrics2.cpu_usage <= 100.0);
+
+    // Na segunda amostra em sistema Linux com pelo menos 4 núcleos, cpu_core_usage terá 4 itens
+    #[cfg(target_os = "linux")]
+    {
+        if metrics2.cpu_core_usage.len() == 4 {
+            for &core in &metrics2.cpu_core_usage {
+                assert!(core >= 0.0 && core <= 100.0, "Uso por núcleo deve estar entre 0 e 100%");
+            }
+        }
+    }
+
+    // CMA pode estar ativa ou não dependendo do kernel host/target
+    if metrics2.cma_available {
+        assert!(metrics2.cma_free_mb <= metrics2.cma_total_mb);
+    } else {
+        assert_eq!(metrics2.cma_total_mb, 0);
+        assert_eq!(metrics2.cma_free_mb, 0);
+    }
 }
 
 #[test]
@@ -147,6 +174,7 @@ fn test_gamepad_push_events_and_concurrent_control_stream() {
     let metrics = Arc::new(MetricsCollector::new());
     let gamepad = Arc::new(r36s_agent::gamepad::GamepadService::new());
     let gamepad_clone = Arc::clone(&gamepad);
+    let sandbox = Arc::new(r36s_agent::process::SandboxManager::new());
 
     let server_handle = std::thread::spawn(move || {
         let (stream, _) = listener.accept().unwrap();
@@ -158,6 +186,7 @@ fn test_gamepad_push_events_and_concurrent_control_stream() {
             1,
             metrics,
             gamepad,
+            sandbox,
         );
     });
 
@@ -175,7 +204,13 @@ fn test_gamepad_push_events_and_concurrent_control_stream() {
     stream.write_all(hs_cmd.as_bytes()).unwrap();
     let mut line = String::new();
     reader.read_line(&mut line).unwrap();
-    assert!(line.contains("HandshakeAck"));
+    let ack: ServerResponse = serde_json::from_str(line.trim()).unwrap();
+    if let ServerResponse::HandshakeAck { capabilities, .. } = ack {
+        assert!(capabilities.contains(&"gamepad-v2".to_string()));
+        assert!(capabilities.contains(&"gamepad-pulse-v1".to_string()));
+    } else {
+        panic!("Esperava HandshakeAck");
+    }
 
     // 2. SetGamepadMonitor { enabled: true }
     let mon_cmd =
@@ -223,5 +258,35 @@ fn test_gamepad_push_events_and_concurrent_control_stream() {
     drop(stream);
     drop(reader);
     server_handle.join().unwrap();
+}
+
+#[test]
+fn test_gamepad_pulse_json_tagged_serialization_compatibility() {
+    let action = GamepadInputAction::Pulse {
+        mask: BTN_MASK_A | BTN_MASK_START,
+        duration_ms: 80,
+    };
+    let json = serde_json::to_string(&action).expect("serialize Pulse");
+    assert_eq!(
+        json,
+        r#"{"type":"Pulse","payload":{"mask":8208,"duration_ms":80}}"#
+    );
+    let decoded: GamepadInputAction = serde_json::from_str(&json).expect("deserialize Pulse");
+    assert_eq!(decoded, action);
+
+    // Also verify ClientCommand::InjectGamepadInput wrap
+    let cmd = ClientCommand::InjectGamepadInput { action: action.clone() };
+    let cmd_json = serde_json::to_string(&cmd).expect("serialize ClientCommand");
+    assert_eq!(
+        cmd_json,
+        r#"{"type":"InjectGamepadInput","payload":{"action":{"type":"Pulse","payload":{"mask":8208,"duration_ms":80}}}}"#
+    );
+    let decoded_cmd: ClientCommand = serde_json::from_str(&cmd_json).expect("deserialize ClientCommand");
+    match decoded_cmd {
+        ClientCommand::InjectGamepadInput { action: decoded_action } => {
+            assert_eq!(decoded_action, action);
+        }
+        _ => panic!("Expected InjectGamepadInput"),
+    }
 }
 

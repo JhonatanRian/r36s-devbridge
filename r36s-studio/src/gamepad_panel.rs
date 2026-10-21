@@ -34,7 +34,8 @@ impl GamepadPanel {
         );
         let capable = c.gamepad_supported.load(Ordering::Relaxed);
         let state = c.gamepad_state.lock().unwrap().clone();
-        ui.add_enabled_ui(connected && capable, |ui| {
+        let sequence_active = c.sequence_running.load(Ordering::Relaxed);
+        ui.add_enabled_ui(connected && capable && !sequence_active, |ui| {
             let mut listen = c.gamepad_listening.load(Ordering::Relaxed);
             let mut send = c.gamepad_input_enabled.load(Ordering::Relaxed);
 
@@ -61,6 +62,12 @@ impl GamepadPanel {
                 }
             }
         });
+        if sequence_active {
+            ui.colored_label(
+                Color32::from_rgb(100, 200, 255),
+                "Executando sequência de automação…",
+            );
+        }
         ui.label(if !connected {
             "Desconectado"
         } else if !capable {
@@ -142,6 +149,7 @@ impl GamepadPanel {
             self.glow = [None; 20];
             self.last_sequence = 0;
         }
+        state.buttons |= c.automation_buttons.load(Ordering::Relaxed);
         let w = viewport.console_width(ui.available_size() - vec2(16.0, 16.0));
         egui::ScrollArea::both()
             .auto_shrink([false; 2])
@@ -326,6 +334,9 @@ impl GamepadPanel {
     }
 
     pub fn interact_keyboard(&mut self, ui: &Ui, c: &ConnectionManager) {
+        if c.sequence_running.load(Ordering::Relaxed) {
+            return;
+        }
         if !c.gamepad_input_enabled.load(Ordering::Relaxed) {
             return;
         }
@@ -359,6 +370,9 @@ impl GamepadPanel {
         sticks: [Pos2; 2],
         w: f32,
     ) {
+        if c.sequence_running.load(Ordering::Relaxed) {
+            return;
+        }
         if !c.gamepad_input_enabled.load(Ordering::Relaxed) {
             return;
         }

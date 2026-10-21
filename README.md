@@ -208,6 +208,83 @@ DevBridge operates over two dedicated TCP ports over the USB Ethernet gadget lin
 
 ---
 
+## 🤖 AI DevLoop, Automation CLI & MCP Server
+
+The DevBridge binary (`./app`) supports graphical GUI mode, headless automation CLI, and Model Context Protocol (MCP) server:
+
+### Dual Operation Modes (Co-Pilot vs. Headless)
+DevBridge automatically detects and routes communication without manual toggling:
+- **Co-Pilot Mode (GUI `./app` is open):** CLI commands and MCP tools communicate with the GUI via a local Unix domain socket IPC (`/tmp/r36s-devbridge.sock`). Video frames and metrics are read directly from PC RAM with zero network overhead on the R36S, without disrupting active streaming.
+- **Headless Mode (GUI `./app` is closed):** CLI commands and MCP tools take exclusive ownership, connecting directly to the console over TCP (`192.168.7.2:7365` control and `7366` video).
+
+---
+
+### 1. Automation CLI (`./app cli ...`)
+Run scripted commands from your terminal or automation scripts:
+```bash
+# Query status, telemetry (CPU0..3, CMA, Temp), and full sandbox state
+./app cli status
+
+# Save live 640x480 screenshot with atomic file sync
+./app cli screenshot screen.png
+
+# Inject button sequences and wait timers (timed on the PC host)
+./app cli input "START,WAIT:500,A"
+
+# Inject analog joystick axes (-1800..1800 physical calibration range)
+./app cli input "AXIS:left_x:1800,WAIT:500,AXIS:left_x:0"
+./app cli input "AXIS:right_y:-1500,WAIT:300,AXIS:right_y:0"
+
+# Deploy files to RAM tmpfs (@sandbox/) or ROMs partition
+./app cli deploy ./my_binary @sandbox/my_binary --executable
+
+# Run isolated sandbox test with DRM Master handoff
+./app cli run "/tmp/r36s-sandbox/my_binary"
+
+# Stop sandbox process and automatically restore EmulationStation
+./app cli stop
+
+# Inspect RAM ring-buffer logs (sandbox, dmesg, retroarch, es, agent)
+./app cli logs sandbox
+```
+
+---
+
+### 2. Native Model Context Protocol (MCP) Server (`./app --mcp`)
+Exposes 6 multimodal tools over standard JSON-RPC 2.0 `stdio`:
+
+| Tool | Purpose | Key Inputs |
+| :--- | :--- | :--- |
+| `r36s_status_and_metrics` | Live hardware telemetry & process state | None |
+| `r36s_screenshot` | Native 640×480 PNG capture with opaque alpha `0xFF` | None |
+| `r36s_input` | Digital buttons, analog axes, and timed sequences | `button`, `axis` (`left_x`, `left_y`, `right_x`, `right_y`), `value` (`-1800..1800`), `action` (`pulse`, `hold`, `release`), `sequence` |
+| `r36s_deploy` | Push binaries/ROMs with SHA-256 validation | `local_path`, `remote_path` (`@sandbox/...` or ROMs), `executable` |
+| `r36s_sandbox` | Isolate test execution with DRM Master handoff | `action` (`start`, `status`, `stop`), `command`, `args`, `exclusive_drm` |
+| `r36s_logs` | Retrieve RAM ring-buffer logs (never hits SD card) | `source` (`sandbox`, `dmesg`, `retroarch`, `es`, `agent`), `lines` |
+
+```bash
+# Run MCP server directly (reads stdin, writes stdout, logs to stderr)
+./app --mcp
+```
+
+#### Claude Code / Cursor / Antigravity Integration
+This repository comes with pre-configured `.mcp.json` in the root:
+```json
+{
+  "mcpServers": {
+    "r36s-devbridge": {
+      "command": "./app",
+      "args": ["--mcp"]
+    }
+  }
+}
+```
+
+#### Engineering Skill for AI Agents
+An engineering guide and AI DevLoop skill is bundled in [`.agents/skills/r36s-dev/SKILL.md`](.agents/skills/r36s-dev/SKILL.md) to provide autonomous agents with the rules of engagement for Rockchip RK3326 and ArkOS.
+
+---
+
 ## 📚 Technical Documentation & Architecture
 
 For in-depth architectural guides, hardware limitations, protocol details, and engineering post-mortems, see the [docs/](docs/index.md) directory:

@@ -20,6 +20,9 @@ class InstallerTests(unittest.TestCase):
         self.binary = self.root / 'usr/local/bin/r36s-agent'
         self.binary.parent.mkdir(parents=True)
         self.binary.write_bytes(b'previous executable')
+        self.service = self.root / 'etc/systemd/system/r36s-agent.service'
+        self.service.parent.mkdir(parents=True, exist_ok=True)
+        self.service.write_bytes(b'previous service')
         self.make_payload()
 
     def make_payload(self):
@@ -31,35 +34,43 @@ class InstallerTests(unittest.TestCase):
             'service_sha256': installer.digest(self.payload / 'r36s-agent.service'),
         }))
 
+    def test_service_unit_uses_control_group_killmode(self):
+        repo_service = Path(__file__).parents[2] / 'r36s-agent/systemd/r36s-agent.service'
+        self.assertTrue(repo_service.is_file(), f"Service file not found at {repo_service}")
+        content = repo_service.read_text()
+        self.assertIn('KillMode=control-group', content)
+        self.assertNotIn('KillMode=process', content)
+
     def test_corruption_is_rejected_before_changes(self):
         (self.payload / 'r36s-agent').write_bytes(b'corrupt')
         with self.assertRaises(ValueError):
             installer.install(self.payload, self.root)
         self.assertEqual(self.binary.read_bytes(), b'previous executable')
+        self.assertEqual(self.service.read_bytes(), b'previous service')
 
     def test_atomic_replacement_preserves_open_executable_and_backup(self):
         with self.binary.open('rb') as running:
             installer.install(self.payload, self.root)
             self.assertEqual(running.read(), b'previous executable')
         self.assertEqual(self.binary.read_bytes(), b'new executable')
+        self.assertEqual(self.service.read_bytes(), b'new service')
         self.assertEqual((self.root / 'usr/local/share/devbridge/previous/r36s-agent').read_bytes(), b'previous executable')
+        self.assertEqual((self.root / 'usr/local/share/devbridge/previous/r36s-agent.service').read_bytes(), b'previous service')
         self.assertEqual(self.binary.stat().st_mode & 0o777, 0o755)
+        self.assertEqual(self.service.stat().st_mode & 0o777, 0o644)
 
     def test_failed_install_restores_previous_files(self):
         original = installer.atomic_copy
         def copy(source, target, mode):
-            if source == self.payload / 'r36s-agent.service':
+            if source == self.payload / 'manifest.json':
                 raise OSError('simulated full filesystem')
             original(source, target, mode)
         with patch.object(installer, 'atomic_copy', side_effect=copy):
             with self.assertRaises(OSError):
                 installer.install(self.payload, self.root)
         self.assertEqual(self.binary.read_bytes(), b'previous executable')
+        self.assertEqual(self.service.read_bytes(), b'previous service')
         self.assertFalse((self.root / 'usr/local/share/devbridge/manifest.json').exists())
-
-
-if __name__ == '__main__':
-    unittest.main()
 
 class ConfigurationTransactionTests(InstallerTests):
     def test_resume_configuration_is_included_in_rollback(self):
@@ -74,6 +85,7 @@ class ConfigurationTransactionTests(InstallerTests):
         self.assertEqual(legacy.read_text(), 'old hook')
         self.assertFalse(dropin.exists())
         self.assertEqual(self.binary.read_bytes(), b'previous executable')
+        self.assertEqual(self.service.read_bytes(), b'previous service')
 
     def test_configuration_failure_restores_every_changed_file(self):
         original = installer.atomic_copy
@@ -85,6 +97,7 @@ class ConfigurationTransactionTests(InstallerTests):
             with self.assertRaises(OSError):
                 installer.install(self.payload, self.root)
         self.assertEqual(self.binary.read_bytes(), b'previous executable')
+        self.assertEqual(self.service.read_bytes(), b'previous service')
         self.assertFalse((self.root / 'etc/modprobe.d/g_ether.conf').exists())
 
     def test_mac_is_persistent_and_not_shared_by_new_installations(self):
@@ -95,3 +108,7 @@ class ConfigurationTransactionTests(InstallerTests):
         self.assertEqual(mac.read_text(), first)
         other = Path(self.temp.name) / 'another-console'
         self.assertNotEqual(installer.generated_files(other)['etc/modprobe.d/g_ether.conf'][0], first)
+
+
+if __name__ == '__main__':
+    unittest.main()

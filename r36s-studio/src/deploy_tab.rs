@@ -1,4 +1,5 @@
 use crate::connection::ConnectionManager;
+use crate::ipc::base64_encode;
 use crate::protocol::{ClientCommand, ServerResponse};
 use egui::{Color32, ProgressBar, RichText, ScrollArea, Ui};
 use sha2::{Digest, Sha256};
@@ -201,6 +202,7 @@ impl DeployTab {
             filename: filename.clone(),
             total_size,
             sha256: sha256.clone(),
+            executable: None,
         };
 
         let mut cmd_json = serde_json::to_string(&start_cmd).unwrap();
@@ -358,40 +360,4 @@ impl DeployTab {
 
         is_uploading.store(false, Ordering::Relaxed);
     }
-}
-
-fn base64_encode(data: &[u8]) -> String {
-    const TABLE: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(data.len() * 4 / 3 + 4);
-    let mut i = 0;
-    while i < data.len() {
-        let b0 = data[i] as u32;
-        let b1 = if i + 1 < data.len() {
-            data[i + 1] as u32
-        } else {
-            0
-        };
-        let b2 = if i + 2 < data.len() {
-            data[i + 2] as u32
-        } else {
-            0
-        };
-
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-
-        out.push(TABLE[((triple >> 18) & 0x3F) as usize] as char);
-        out.push(TABLE[((triple >> 12) & 0x3F) as usize] as char);
-        if i + 1 < data.len() {
-            out.push(TABLE[((triple >> 6) & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if i + 2 < data.len() {
-            out.push(TABLE[(triple & 0x3F) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        i += 3;
-    }
-    out
 }

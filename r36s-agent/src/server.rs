@@ -19,6 +19,7 @@ pub struct AgentServer {
     metrics_collector: Arc<MetricsCollector>,
     fb_reader: Arc<Mutex<FramebufferReader>>,
     gamepad: Arc<crate::gamepad::GamepadService>,
+    sandbox: Arc<crate::process::SandboxManager>,
 }
 
 impl AgentServer {
@@ -28,6 +29,7 @@ impl AgentServer {
         let metrics = Arc::new(MetricsCollector::new());
         metrics.set_fb_info(reader.width, reader.height, reader.bpp, reader.format);
         let gamepad = Arc::new(crate::gamepad::GamepadService::new());
+        let sandbox = Arc::new(crate::process::SandboxManager::new());
 
         Self {
             streaming_enabled: Arc::new(AtomicBool::new(false)),
@@ -37,6 +39,7 @@ impl AgentServer {
             metrics_collector: metrics,
             fb_reader: Arc::new(Mutex::new(reader)),
             gamepad,
+            sandbox,
         }
     }
 
@@ -111,6 +114,7 @@ impl AgentServer {
                     let session_id = next_control_id;
                     let metrics = Arc::clone(&self.metrics_collector);
                     let gamepad = Arc::clone(&self.gamepad);
+                    let sandbox = Arc::clone(&self.sandbox);
                     thread::spawn(move || {
                         Self::handle_control_client(
                             stream,
@@ -120,6 +124,7 @@ impl AgentServer {
                             session_id,
                             metrics,
                             gamepad,
+                            sandbox,
                         );
                     });
                 }
@@ -138,6 +143,7 @@ impl AgentServer {
         session_id: u32,
         metrics: Arc<MetricsCollector>,
         gamepad: Arc<crate::gamepad::GamepadService>,
+        sandbox: Arc<crate::process::SandboxManager>,
     ) {
         let peer_addr = stream.peer_addr().ok();
         println!(
@@ -234,7 +240,11 @@ impl AgentServer {
                             agent_version: env!("CARGO_PKG_VERSION").to_string(),
                             protocol_version: PROTOCOL_VERSION.to_string(),
                             compatible: true,
-                            capabilities: vec!["gamepad-v2".into()],
+                            capabilities: vec![
+                                "gamepad-v2".into(),
+                                "gamepad-pulse-v1".into(),
+                                "sandbox-v1".into(),
+                            ],
                             fb_width: fb_w,
                             fb_height: fb_h,
                             fb_bpp: fb_bpp,
@@ -264,7 +274,14 @@ impl AgentServer {
                         filename,
                         total_size,
                         sha256,
-                    } => match deploy_mgr.start(&relative_path, &filename, total_size, &sha256) {
+                        executable,
+                    } => match deploy_mgr.start(
+                        &relative_path,
+                        &filename,
+                        total_size,
+                        &sha256,
+                        executable.unwrap_or(false),
+                    ) {
                         Ok(msg) => ServerResponse::DeployProgress {
                             status: "in_progress".to_string(),
                             message: msg,
@@ -385,6 +402,47 @@ impl AgentServer {
                                 success: false,
                                 message: format!("Falha ao injetar comando: {}", e),
                             },
+                        }
+                    }
+                    ClientCommand::RunSandbox {
+                        path,
+                        args,
+                        env,
+                        cwd,
+                        exclusive_drm,
+                    } => match sandbox.run(path, args, env, cwd, exclusive_drm) {
+                        Ok(pid) => ServerResponse::SandboxStartResult {
+                            success: true,
+                            pid: Some(pid),
+                            error: None,
+                        },
+                        Err(e) => ServerResponse::SandboxStartResult {
+                            success: false,
+                            pid: None,
+                            error: Some(e),
+                        },
+                    },
+                    ClientCommand::StopSandbox { timeout_ms } => {
+                        let outcome = sandbox.stop(timeout_ms);
+                        ServerResponse::SandboxStopResult {
+                            success: outcome.success,
+                            exit_code: outcome.exit_code,
+                            term_signal: outcome.term_signal,
+                            restore_error: outcome.restore_error,
+                            error: outcome.error,
+                        }
+                    }
+                    ClientCommand::GetSandboxStatus => {
+                        let status = sandbox.status();
+                        ServerResponse::SandboxStatus {
+                            running: status.running,
+                            pid: status.pid,
+                            exit_code: status.exit_code,
+                            term_signal: status.term_signal,
+                            uptime_ms: status.uptime_ms,
+                            stdout_tail: status.stdout_tail,
+                            stderr_tail: status.stderr_tail,
+                            restore_error: status.restore_error,
                         }
                     }
                 },

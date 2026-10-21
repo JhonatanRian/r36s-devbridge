@@ -122,6 +122,37 @@ impl TelemetryDashboard {
                     // Gráfico de Linha ao Vivo (Sparkline 60 segundos)
                     self.render_cpu_graph(ui);
 
+                    // Barras por núcleo C0..C3
+                    if !metrics.cpu_core_usage.is_empty() {
+                        ui.add_space(2.0);
+                        let bar_width = ((ui.available_width() - 18.0) / metrics.cpu_core_usage.len() as f32).max(40.0);
+                        ui.horizontal(|ui| {
+                            for (i, &usage) in metrics.cpu_core_usage.iter().enumerate() {
+                                ui.vertical(|ui| {
+                                    ui.label(RichText::new(format!("C{}: {:.0}%", i, usage)).small());
+                                    ui.add_sized(
+                                        [bar_width, 6.0],
+                                        ProgressBar::new((usage / 100.0).clamp(0.0, 1.0))
+                                            .animate(false)
+                                            .fill(if usage > 85.0 {
+                                                Color32::from_rgb(240, 80, 80)
+                                            } else if usage > 60.0 {
+                                                Color32::from_rgb(255, 180, 0)
+                                            } else {
+                                                Color32::from_rgb(60, 160, 240)
+                                            }),
+                                    );
+                                });
+                            }
+                        });
+                    } else {
+                        ui.label(
+                            RichText::new("Uso por núcleo (C0..C3): Indisponível")
+                                .small()
+                                .color(Color32::GRAY),
+                        );
+                    }
+
                     // Frequências dos Cores
                     if !metrics.cpu_freq_mhz.is_empty() {
                         ui.horizontal_wrapped(|ui| {
@@ -140,27 +171,63 @@ impl TelemetryDashboard {
                         );
                     }
 
-                    // Temperatura Real
+                    // Temperatura Real e Alertas
                     ui.horizontal(|ui| {
                         ui.label("Temperatura:");
                         if let Some(temp) = metrics.cpu_temp_c {
-                            let color = if temp > 75.0 {
-                                Color32::from_rgb(255, 60, 60)
+                            let color = if temp >= 80.0 {
+                                Color32::from_rgb(255, 50, 50)
+                            } else if temp >= 75.0 {
+                                Color32::from_rgb(255, 120, 0)
                             } else if temp > 60.0 {
                                 Color32::from_rgb(255, 180, 0)
                             } else {
                                 Color32::from_rgb(80, 220, 100)
                             };
                             ui.colored_label(color, format!("{:.1} °C", temp));
+
+                            if temp >= 80.0 {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 60, 60),
+                                    RichText::new("⚠️ Crítico (≥80°C)").small().strong(),
+                                );
+                            } else if temp >= 75.0 {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 140, 0),
+                                    RichText::new("⚠️ Atenção (≥75°C)").small(),
+                                );
+                            }
                         } else {
                             ui.colored_label(Color32::GRAY, "Indisponível");
+                        }
+                    });
+
+                    // Estado térmico heurístico
+                    ui.horizontal(|ui| {
+                        ui.label("Estado Térmico:");
+                        match metrics.thermal_throttling {
+                            Some(true) => {
+                                ui.colored_label(
+                                    Color32::from_rgb(255, 80, 80),
+                                    RichText::new("Suspeita de Throttling Térmico").strong(),
+                                );
+                            }
+                            Some(false) => {
+                                ui.colored_label(
+                                    Color32::from_rgb(80, 220, 100),
+                                    "Normal (sem limitação)",
+                                );
+                            }
+                            None => {
+                                ui.colored_label(Color32::GRAY, "Indisponível");
+                            }
                         }
                     });
                 });
 
                 ui.add_space(6.0);
 
-                // Memória RAM
+                // Memória RAM & Reserva CMA
                 ui.group(|ui| {
                     let ram_pct = if metrics.ram_total_mb > 0 {
                         (metrics.ram_used_mb as f32 / metrics.ram_total_mb as f32).clamp(0.0, 1.0)
@@ -182,6 +249,47 @@ impl TelemetryDashboard {
                             .animate(false)
                             .fill(Color32::from_rgb(180, 100, 240)),
                     );
+
+                    ui.add_space(4.0);
+
+                    // Reserva CMA
+                    if metrics.cma_available && metrics.cma_total_mb > 0 {
+                        let cma_used_mb = metrics.cma_total_mb.saturating_sub(metrics.cma_free_mb);
+                        let cma_free_pct = (metrics.cma_free_mb as f32 / metrics.cma_total_mb as f32).clamp(0.0, 1.0);
+                        let cma_used_pct = (cma_used_mb as f32 / metrics.cma_total_mb as f32).clamp(0.0, 1.0);
+
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Reserva CMA:").small().strong());
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} MB livres / {} MB ({:.0}% livre)",
+                                        metrics.cma_free_mb,
+                                        metrics.cma_total_mb,
+                                        cma_free_pct * 100.0,
+                                    ))
+                                    .small(),
+                                );
+                            });
+                        });
+                        ui.add(
+                            ProgressBar::new(cma_used_pct)
+                                .animate(false)
+                                .fill(if cma_free_pct < 0.2 {
+                                    Color32::from_rgb(255, 80, 80)
+                                } else {
+                                    Color32::from_rgb(100, 180, 240)
+                                }),
+                        );
+                    } else {
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Reserva CMA:").small());
+                            ui.colored_label(
+                                Color32::GRAY,
+                                RichText::new("Indisponível").small(),
+                            );
+                        });
+                    }
                 });
 
                 ui.add_space(6.0);
@@ -254,5 +362,99 @@ impl TelemetryDashboard {
                 Stroke::new(1.5_f32, Color32::from_rgb(80, 180, 255)),
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_telemetry_dashboard_render_complete_and_legacy_snapshots() {
+        let mut dashboard = TelemetryDashboard::new();
+        let ctx = egui::Context::default();
+
+        let complete_metrics = SystemMetrics {
+            timestamp: 100,
+            cpu_usage: 88.0,
+            cpu_freq_mhz: vec![1200, 1200, 1200, 1200],
+            cpu_temp_c: Some(82.5),
+            ram_used_mb: 400,
+            ram_total_mb: 1024,
+            mali_gpu_load: Some(40.0),
+            mali_gpu_freq_mhz: Some(500),
+            active_game: Some("RetroArch".to_string()),
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: vec![90.0, 85.0, 88.0, 89.0],
+            cma_total_mb: 32,
+            cma_free_mb: 8,
+            cma_available: true,
+            thermal_throttling: Some(true),
+        };
+
+        let legacy_metrics = SystemMetrics {
+            timestamp: 101,
+            cpu_usage: 25.0,
+            cpu_freq_mhz: vec![1000],
+            cpu_temp_c: Some(50.0),
+            ram_used_mb: 300,
+            ram_total_mb: 1024,
+            mali_gpu_load: None,
+            mali_gpu_freq_mhz: None,
+            active_game: None,
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: Vec::new(),
+            cma_total_mb: 0,
+            cma_free_mb: 0,
+            cma_available: false,
+            thermal_throttling: None,
+        };
+
+        let status = ConnectionStatus::Connected {
+            target: "192.168.7.2:7365".to_string(),
+            latency_ms: 1.5,
+            agent_version: "0.2.9".to_string(),
+        };
+
+        // 1. Testa render com snapshot completo
+        dashboard.update_metrics(Some(&complete_metrics));
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                dashboard.render(ui, &status, Some(&complete_metrics), 120.0);
+            });
+        });
+
+        // 2. Testa render com snapshot legado (ausência explícita de campos)
+        dashboard.update_metrics(Some(&legacy_metrics));
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                dashboard.render(ui, &status, Some(&legacy_metrics), 50.0);
+            });
+        });
+
+        // 3. Testa render com alerta térmico de atenção (76 °C)
+        let mut warning_metrics = complete_metrics.clone();
+        warning_metrics.cpu_temp_c = Some(76.0);
+        warning_metrics.thermal_throttling = Some(false);
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                dashboard.render(ui, &status, Some(&warning_metrics), 100.0);
+            });
+        });
+
+        // 4. Testa render sem métricas conectadas
+        let _ = ctx.run(Default::default(), |ctx| {
+            egui::CentralPanel::default().show(ctx, |ui| {
+                dashboard.render(ui, &status, None, 0.0);
+            });
+        });
     }
 }

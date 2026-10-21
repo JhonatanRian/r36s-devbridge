@@ -303,6 +303,7 @@ pub struct EvdevGamepadBackend {
     writer: Option<File>,
     injected_buttons: HashMap<u16, bool>,
     injected_axes: bool,
+    pulse_deadlines: HashMap<u16, Instant>,
 }
 impl EvdevGamepadBackend {
     pub fn new() -> Self {
@@ -312,6 +313,7 @@ impl EvdevGamepadBackend {
             writer: None,
             injected_buttons: HashMap::new(),
             injected_axes: false,
+            pulse_deadlines: HashMap::new(),
         }
     }
     fn discover(&mut self) {
@@ -450,11 +452,25 @@ impl EvdevGamepadBackend {
     }
     #[cfg(test)]
     fn poll_events(&mut self, state: &mut GamepadState) {
+        let timeout_ms = if let Some(earliest) = self.next_pulse_deadline() {
+            let now = Instant::now();
+            if earliest <= now {
+                0
+            } else {
+                let rem = (earliest - now).as_millis() as i32;
+                rem.clamp(1, 20)
+            }
+        } else {
+            20
+        };
         let mut polls = self.prepare_poll(state);
-        unsafe {
-            libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 20);
+        if !polls.is_empty() {
+            unsafe {
+                libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout_ms);
+            }
         }
         self.process_poll_results(&polls, state);
+        self.release_due_pulses(Instant::now());
     }
     fn enable_writer(&mut self) -> Result<(), String> {
         if self.writer.is_some() {
@@ -503,6 +519,24 @@ impl EvdevGamepadBackend {
         }
         Ok(())
     }
+    fn map_button_bit_to_code(d: &Device, bit_mask: u32) -> Option<u16> {
+        (0..768).find(|c| {
+            if !has(&d.keys, *c) {
+                return false;
+            }
+            let mut st = GamepadState::default();
+            d.process_single_event(
+                &InputEvent {
+                    type_: EV_KEY,
+                    code: *c,
+                    value: 1,
+                    ..Default::default()
+                },
+                &mut st,
+            );
+            st.buttons == bit_mask
+        })
+    }
     fn inject_action(&mut self, action: &GamepadInputAction) -> Result<(), String> {
         let d = self
             .devices
@@ -510,29 +544,22 @@ impl EvdevGamepadBackend {
             .find(|d| d.is_gamepad())
             .ok_or("Controle indisponível")?;
         let mut events = vec![];
+        let mut is_pulse = false;
+        let mut new_pulse_deadlines = vec![];
+
         match action {
             GamepadInputAction::Button { mask, pressed } => {
                 if mask.count_ones() != 1 {
                     return Err("Envie exatamente um botão".into());
                 }
-                let code = (0..768)
-                    .find(|c| {
-                        if !has(&d.keys, *c) {
-                            return false;
-                        }
-                        let mut st = GamepadState::default();
-                        d.process_single_event(
-                            &InputEvent {
-                                type_: EV_KEY,
-                                code: *c,
-                                value: 1,
-                                ..Default::default()
-                            },
-                            &mut st,
-                        );
-                        st.buttons == *mask
-                    })
+                let code = Self::map_button_bit_to_code(d, *mask)
                     .ok_or("Botão não suportado pelo controle")?;
+                if *pressed && self.pulse_deadlines.contains_key(&code) {
+                    return Err("Botão já em pulso".into());
+                }
+                if self.writer.is_none() {
+                    return Err("Dispositivo não aberto para escrita".into());
+                }
                 events.push(InputEvent {
                     type_: EV_KEY,
                     code,
@@ -546,6 +573,9 @@ impl EvdevGamepadBackend {
                 right_x,
                 right_y,
             } => {
+                if self.writer.is_none() {
+                    return Err("Dispositivo não aberto para escrita".into());
+                }
                 let rx = if d.axes.contains_key(&ABS_RX) {
                     ABS_RX
                 } else {
@@ -577,24 +607,117 @@ impl EvdevGamepadBackend {
                     });
                 }
             }
+            GamepadInputAction::Pulse { mask, duration_ms } => {
+                if *mask == 0 {
+                    return Err("Máscara de botões vazia".into());
+                }
+                if !(1..=1000).contains(duration_ms) {
+                    return Err("Duração do pulso deve ser entre 1 e 1000 ms".into());
+                }
+                if self.writer.is_none() {
+                    return Err("Dispositivo não aberto para escrita".into());
+                }
+                let mut codes = Vec::new();
+                for bit in 0..32 {
+                    let bit_mask = 1u32 << bit;
+                    if (mask & bit_mask) != 0 {
+                        let code = Self::map_button_bit_to_code(d, bit_mask)
+                            .ok_or("Botão não suportado pelo controle")?;
+                        if self.injected_buttons.get(&code).copied().unwrap_or(false) {
+                            return Err("Botão já pressionado".into());
+                        }
+                        if self.pulse_deadlines.contains_key(&code) {
+                            return Err("Botão já em pulso".into());
+                        }
+                        codes.push(code);
+                    }
+                }
+                let deadline = Instant::now() + Duration::from_millis(*duration_ms as u64);
+                for &code in &codes {
+                    events.push(InputEvent {
+                        type_: EV_KEY,
+                        code,
+                        value: 1,
+                        ..Default::default()
+                    });
+                    new_pulse_deadlines.push((code, deadline));
+                }
+                is_pulse = true;
+            }
         }
         events.push(InputEvent {
             type_: EV_SYN,
             code: SYN_REPORT,
             ..Default::default()
         });
-        // Record intent first so a partial write is also released by the watchdog.
-        for ev in &events {
-            if ev.type_ == EV_KEY {
-                self.injected_buttons.insert(ev.code, ev.value != 0);
+        if is_pulse {
+            for (code, deadline) in new_pulse_deadlines {
+                self.pulse_deadlines.insert(code, deadline);
             }
-            if ev.type_ == EV_ABS {
-                self.injected_axes = true;
+        } else {
+            for ev in &events {
+                if ev.type_ == EV_KEY {
+                    self.injected_buttons.insert(ev.code, ev.value != 0);
+                }
+                if ev.type_ == EV_ABS {
+                    self.injected_axes = true;
+                }
             }
         }
-        self.write_events(&events)
+        let res = self.write_events(&events);
+        if res.is_err() && is_pulse {
+            for ev in &events {
+                if ev.type_ == EV_KEY {
+                    self.pulse_deadlines.remove(&ev.code);
+                }
+            }
+        }
+        res
     }
-    fn release(&mut self) {
+    pub fn release_due_pulses(&mut self, now: Instant) -> usize {
+        let mut due_codes = Vec::new();
+        self.pulse_deadlines.retain(|&code, &mut deadline| {
+            if now >= deadline {
+                due_codes.push(code);
+                false
+            } else {
+                true
+            }
+        });
+
+        if due_codes.is_empty() {
+            return 0;
+        }
+
+        due_codes.sort();
+
+        let mut events = Vec::with_capacity(due_codes.len() + 1);
+        for code in &due_codes {
+            events.push(InputEvent {
+                type_: EV_KEY,
+                code: *code,
+                value: 0,
+                ..Default::default()
+            });
+        }
+        events.push(InputEvent {
+            type_: EV_SYN,
+            code: SYN_REPORT,
+            ..Default::default()
+        });
+
+        if self.writer.is_some() {
+            let _ = self.write_events(&events);
+        }
+        due_codes.len()
+    }
+    pub fn next_pulse_deadline(&self) -> Option<Instant> {
+        self.pulse_deadlines.values().copied().min()
+    }
+    pub fn has_active_pulses(&self) -> bool {
+        !self.pulse_deadlines.is_empty()
+    }
+    pub fn release_held(&mut self) {
         let mut events: Vec<_> = self
             .injected_buttons
             .iter()
@@ -620,17 +743,76 @@ impl EvdevGamepadBackend {
                 }
             }
         }
-        events.push(InputEvent {
-            type_: EV_SYN,
-            code: SYN_REPORT,
-            ..Default::default()
-        });
-        if self.writer.is_some() {
-            let _ = self.write_events(&events);
+        if !events.is_empty() {
+            events.push(InputEvent {
+                type_: EV_SYN,
+                code: SYN_REPORT,
+                ..Default::default()
+            });
+            if self.writer.is_some() {
+                let _ = self.write_events(&events);
+            }
+        }
+        self.injected_buttons.clear();
+        self.injected_axes = false;
+        if self.pulse_deadlines.is_empty() {
+            self.writer = None;
+        }
+    }
+    pub fn release_all(&mut self) {
+        let mut events: Vec<_> = self
+            .injected_buttons
+            .iter()
+            .filter(|(_, v)| **v)
+            .map(|(code, _)| InputEvent {
+                type_: EV_KEY,
+                code: *code,
+                value: 0,
+                ..Default::default()
+            })
+            .collect();
+        for &code in self.pulse_deadlines.keys() {
+            if !events.iter().any(|e| e.code == code) {
+                events.push(InputEvent {
+                    type_: EV_KEY,
+                    code,
+                    value: 0,
+                    ..Default::default()
+                });
+            }
+        }
+        if self.injected_axes {
+            if let Some(d) = self.devices.iter().find(|d| d.is_gamepad()) {
+                for (code, info) in &d.axes {
+                    if *code <= ABS_RZ {
+                        events.push(InputEvent {
+                            type_: EV_ABS,
+                            code: *code,
+                            value: ((info.minimum as i64 + info.maximum as i64) / 2) as i32,
+                            ..Default::default()
+                        });
+                    }
+                }
+            }
+        }
+        if !events.is_empty() {
+            events.push(InputEvent {
+                type_: EV_SYN,
+                code: SYN_REPORT,
+                ..Default::default()
+            });
+            if self.writer.is_some() {
+                let _ = self.write_events(&events);
+            }
         }
         self.writer = None;
         self.injected_buttons.clear();
+        self.pulse_deadlines.clear();
         self.injected_axes = false;
+    }
+    #[allow(dead_code)]
+    pub fn release(&mut self) {
+        self.release_all();
     }
 }
 
@@ -664,32 +846,63 @@ impl GamepadService {
         thread::spawn(move || loop {
             let poll_work = {
                 let mut session = b.lock().unwrap();
+                let now = Instant::now();
                 if session
                     .lease
                     .map_or(false, |(_, t)| t.elapsed() > Duration::from_secs(1))
                 {
-                    session.backend.release();
+                    session.backend.release_held();
                     session.lease = None;
                 }
-                if l.load(Ordering::Relaxed) || session.lease.is_some() {
+                session.backend.release_due_pulses(now);
+                if session.lease.is_none()
+                    && !session.backend.has_active_pulses()
+                    && session.backend.injected_buttons.is_empty()
+                    && !session.backend.injected_axes
+                {
+                    session.backend.writer = None;
+                }
+
+                let has_pulses = session.backend.has_active_pulses();
+                let timeout_ms = if let Some(earliest) = session.backend.next_pulse_deadline() {
+                    let now = Instant::now();
+                    if earliest <= now {
+                        0
+                    } else {
+                        let rem = (earliest - now).as_millis() as i32;
+                        rem.clamp(1, 20)
+                    }
+                } else {
+                    20
+                };
+
+                if l.load(Ordering::Relaxed) || session.lease.is_some() || has_pulses {
                     let mut next = s.lock().unwrap().clone();
                     let polls = session.backend.prepare_poll(&mut next);
-                    Some((polls, next))
+                    Some((polls, next, timeout_ms))
                 } else {
                     s.lock().unwrap().input_enabled = false;
                     None
                 }
             };
-            if let Some((mut polls, mut next)) = poll_work {
+            if let Some((mut polls, mut next, timeout_ms)) = poll_work {
                 // Blocking poll runs without holding either backend or published-state mutex.
                 if polls.is_empty() {
-                    thread::sleep(Duration::from_millis(20));
+                    thread::sleep(Duration::from_millis(timeout_ms as u64));
                 } else {
                     unsafe {
-                        libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, 20);
+                        libc::poll(polls.as_mut_ptr(), polls.len() as libc::nfds_t, timeout_ms);
                     }
                 }
                 let mut session = b.lock().unwrap();
+                session.backend.release_due_pulses(Instant::now());
+                if session.lease.is_none()
+                    && !session.backend.has_active_pulses()
+                    && session.backend.injected_buttons.is_empty()
+                    && !session.backend.injected_axes
+                {
+                    session.backend.writer = None;
+                }
                 session.backend.process_poll_results(&polls, &mut next);
                 next.listening = l.load(Ordering::Relaxed) && next.available;
                 next.input_enabled = session.lease.is_some() && session.backend.writer.is_some();
@@ -746,7 +959,7 @@ impl GamepadService {
     pub fn set_listening(&self, enabled: bool) {
         let mut session = self.backend.lock().unwrap();
         if enabled {
-            session.backend.release();
+            session.backend.release_all();
             session.lease = None;
             if !session.backend.devices.iter().any(|d| d.is_gamepad()) {
                 session.backend.discover();
@@ -787,12 +1000,12 @@ impl GamepadService {
         let mut session = self.backend.lock().unwrap();
         if !enabled {
             if session.lease.map_or(false, |(id, _)| id == session_id) {
-                session.backend.release();
+                session.backend.release_all();
                 session.lease = None;
             }
         } else {
             if session.lease.map_or(false, |(id, _)| id != session_id) {
-                session.backend.release();
+                session.backend.release_held();
             }
             session.backend.enable_writer()?;
             self.listening.store(false, Ordering::Relaxed);
@@ -808,7 +1021,13 @@ impl GamepadService {
         Ok(())
     }
     pub fn disconnect(&self, id: u32) {
-        let _ = self.set_input(id, false);
+        let mut session = self.backend.lock().unwrap();
+        if session.lease.map_or(false, |(owner, _)| owner == id) {
+            session.backend.release_held();
+            session.lease = None;
+        }
+        let mut state = self.state.lock().unwrap();
+        state.input_enabled = false;
     }
     pub fn get_state(&self) -> GamepadState {
         let mut st = self.state.lock().unwrap();
@@ -829,6 +1048,7 @@ impl GamepadService {
     pub fn set_listener(&self, listener: Option<GamepadListener>) {
         *self.listener.lock().unwrap() = listener;
     }
+    #[allow(dead_code)]
     pub fn notify_listener(&self, state: GamepadState) {
         let maybe_cb = self.listener.lock().unwrap().clone();
         if let Some(cb) = maybe_cb {
@@ -858,7 +1078,7 @@ mod tests {
     fn unsupported_axis_is_neutral() {
         assert_eq!(normalize(&InputAbsInfo::default(), 100), 0);
     }
-    fn fixture() -> (EvdevGamepadBackend, std::os::unix::net::UnixStream) {
+    pub(crate) fn fixture() -> (EvdevGamepadBackend, std::os::unix::net::UnixStream) {
         let (read, write) = std::os::unix::net::UnixStream::pair().unwrap();
         read.set_nonblocking(true).unwrap();
         let fd: std::os::fd::OwnedFd = read.into();
@@ -998,6 +1218,110 @@ mod tests {
         assert_eq!(events[3].type_, EV_SYN);
         assert!(b.writer.is_none());
     }
+    fn drain_receiver(receiver: &mut std::os::unix::net::UnixStream) {
+        use std::io::Read;
+        let mut buf = [0u8; 512];
+        loop {
+            match receiver.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(_) => continue,
+            }
+        }
+    }
+
+    #[test]
+    fn pulse_validation_and_rejection_produces_no_kernel_events() {
+        use std::io::Read;
+        let (mut b, _) = fixture();
+        let (writer, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        b.writer = Some(File::from(std::os::fd::OwnedFd::from(writer)));
+
+        // Empty mask
+        assert!(b.inject_action(&GamepadInputAction::Pulse { mask: 0, duration_ms: 50 }).is_err());
+        // Duration 0
+        assert!(b.inject_action(&GamepadInputAction::Pulse { mask: BTN_MASK_A, duration_ms: 0 }).is_err());
+        // Duration > 1000
+        assert!(b.inject_action(&GamepadInputAction::Pulse { mask: BTN_MASK_A, duration_ms: 1001 }).is_err());
+        // Unsupported button (BTN_MASK_L1 not in fixture)
+        assert!(b.inject_action(&GamepadInputAction::Pulse { mask: BTN_MASK_L1, duration_ms: 50 }).is_err());
+
+        // Verify receiver got no events at all
+        let mut buf = [0u8; 32];
+        assert_eq!(receiver.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+
+        // Hold button A
+        b.inject_action(&GamepadInputAction::Button { mask: BTN_MASK_A, pressed: true }).unwrap();
+        drain_receiver(&mut receiver); // clear button events
+
+        // Overlap with held button must fail without writing
+        assert!(b.inject_action(&GamepadInputAction::Pulse { mask: BTN_MASK_A, duration_ms: 50 }).is_err());
+        assert_eq!(receiver.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+
+        // Pulse button B
+        b.inject_action(&GamepadInputAction::Pulse { mask: BTN_MASK_B, duration_ms: 50 }).unwrap();
+        drain_receiver(&mut receiver); // clear pulse press events
+
+        // Overlap with already pulsing button must fail without writing
+        assert!(b.inject_action(&GamepadInputAction::Pulse { mask: BTN_MASK_B, duration_ms: 50 }).is_err());
+        assert_eq!(receiver.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn pulse_press_batch_and_deadline_release_at_requested_timing_multi_button() {
+        use std::io::Read;
+        let (mut b, _) = fixture();
+        let (writer, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        b.writer = Some(File::from(std::os::fd::OwnedFd::from(writer)));
+
+        let t0 = Instant::now();
+        b.inject_action(&GamepadInputAction::Pulse {
+            mask: BTN_MASK_A | BTN_MASK_B,
+            duration_ms: 50,
+        })
+        .unwrap();
+
+        // Exactly 2 key-downs and 1 shared SYN_REPORT
+        let mut buf = [0u8; 512];
+        let n = receiver.read(&mut buf).unwrap();
+        let events: Vec<_> = buf[..n]
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|c| unsafe { std::ptr::read_unaligned(c.as_ptr().cast::<InputEvent>()) })
+            .collect();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].type_, EV_KEY);
+        assert_eq!(events[0].value, 1);
+        assert_eq!(events[1].type_, EV_KEY);
+        assert_eq!(events[1].value, 1);
+        assert_eq!((events[2].type_, events[2].code), (EV_SYN, SYN_REPORT));
+        let press_codes: std::collections::HashSet<_> = [events[0].code, events[1].code].into_iter().collect();
+        assert!(press_codes.contains(&BTN_EAST));
+        assert!(press_codes.contains(&BTN_SOUTH));
+
+        // Before deadline: 0 released
+        assert_eq!(b.release_due_pulses(t0 + Duration::from_millis(20)), 0);
+        assert_eq!(receiver.read(&mut buf).unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+
+        // After deadline: exactly 2 key-ups and 1 shared SYN_REPORT
+        assert_eq!(b.release_due_pulses(t0 + Duration::from_millis(55)), 2);
+        let n = receiver.read(&mut buf).unwrap();
+        let rel_events: Vec<_> = buf[..n]
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|c| unsafe { std::ptr::read_unaligned(c.as_ptr().cast::<InputEvent>()) })
+            .collect();
+        assert_eq!(rel_events.len(), 3);
+        assert_eq!(rel_events[0].type_, EV_KEY);
+        assert_eq!(rel_events[0].value, 0);
+        assert_eq!(rel_events[1].type_, EV_KEY);
+        assert_eq!(rel_events[1].value, 0);
+        assert_eq!((rel_events[2].type_, rel_events[2].code), (EV_SYN, SYN_REPORT));
+        let rel_codes: std::collections::HashSet<_> = [rel_events[0].code, rel_events[1].code].into_iter().collect();
+        assert!(rel_codes.contains(&BTN_EAST));
+        assert!(rel_codes.contains(&BTN_SOUTH));
+        assert!(!b.has_active_pulses());
+    }
+
     #[test]
     fn absent_hardware_is_not_mock() {
         let b = EvdevGamepadBackend::new();
@@ -1010,6 +1334,8 @@ mod tests {
 #[cfg(test)]
 mod mode_regression_tests {
     use super::*;
+    use super::tests::fixture;
+
     #[test]
     fn monitor_ack_revokes_previous_injection_lease_immediately() {
         let service = GamepadService {
@@ -1027,5 +1353,130 @@ mod mode_regression_tests {
         service.set_listening(true);
         assert!(!service.get_state().input_enabled);
         assert!(service.backend.lock().unwrap().lease.is_none());
+    }
+
+    #[test]
+    fn disconnect_and_lease_expiry_preserves_pulse_deadline_while_releasing_held_inputs() {
+        use std::io::Read;
+        let (mut b, _) = fixture();
+        let (writer, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        b.writer = Some(File::from(std::os::fd::OwnedFd::from(writer)));
+
+        let service = GamepadService {
+            backend: Arc::new(Mutex::new(BackendSession {
+                backend: b,
+                lease: Some((42, Instant::now())),
+            })),
+            state: Arc::new(Mutex::new(GamepadState {
+                input_enabled: true,
+                ..Default::default()
+            })),
+            listening: Arc::new(AtomicBool::new(false)),
+            listener: Arc::new(Mutex::new(None)),
+        };
+
+        service.inject_action(42, &GamepadInputAction::Button { mask: BTN_MASK_A, pressed: true }).unwrap();
+        service.inject_action(42, &GamepadInputAction::Pulse { mask: BTN_MASK_B, duration_ms: 100 }).unwrap();
+
+        let mut buf = [0u8; 512];
+        let _ = receiver.read(&mut buf).unwrap();
+
+        service.disconnect(42);
+
+        // Held button (A) released immediately
+        let n = receiver.read(&mut buf).unwrap();
+        let events: Vec<_> = buf[..n]
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|c| unsafe { std::ptr::read_unaligned(c.as_ptr().cast::<InputEvent>()) })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].code, events[0].value), (BTN_EAST, 0));
+        assert_eq!(events[1].type_, EV_SYN);
+
+        // Pulse (B) remains active until deadline
+        {
+            let mut session = service.backend.lock().unwrap();
+            assert!(session.backend.has_active_pulses());
+            let released = session.backend.release_due_pulses(Instant::now() + Duration::from_millis(150));
+            assert_eq!(released, 1);
+        }
+        let n = receiver.read(&mut buf).unwrap();
+        let events: Vec<_> = buf[..n]
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|c| unsafe { std::ptr::read_unaligned(c.as_ptr().cast::<InputEvent>()) })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].code, events[0].value), (BTN_SOUTH, 0));
+        assert_eq!(events[1].type_, EV_SYN);
+    }
+
+    #[test]
+    fn explicit_mode_revocation_releases_pulse_immediately() {
+        use std::io::Read;
+        let (mut b, _) = fixture();
+        let (writer, mut receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        receiver.set_nonblocking(true).unwrap();
+        b.writer = Some(File::from(std::os::fd::OwnedFd::from(writer)));
+
+        let service = GamepadService {
+            backend: Arc::new(Mutex::new(BackendSession {
+                backend: b,
+                lease: Some((42, Instant::now())),
+            })),
+            state: Arc::new(Mutex::new(GamepadState {
+                input_enabled: true,
+                ..Default::default()
+            })),
+            listening: Arc::new(AtomicBool::new(false)),
+            listener: Arc::new(Mutex::new(None)),
+        };
+
+        service.inject_action(42, &GamepadInputAction::Pulse { mask: BTN_MASK_A, duration_ms: 500 }).unwrap();
+        let mut buf = [0u8; 512];
+        let _ = receiver.read(&mut buf).unwrap();
+
+        service.set_input(42, false).unwrap();
+
+        let n = receiver.read(&mut buf).unwrap();
+        let events: Vec<_> = buf[..n]
+            .chunks_exact(std::mem::size_of::<InputEvent>())
+            .map(|c| unsafe { std::ptr::read_unaligned(c.as_ptr().cast::<InputEvent>()) })
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!((events[0].code, events[0].value), (BTN_EAST, 0));
+        assert_eq!(events[1].type_, EV_SYN);
+
+        assert!(!service.backend.lock().unwrap().backend.has_active_pulses());
+    }
+
+    #[test]
+    fn new_session_cannot_overlap_pending_pulse() {
+        let (mut b, _) = fixture();
+        let (writer, _receiver) = std::os::unix::net::UnixStream::pair().unwrap();
+        b.writer = Some(File::from(std::os::fd::OwnedFd::from(writer)));
+
+        let service = GamepadService {
+            backend: Arc::new(Mutex::new(BackendSession {
+                backend: b,
+                lease: Some((1, Instant::now())),
+            })),
+            state: Arc::new(Mutex::new(GamepadState {
+                input_enabled: true,
+                ..Default::default()
+            })),
+            listening: Arc::new(AtomicBool::new(false)),
+            listener: Arc::new(Mutex::new(None)),
+        };
+
+        service.inject_action(1, &GamepadInputAction::Pulse { mask: BTN_MASK_A, duration_ms: 200 }).unwrap();
+
+        service.disconnect(1);
+
+        service.backend.lock().unwrap().lease = Some((2, Instant::now()));
+
+        assert!(service.inject_action(2, &GamepadInputAction::Pulse { mask: BTN_MASK_A, duration_ms: 50 }).is_err());
+        assert!(service.inject_action(2, &GamepadInputAction::Button { mask: BTN_MASK_A, pressed: true }).is_err());
+        assert!(service.inject_action(2, &GamepadInputAction::Pulse { mask: BTN_MASK_B, duration_ms: 50 }).is_ok());
     }
 }
