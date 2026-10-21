@@ -300,13 +300,28 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
         }),
         serde_json::json!({
             "name": "r36s_logs",
-            "description": "Recupera logs em RAM do R36S: saídas stdout/stderr de processos em teste no sandbox, ou logs de sistema (dmesg, retroarch, es, agent). Nunca consulta journalctl.",
+            "description": "Recupera logs em RAM do R36S: saídas stdout/stderr de processos em teste no sandbox, ou logs de emuladores e sistema (active_game, run, emulationstation, retroarch, agent, dmesg, syslog, port, java, ppsspp, drastic, mupen64plus). Suporta filtro por grep. Nunca consulta journalctl.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "source": {
                         "type": "string",
-                        "enum": ["sandbox", "dmesg", "retroarch", "es", "agent"],
+                        "enum": [
+                            "sandbox",
+                            "active_game",
+                            "run",
+                            "emulationstation",
+                            "es",
+                            "retroarch",
+                            "agent",
+                            "dmesg",
+                            "syslog",
+                            "port",
+                            "java",
+                            "ppsspp",
+                            "drastic",
+                            "mupen64plus"
+                        ],
                         "description": "Fonte dos logs (padrão: sandbox)"
                     },
                     "lines": {
@@ -314,6 +329,10 @@ pub fn get_tool_definitions() -> Vec<serde_json::Value> {
                         "minimum": 1,
                         "maximum": 500,
                         "description": "Quantidade máxima de linhas (padrão: 50)"
+                    },
+                    "grep": {
+                        "type": "string",
+                        "description": "Padrão textual para filtrar linhas do log (insensível a maiúsculas/minúsculas)"
                     }
                 },
                 "additionalProperties": false
@@ -608,14 +627,22 @@ fn dispatch_tool_call(name: &str, args: &serde_json::Value, client: &BridgeClien
         "r36s_logs" => {
             let source = args.get("source").and_then(|v| v.as_str()).unwrap_or("sandbox");
             let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(50) as usize;
+            let grep = args.get("grep").and_then(|v| v.as_str());
 
             if source == "sandbox" {
                 match client.get_diagnostics() {
                     Ok(diag) => {
+                        let mut stdout = diag.sandbox_stdout_tail.unwrap_or_default();
+                        let mut stderr = diag.sandbox_stderr_tail.unwrap_or_default();
+                        if let Some(pattern) = grep {
+                            let p = pattern.to_lowercase();
+                            stdout = stdout.lines().filter(|l| l.to_lowercase().contains(&p)).collect::<Vec<_>>().join("\n");
+                            stderr = stderr.lines().filter(|l| l.to_lowercase().contains(&p)).collect::<Vec<_>>().join("\n");
+                        }
                         let out = serde_json::json!({
                             "source": "sandbox",
-                            "stdout_tail": diag.sandbox_stdout_tail.unwrap_or_default(),
-                            "stderr_tail": diag.sandbox_stderr_tail.unwrap_or_default()
+                            "stdout_tail": stdout,
+                            "stderr_tail": stderr
                         });
                         serde_json::json!({
                             "content": [
@@ -626,7 +653,21 @@ fn dispatch_tool_call(name: &str, args: &serde_json::Value, client: &BridgeClien
                     }
                     Err(e) => make_tool_error(format!("Falha ao obter logs do sandbox: {}", e)),
                 }
-            } else if matches!(source, "dmesg" | "retroarch" | "es" | "agent") {
+            } else if matches!(
+                source,
+                "active_game" | "active" | "game"
+                | "run" | "runcommand"
+                | "emulationstation" | "es"
+                | "retroarch"
+                | "agent" | "daemon" | "journalctl"
+                | "dmesg"
+                | "syslog" | "system"
+                | "port" | "installer"
+                | "java" | "freej2me"
+                | "ppsspp" | "psp"
+                | "drastic" | "nds"
+                | "mupen64plus" | "n64"
+            ) {
                 let cmd = ClientCommand::FetchLogs {
                     log_type: source.to_string(),
                     lines,
@@ -634,9 +675,15 @@ fn dispatch_tool_call(name: &str, args: &serde_json::Value, client: &BridgeClien
                 match client.send_command(cmd) {
                     Ok(res) => match res.response {
                         Some(ServerResponse::LogsResponse { log_type, content }) => {
+                            let filtered = if let Some(pattern) = grep {
+                                let p = pattern.to_lowercase();
+                                content.lines().filter(|l| l.to_lowercase().contains(&p)).collect::<Vec<_>>().join("\n")
+                            } else {
+                                content
+                            };
                             serde_json::json!({
                                 "content": [
-                                    { "type": "text", "text": format!("=== Logs [{}] ===\n{}", log_type, content) }
+                                    { "type": "text", "text": format!("=== Logs [{}] ===\n{}", log_type, filtered) }
                                 ],
                                 "isError": false
                             })
@@ -647,7 +694,7 @@ fn dispatch_tool_call(name: &str, args: &serde_json::Value, client: &BridgeClien
                 }
             } else {
                 make_tool_error(format!(
-                    "Fonte de logs inválida: '{}'. Fontes válidas: sandbox, dmesg, retroarch, es, agent",
+                    "Fonte de logs inválida: '{}'. Fontes válidas: sandbox, active_game, run, emulationstation, retroarch, agent, dmesg, syslog, port, java, ppsspp, drastic, mupen64plus",
                     source
                 ))
             }
@@ -832,5 +879,55 @@ mod tests {
         assert!(props.get("value").is_some(), "value property must exist in r36s_input schema");
         assert!(props.get("button").is_some(), "button property must exist");
         assert!(props.get("sequence").is_some(), "sequence property must exist");
+    }
+
+    #[test]
+    fn test_mcp_tools_list_schema_r36s_logs() {
+        let tools = get_tool_definitions();
+        let logs_tool = tools
+            .iter()
+            .find(|t| t.get("name").and_then(|v| v.as_str()) == Some("r36s_logs"))
+            .expect("r36s_logs tool found");
+
+        let schema = logs_tool.get("inputSchema").expect("inputSchema exists");
+        let props = schema.get("properties").expect("properties exist");
+        assert!(props.get("source").is_some(), "source property must exist");
+        assert!(props.get("lines").is_some(), "lines property must exist");
+        assert!(props.get("grep").is_some(), "grep property must exist");
+
+        let source_enum = props
+            .get("source")
+            .and_then(|s| s.get("enum"))
+            .and_then(|e| e.as_array())
+            .expect("source enum exists");
+        let enum_vals: Vec<&str> = source_enum.iter().filter_map(|v| v.as_str()).collect();
+
+        for expected in &[
+            "sandbox",
+            "active_game",
+            "run",
+            "emulationstation",
+            "retroarch",
+            "agent",
+            "dmesg",
+            "syslog",
+            "port",
+            "java",
+            "ppsspp",
+            "drastic",
+            "mupen64plus",
+        ] {
+            assert!(
+                enum_vals.contains(expected),
+                "Source enum deve conter {}",
+                expected
+            );
+        }
+
+        // Teste de despacho com fonte inválida
+        let client = BridgeClient::new();
+        let bad_args = serde_json::json!({ "source": "invalid_source" });
+        let res = dispatch_tool_call("r36s_logs", &bad_args, &client);
+        assert_eq!(res.get("isError").and_then(|v| v.as_bool()), Some(true));
     }
 }

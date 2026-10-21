@@ -108,6 +108,15 @@ impl ProcessManager {
                                     let clean_cmd = cmdline.replace('\0', " ").trim().to_string();
                                     let lower = clean_cmd.to_lowercase();
                                     let is_game = lower.contains("retroarch")
+                                        || lower.contains("retroarch32")
+                                        || lower.contains("retrorun")
+                                        || lower.contains("retrorun32")
+                                        || lower.contains("yabasanshiro")
+                                        || lower.contains("flycast")
+                                        || lower.contains("hypseus")
+                                        || lower.contains("scummvm")
+                                        || lower.contains("openbor")
+                                        || lower.contains("solarusemulator")
                                         || lower.contains("drastic")
                                         || lower.contains("ppsspp")
                                         || lower.contains("mupen64plus")
@@ -125,7 +134,11 @@ impl ProcessManager {
                                                 if let Some(target_str) = target.to_str() {
                                                     if target_str.ends_with(".log") || target_str.ends_with(".txt") {
                                                         if let Ok(content) = Self::tail_file(target_str, lines_to_fetch) {
-                                                            return format!("[PID {} - {}]\n{}", pid, target_str, content);
+                                                            let mut res = format!("[PID {} - {}]\n{}", pid, target_str, content);
+                                                            if let Some(vcs) = Self::read_virtual_console_tail(lines_to_fetch) {
+                                                                res.push_str(&format!("\n\n[Console Virtual /dev/vcs1]\n{}", vcs));
+                                                            }
+                                                            return res;
                                                         }
                                                     }
                                                 }
@@ -138,10 +151,13 @@ impl ProcessManager {
                     }
                 }
 
-                // 2. Fallbacks conhecidos de logs de ports/jogos
+                // 2. Fallbacks conhecidos de logs de ports/jogos em memória (/dev/shm) e disco
                 let candidates = [
+                    "/dev/shm/arkos-launch.log",
                     "/dev/shm/runcommand.log",
                     "/dev/shm/run.log",
+                    "/dev/shm/yabasanshiro.log",
+                    "/dev/shm/flycast.log",
                     "/tmp/run.log",
                     "/tmp/retroarch.log",
                     "/home/ark/.config/retroarch/retroarch.log",
@@ -152,7 +168,11 @@ impl ProcessManager {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
                             if !content.trim().is_empty() {
-                                return format!("[Arquivo: {}]\n{}", path, content);
+                                let mut res = format!("[Arquivo: {}]\n{}", path, content);
+                                if let Some(vcs) = Self::read_virtual_console_tail(lines_to_fetch) {
+                                    res.push_str(&format!("\n\n[Console Virtual /dev/vcs1]\n{}", vcs));
+                                }
+                                return res;
                             }
                         }
                     }
@@ -166,6 +186,9 @@ impl ProcessManager {
                     for p in &active_procs {
                         diag.push_str(&format!("  - {}\n", p));
                     }
+                }
+                if let Some(vcs) = Self::read_virtual_console_tail(lines_to_fetch) {
+                    diag.push_str(&format!("\n[Console Virtual /dev/vcs1]\n{}\n", vcs));
                 }
                 if let Ok(clients) = std::fs::read_to_string("/sys/kernel/debug/dri/0/clients") {
                     diag.push_str("\n[Clientes DRM /dev/dri/card0]\n");
@@ -236,21 +259,36 @@ impl ProcessManager {
             }
             "run" | "runcommand" => {
                 let candidates = [
+                    "/dev/shm/arkos-launch.log",
                     "/dev/shm/runcommand.log",
                     "/dev/shm/run.log",
+                    "/dev/shm/yabasanshiro.log",
+                    "/dev/shm/flycast.log",
                     "/tmp/run.log",
                     "/var/log/run.log",
                 ];
+                let mut found_content = None;
                 for path in candidates {
                     if Path::new(path).exists() {
                         if let Ok(content) = Self::tail_file(path, lines_to_fetch) {
                             if !content.trim().is_empty() {
-                                return format!("[Arquivo: {}]\n{}", path, content);
+                                found_content = Some(format!("[Arquivo: {}]\n{}", path, content));
+                                break;
                             }
                         }
                     }
                 }
-                "Nenhum log em /dev/shm/runcommand.log ou /dev/shm/run.log no momento.".to_string()
+
+                let vcs_opt = Self::read_virtual_console_tail(lines_to_fetch);
+                match (found_content, vcs_opt) {
+                    (Some(mut file_log), Some(vcs)) => {
+                        file_log.push_str(&format!("\n\n[Console Virtual /dev/vcs1]\n{}", vcs));
+                        file_log
+                    }
+                    (Some(file_log), None) => file_log,
+                    (None, Some(vcs)) => format!("[Console Virtual /dev/vcs1]\n{}", vcs),
+                    (None, None) => "Nenhum log em /dev/shm/runcommand.log ou /dev/shm/run.log no momento.".to_string(),
+                }
             }
             "syslog" | "system" => {
                 let candidates = [
@@ -427,6 +465,104 @@ impl ProcessManager {
         } else {
             lines[lines.len() - count..].join("\n")
         }
+    }
+
+    /// Sanitiza o buffer de caracteres do terminal virtual (máx 16 KB),
+    /// tratando o formato raw de matriz de colunas (80 colunas padrão sem '\n')
+    /// ou fluxos delimitados por '\n', descartando espaços à direita e blocos em branco.
+    pub fn sanitize_vcs_buffer(raw: &[u8], max_lines: usize) -> Option<String> {
+        if raw.is_empty() {
+            return None;
+        }
+
+        let bounded = if raw.len() > 16 * 1024 {
+            &raw[raw.len() - 16 * 1024..]
+        } else {
+            raw
+        };
+
+        let raw_lines: Vec<String> = if bounded.contains(&b'\n') {
+            bounded
+                .split(|&b| b == b'\n')
+                .map(|line| {
+                    let s = String::from_utf8_lossy(line);
+                    s.chars()
+                        .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        } else {
+            // No Linux, /dev/vcs* expõe a memória de texto bruta do console de tamanho fixo,
+            // tipicamente 80 colunas por linha no ArkOS/RK3326.
+            bounded
+                .chunks(80)
+                .map(|chunk| {
+                    let s = String::from_utf8_lossy(chunk);
+                    s.chars()
+                        .map(|c| if c.is_control() && c != '\t' { ' ' } else { c })
+                        .collect::<String>()
+                        .trim_end()
+                        .to_string()
+                })
+                .collect()
+        };
+
+        // Colapsa linhas em branco consecutivas e remove linhas vazias no início e fim
+        let mut clean_lines = Vec::new();
+        let mut last_was_empty = true;
+        for line in raw_lines {
+            if line.is_empty() {
+                if !last_was_empty {
+                    clean_lines.push(String::new());
+                    last_was_empty = true;
+                }
+            } else {
+                clean_lines.push(line);
+                last_was_empty = false;
+            }
+        }
+
+        while clean_lines.last().map(|s| s.is_empty()).unwrap_or(false) {
+            clean_lines.pop();
+        }
+
+        if clean_lines.is_empty() {
+            return None;
+        }
+
+        let start = if max_lines > 0 && clean_lines.len() > max_lines {
+            clean_lines.len() - max_lines
+        } else {
+            0
+        };
+
+        let result = clean_lines[start..].join("\n");
+        if result.trim().is_empty() {
+            None
+        } else {
+            Some(result)
+        }
+    }
+
+    /// Lê até 16 KB do dispositivo de console virtual ou arquivo fornecido e sanitiza seu conteúdo
+    pub fn read_virtual_console_from_path(path: &Path, max_lines: usize) -> Option<String> {
+        let mut file = File::open(path).ok()?;
+        let mut buffer = Vec::new();
+        file.by_ref().take(16 * 1024).read_to_end(&mut buffer).ok()?;
+        Self::sanitize_vcs_buffer(&buffer, max_lines)
+    }
+
+    /// Tenta ler /dev/vcs1 (console virtual 1 / tty1 do ArkOS) com fallback para /dev/vcs
+    pub fn read_virtual_console_tail(max_lines: usize) -> Option<String> {
+        let candidates = ["/dev/vcs1", "/dev/vcs"];
+        for path in &candidates {
+            if let Some(content) = Self::read_virtual_console_from_path(Path::new(path), max_lines) {
+                return Some(content);
+            }
+        }
+        None
     }
 }
 
@@ -1173,6 +1309,15 @@ impl SandboxManager {
                         if let Ok(cmdline) = std::fs::read_to_string(entry.path().join("cmdline")) {
                             let clean = cmdline.replace('\0', " ").to_lowercase();
                             if (clean.contains("retroarch")
+                                || clean.contains("retroarch32")
+                                || clean.contains("retrorun")
+                                || clean.contains("retrorun32")
+                                || clean.contains("yabasanshiro")
+                                || clean.contains("flycast")
+                                || clean.contains("hypseus")
+                                || clean.contains("scummvm")
+                                || clean.contains("openbor")
+                                || clean.contains("solarusemulator")
                                 || clean.contains("drastic")
                                 || clean.contains("ppsspp")
                                 || clean.contains("mupen64plus")
@@ -1655,6 +1800,66 @@ mod tests {
 
         let _ = std::fs::remove_file(script);
         let _ = std::fs::remove_file(marker);
+    }
+
+    #[test]
+    fn test_sanitize_vcs_buffer_raw_chunks_and_limits() {
+        // 1. Simula buffer de tela de console sem '\n' (matriz 80 colunas por linha)
+        let mut screen_raw = Vec::new();
+        let line1 = b"ArkOS Launching Sega Saturn (yabasanshiro)...";
+        screen_raw.extend_from_slice(line1);
+        screen_raw.resize(80, b' '); // preenche o resto da linha com espaços
+
+        let line2 = b"I don't detect a saturn_bios.bin in /roms/bios";
+        screen_raw.extend_from_slice(line2);
+        screen_raw.resize(160, b' ');
+
+        let line3 = b"Please place a valid BIOS file and try again.";
+        screen_raw.extend_from_slice(line3);
+        screen_raw.resize(240, b' ');
+
+        // Adiciona 5 linhas de 80 espaços em branco (linhas vazias da tela)
+        screen_raw.resize(240 + 5 * 80, b' ');
+
+        let sanitized = ProcessManager::sanitize_vcs_buffer(&screen_raw, 10).expect("Buffer com texto deve retornar Some");
+        let expected = "ArkOS Launching Sega Saturn (yabasanshiro)...\nI don't detect a saturn_bios.bin in /roms/bios\nPlease place a valid BIOS file and try again.";
+        assert_eq!(sanitized, expected);
+
+        // 2. Buffer inteiramente composto de espaços e bytes nulos deve retornar None
+        let blank_screen = vec![b' '; 80 * 25];
+        assert_eq!(ProcessManager::sanitize_vcs_buffer(&blank_screen, 10), None);
+        let null_screen = vec![0u8; 80 * 25];
+        assert_eq!(ProcessManager::sanitize_vcs_buffer(&null_screen, 10), None);
+
+        // 3. Buffer com delimitadores '\n' e espaços em excesso
+        let newline_stream = b"   Linha 1 com espacos no fim   \n\n\n   Linha 2 apos vazias   \n   \n";
+        let parsed_nl = ProcessManager::sanitize_vcs_buffer(newline_stream, 10).unwrap();
+        assert_eq!(parsed_nl, "   Linha 1 com espacos no fim\n\n   Linha 2 apos vazias");
+
+        // 4. Limitação por max_lines
+        let multi_lines = b"L1\nL2\nL3\nL4\nL5";
+        let max_2 = ProcessManager::sanitize_vcs_buffer(multi_lines, 2).unwrap();
+        assert_eq!(max_2, "L4\nL5");
+
+        // 5. Verificação de limites de tamanho (> 16 KB)
+        let mut huge_buffer = vec![b' '; 20 * 1024];
+        huge_buffer.extend_from_slice(b"Mensagem final no limite da memoria\n");
+        let huge_parsed = ProcessManager::sanitize_vcs_buffer(&huge_buffer, 5).unwrap();
+        assert!(huge_parsed.contains("Mensagem final no limite da memoria"));
+    }
+
+    #[test]
+    fn test_read_virtual_console_from_path_mock() {
+        let test_file = PathBuf::from(format!("/tmp/test_vcs_mock_{}.txt", std::process::id()));
+        let mut mock_screen = Vec::new();
+        mock_screen.extend_from_slice(b"Error: flycast could not find dc_boot.bin");
+        mock_screen.resize(80, b' ');
+        std::fs::write(&test_file, &mock_screen).expect("Grava mock VCS");
+
+        let content = ProcessManager::read_virtual_console_from_path(&test_file, 5).expect("Leitura mock VCS");
+        assert_eq!(content, "Error: flycast could not find dc_boot.bin");
+
+        let _ = std::fs::remove_file(test_file);
     }
 }
 

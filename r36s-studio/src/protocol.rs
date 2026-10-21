@@ -87,7 +87,17 @@ pub struct TelemetrySnapshot {
 
 impl TelemetrySnapshot {
     pub fn from_metrics(metrics: SystemMetrics, current_timestamp: u64) -> Self {
-        let age_secs = current_timestamp.saturating_sub(metrics.timestamp);
+        let current_secs = if current_timestamp > 10_000_000_000 {
+            current_timestamp / 1000
+        } else {
+            current_timestamp
+        };
+        let metrics_secs = if metrics.timestamp > 10_000_000_000 {
+            metrics.timestamp / 1000
+        } else {
+            metrics.timestamp
+        };
+        let age_secs = current_secs.saturating_sub(metrics_secs);
         let cores_available = !metrics.cpu_core_usage.is_empty();
         let cma_available = metrics.cma_available;
         let thermal_available = metrics.thermal_throttling.is_some() || metrics.cpu_temp_c.is_some();
@@ -529,6 +539,51 @@ mod tests {
         assert!(!legacy_snapshot.cores_available);
         assert!(!legacy_snapshot.cma_available);
         assert!(!legacy_snapshot.thermal_available);
+    }
+
+    #[test]
+    fn test_telemetry_snapshot_timestamp_normalization() {
+        let make_metrics = |ts: u64| SystemMetrics {
+            timestamp: ts,
+            cpu_usage: 10.0,
+            cpu_freq_mhz: vec![1300],
+            cpu_temp_c: Some(42.0),
+            ram_used_mb: 256,
+            ram_total_mb: 1024,
+            mali_gpu_load: None,
+            mali_gpu_freq_mhz: None,
+            active_game: None,
+            running_processes: Vec::new(),
+            fb_width: 640,
+            fb_height: 480,
+            fb_bpp: 16,
+            fb_format: 1,
+            cpu_core_usage: vec![10.0, 10.0, 10.0, 10.0],
+            cma_total_mb: 64,
+            cma_free_mb: 32,
+            cma_available: true,
+            thermal_throttling: Some(false),
+        };
+
+        // 1. Ambos em segundos
+        let snap1 = TelemetrySnapshot::from_metrics(make_metrics(1_700_000_000), 1_700_000_005);
+        assert_eq!(snap1.age_secs, 5);
+
+        // 2. Ambos em milissegundos
+        let snap2 = TelemetrySnapshot::from_metrics(make_metrics(1_700_000_000_000), 1_700_000_005_000);
+        assert_eq!(snap2.age_secs, 5);
+
+        // 3. Current em milissegundos e metrics em segundos
+        let snap3 = TelemetrySnapshot::from_metrics(make_metrics(1_700_000_000), 1_700_000_005_000);
+        assert_eq!(snap3.age_secs, 5);
+
+        // 4. Current em segundos e metrics em milissegundos
+        let snap4 = TelemetrySnapshot::from_metrics(make_metrics(1_700_000_000_000), 1_700_000_005);
+        assert_eq!(snap4.age_secs, 5);
+
+        // 5. Saturation check (timestamp no futuro)
+        let snap5 = TelemetrySnapshot::from_metrics(make_metrics(1_700_000_010), 1_700_000_005);
+        assert_eq!(snap5.age_secs, 0);
     }
 
     #[test]

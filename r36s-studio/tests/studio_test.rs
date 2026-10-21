@@ -1642,6 +1642,31 @@ fn test_cli_and_mcp_mode_selection_and_usage_in_subprocess() {
     let stderr_logs_bad = String::from_utf8_lossy(&output_logs_bad.stderr);
     assert!(stderr_logs_bad.contains("Fonte de logs inválida: 'invalid_source'"));
 
+    // 7.1 ./app cli logs com flag inválida ou valor ausente falha
+    let output_logs_bad_opt = std::process::Command::new(bin_path)
+        .args(["cli", "logs", "dmesg", "--bad-flag"])
+        .output()
+        .expect("Executa ./app cli logs dmesg --bad-flag");
+    assert!(!output_logs_bad_opt.status.success());
+    let stderr_bad_opt = String::from_utf8_lossy(&output_logs_bad_opt.stderr);
+    assert!(stderr_bad_opt.contains("Opção desconhecida para comando logs: '--bad-flag'"));
+
+    let output_logs_bad_lines = std::process::Command::new(bin_path)
+        .args(["cli", "logs", "active_game", "--lines", "not_a_num"])
+        .output()
+        .expect("Executa ./app cli logs active_game --lines not_a_num");
+    assert!(!output_logs_bad_lines.status.success());
+    let stderr_bad_lines = String::from_utf8_lossy(&output_logs_bad_lines.stderr);
+    assert!(stderr_bad_lines.contains("Valor inválido para '--lines'"));
+
+    let output_logs_missing_out = std::process::Command::new(bin_path)
+        .args(["cli", "logs", "active_game", "--out"])
+        .output()
+        .expect("Executa ./app cli logs active_game --out");
+    assert!(!output_logs_missing_out.status.success());
+    let stderr_missing_out = String::from_utf8_lossy(&output_logs_missing_out.stderr);
+    assert!(stderr_missing_out.contains("Argumento '--out' requer o caminho do arquivo de destino"));
+
     // 8. ./app --mcp fecha limpo com EOF sem abrir janela
     let mut child = std::process::Command::new(bin_path)
         .arg("--mcp")

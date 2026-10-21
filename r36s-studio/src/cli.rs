@@ -33,7 +33,8 @@ fn print_usage_and_fail(error_msg: &str) -> Result<(), String> {
     eprintln!("  ./app cli deploy <origem_pc> <destino_r36s> [--executable]");
     eprintln!("  ./app cli run <comando_r36s>");
     eprintln!("  ./app cli stop");
-    eprintln!("  ./app cli logs [sandbox|dmesg|retroarch|es|agent]");
+    eprintln!("  ./app cli logs [fonte] [--lines <N>] [--grep <termo>] [--out <arquivo>]");
+    eprintln!("         Fontes: sandbox, active_game, run, emulationstation, retroarch, agent, dmesg, syslog, port, java, ppsspp, drastic, mupen64plus");
     Err("".to_string())
 }
 
@@ -282,46 +283,185 @@ fn cmd_stop(client: &BridgeClient) -> Result<(), String> {
     }
 }
 
-fn cmd_logs(client: &BridgeClient, args: &[String]) -> Result<(), String> {
-    let source = if args.is_empty() {
-        "sandbox"
-    } else {
-        args[0].as_str()
-    };
+pub const SUPPORTED_LOG_SOURCES: &[&str] = &[
+    "sandbox",
+    "active_game",
+    "active",
+    "game",
+    "run",
+    "runcommand",
+    "emulationstation",
+    "es",
+    "retroarch",
+    "agent",
+    "daemon",
+    "journalctl",
+    "dmesg",
+    "syslog",
+    "system",
+    "port",
+    "installer",
+    "java",
+    "freej2me",
+    "ppsspp",
+    "psp",
+    "drastic",
+    "nds",
+    "mupen64plus",
+    "n64",
+];
 
-    if source == "sandbox" {
+#[derive(Debug, Clone, PartialEq)]
+pub struct LogsCliArgs {
+    pub source: String,
+    pub lines: usize,
+    pub grep: Option<String>,
+    pub out_file: Option<String>,
+}
+
+pub fn parse_logs_args(args: &[String]) -> Result<LogsCliArgs, String> {
+    let mut source: Option<String> = None;
+    let mut lines: usize = 100;
+    let mut grep: Option<String> = None;
+    let mut out_file: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--lines" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Argumento '--lines' requer um valor numérico".to_string());
+                }
+                lines = args[i].parse::<usize>().map_err(|_| {
+                    format!("Valor inválido para '--lines': '{}'. Deve ser um número inteiro positivo.", args[i])
+                })?;
+            }
+            "--grep" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Argumento '--grep' requer um padrão textual".to_string());
+                }
+                grep = Some(args[i].clone());
+            }
+            "--out" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("Argumento '--out' requer o caminho do arquivo de destino".to_string());
+                }
+                out_file = Some(args[i].clone());
+            }
+            val if val.starts_with("--") => {
+                return Err(format!("Opção desconhecida para comando logs: '{}'", val));
+            }
+            pos => {
+                if source.is_none() {
+                    source = Some(pos.to_string());
+                } else {
+                    return Err(format!("Argumento posicional inesperado: '{}'", pos));
+                }
+            }
+        }
+        i += 1;
+    }
+
+    let source = source.unwrap_or_else(|| "sandbox".to_string());
+    if !SUPPORTED_LOG_SOURCES.contains(&source.as_str()) {
+        return Err(format!(
+            "Fonte de logs inválida: '{}'. Fontes suportadas: sandbox, active_game, run, emulationstation, retroarch, agent, dmesg, syslog, port, java, ppsspp, drastic, mupen64plus",
+            source
+        ));
+    }
+
+    Ok(LogsCliArgs {
+        source,
+        lines,
+        grep,
+        out_file,
+    })
+}
+
+fn cmd_logs(client: &BridgeClient, args: &[String]) -> Result<(), String> {
+    let parsed = parse_logs_args(args)?;
+
+    if parsed.source == "sandbox" {
         let diag = client.get_diagnostics().map_err(|e| e.to_string())?;
+        let mut stdout = diag.sandbox_stdout_tail.unwrap_or_default();
+        let mut stderr = diag.sandbox_stderr_tail.unwrap_or_default();
+        if let Some(ref pat) = parsed.grep {
+            let p = pat.to_lowercase();
+            stdout = stdout.lines().filter(|l| l.to_lowercase().contains(&p)).collect::<Vec<_>>().join("\n");
+            stderr = stderr.lines().filter(|l| l.to_lowercase().contains(&p)).collect::<Vec<_>>().join("\n");
+        }
+        if let Some(ref out_path) = parsed.out_file {
+            let combined = match (!stdout.is_empty(), !stderr.is_empty()) {
+                (true, true) => format!("=== STDOUT ===\n{}\n\n=== STDERR ===\n{}", stdout, stderr),
+                (true, false) => stdout.clone(),
+                (false, true) => stderr.clone(),
+                (false, false) => String::new(),
+            };
+            std::fs::write(out_path, &combined)
+                .map_err(|e| format!("Falha ao gravar arquivo de log em {:?}: {}", out_path, e))?;
+            let out = serde_json::json!({
+                "status": "success",
+                "source": "sandbox",
+                "stdout_tail": stdout,
+                "stderr_tail": stderr,
+                "out": out_path,
+                "bytes_written": combined.len()
+            });
+            println!("{}", serde_json::to_string_pretty(&out).unwrap());
+            return Ok(());
+        }
         let out = serde_json::json!({
             "status": "success",
             "source": "sandbox",
-            "stdout_tail": diag.sandbox_stdout_tail.unwrap_or_default(),
-            "stderr_tail": diag.sandbox_stderr_tail.unwrap_or_default()
+            "stdout_tail": stdout,
+            "stderr_tail": stderr
         });
         println!("{}", serde_json::to_string_pretty(&out).unwrap());
         Ok(())
-    } else if matches!(source, "dmesg" | "retroarch" | "es" | "agent") {
+    } else {
         let cmd = ClientCommand::FetchLogs {
-            log_type: source.to_string(),
-            lines: 100,
+            log_type: parsed.source.clone(),
+            lines: parsed.lines,
         };
         let res = client.send_command(cmd).map_err(|e| e.to_string())?;
         match res.response {
             Some(ServerResponse::LogsResponse { log_type, content }) => {
+                let filtered = if let Some(ref pat) = parsed.grep {
+                    let p = pat.to_lowercase();
+                    content
+                        .lines()
+                        .filter(|l| l.to_lowercase().contains(&p))
+                        .collect::<Vec<_>>()
+                        .join("\n")
+                } else {
+                    content
+                };
+                if let Some(ref out_path) = parsed.out_file {
+                    std::fs::write(out_path, &filtered)
+                        .map_err(|e| format!("Falha ao gravar arquivo de log em {:?}: {}", out_path, e))?;
+                    let out = serde_json::json!({
+                        "status": "success",
+                        "source": log_type,
+                        "content": filtered,
+                        "out": out_path,
+                        "bytes_written": filtered.len()
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out).unwrap());
+                    return Ok(());
+                }
                 let out = serde_json::json!({
                     "status": "success",
                     "source": log_type,
-                    "content": content
+                    "content": filtered
                 });
                 println!("{}", serde_json::to_string_pretty(&out).unwrap());
                 Ok(())
             }
             other => Err(format!("Resposta inesperada ao obter logs: {:?}", other)),
         }
-    } else {
-        Err(format!(
-            "Fonte de logs inválida: '{}'. Fontes suportadas: sandbox, dmesg, retroarch, es, agent",
-            source
-        ))
     }
 }
 
@@ -373,4 +513,79 @@ pub fn tokenize_command(s: &str) -> Result<Vec<String>, String> {
     }
 
     Ok(tokens)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_logs_args_defaults() {
+        let parsed = parse_logs_args(&[]).expect("Default logs args");
+        assert_eq!(
+            parsed,
+            LogsCliArgs {
+                source: "sandbox".to_string(),
+                lines: 100,
+                grep: None,
+                out_file: None,
+            }
+        );
+    }
+
+    #[test]
+    fn test_parse_logs_args_flags_and_sources() {
+        let args = vec![
+            "dmesg".to_string(),
+            "--lines".to_string(),
+            "200".to_string(),
+            "--grep".to_string(),
+            "dwc2".to_string(),
+            "--out".to_string(),
+            "/tmp/dmesg_usb.log".to_string(),
+        ];
+        let parsed = parse_logs_args(&args).expect("Parsed valid flags");
+        assert_eq!(
+            parsed,
+            LogsCliArgs {
+                source: "dmesg".to_string(),
+                lines: 200,
+                grep: Some("dwc2".to_string()),
+                out_file: Some("/tmp/dmesg_usb.log".to_string()),
+            }
+        );
+
+        // Testa fontes novas
+        for src in &[
+            "active_game",
+            "run",
+            "emulationstation",
+            "retroarch",
+            "agent",
+            "syslog",
+            "port",
+            "java",
+            "ppsspp",
+            "drastic",
+            "mupen64plus",
+        ] {
+            let p = parse_logs_args(&[src.to_string()]).expect("Fonte válida suportada");
+            assert_eq!(p.source, *src);
+        }
+    }
+
+    #[test]
+    fn test_parse_logs_args_rejections() {
+        // Fonte inválida
+        let err = parse_logs_args(&["unknown_source".to_string()]).unwrap_err();
+        assert!(err.contains("Fonte de logs inválida: 'unknown_source'"));
+
+        // Opção desconhecida
+        let err_opt = parse_logs_args(&["--unknown".to_string()]).unwrap_err();
+        assert!(err_opt.contains("Opção desconhecida para comando logs"));
+
+        // Valor não-numérico em --lines
+        let err_lines = parse_logs_args(&["--lines".to_string(), "abc".to_string()]).unwrap_err();
+        assert!(err_lines.contains("Valor inválido para '--lines'"));
+    }
 }

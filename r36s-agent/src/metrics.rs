@@ -746,6 +746,20 @@ impl MetricsCollector {
                     return Some(format!("RetroArch ({})", core_name));
                 }
                 return Some("RetroArch".to_string());
+            } else if lower.contains("yabasanshiro") {
+                return Some("Yaba Sanshiro (Saturn)".to_string());
+            } else if lower.contains("flycast") {
+                return Some("Flycast (Dreamcast)".to_string());
+            } else if lower.contains("retrorun") {
+                return Some("RetroRun".to_string());
+            } else if lower.contains("hypseus") {
+                return Some("Hypseus (Daphne)".to_string());
+            } else if lower.contains("scummvm") {
+                return Some("ScummVM".to_string());
+            } else if lower.contains("openbor") {
+                return Some("OpenBOR".to_string());
+            } else if lower.contains("solarusemulator") {
+                return Some("Solarus".to_string());
             } else if lower.contains("java") && lower.contains("freej2me") {
                 return Some("FreeJ2ME (Java)".to_string());
             } else if lower.contains("drastic") {
