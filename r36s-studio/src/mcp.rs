@@ -114,7 +114,7 @@ pub fn handle_mcp_message(line: &str, client: &BridgeClient) -> Option<JsonRpcRe
                 },
                 "serverInfo": {
                     "name": "r36s-studio-mcp",
-                    "version": "0.2.9"
+                    "version": "0.3.0"
                 }
             });
             Some(JsonRpcResponse {
