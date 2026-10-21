@@ -16,6 +16,7 @@ pub struct MetricsCollector {
     fb_info: Mutex<(u16, u16, u8, u8)>,        // (width, height, bpp, format)
     page_size_kb: u64,
     clk_tck: f32,
+    num_cpus: f32,
 }
 
 impl MetricsCollector {
@@ -36,6 +37,14 @@ impl MetricsCollector {
                 val as f32
             } else {
                 100.0
+            }
+        };
+        let num_cpus = unsafe {
+            let n = libc::sysconf(libc::_SC_NPROCESSORS_ONLN);
+            if n > 0 {
+                n as f32
+            } else {
+                4.0
             }
         };
 
@@ -74,6 +83,7 @@ impl MetricsCollector {
             fb_info: Mutex::new((640, 480, 16, 1)),
             page_size_kb,
             clk_tck,
+            num_cpus,
         }
     }
 
@@ -672,12 +682,12 @@ impl MetricsCollector {
                                     {
                                         let tick_diff = total_ticks.saturating_sub(prev_ticks);
                                         let time_diff = now.duration_since(prev_time).as_secs_f32();
-                                        if time_diff > 0.05 {
-                                            let clk_tck = self.clk_tck;
-                                            cpu_percent =
-                                                ((tick_diff as f32 / clk_tck) / time_diff) * 100.0;
-                                            cpu_percent = cpu_percent.clamp(0.0, 400.0);
-                                        }
+                                        cpu_percent = Self::calculate_process_cpu_percent(
+                                            tick_diff,
+                                            time_diff,
+                                            self.clk_tck,
+                                            self.num_cpus,
+                                        );
                                     }
                                 }
                             }
@@ -749,6 +759,22 @@ impl MetricsCollector {
             }
         }
         None
+    }
+
+    /// Calcula a porcentagem de CPU utilizada por um processo normalizada pela quantidade de núcleos (0%..100%).
+    /// Na escala de sistema total (Solaris mode), se 1 núcleo estiver 100% ocupado em um SoC quad-core (como RK3326),
+    /// a função retornará 25.0%, harmonizando com o medidor de CPU global.
+    pub fn calculate_process_cpu_percent(
+        tick_diff: u64,
+        time_diff: f32,
+        clk_tck: f32,
+        num_cpus: f32,
+    ) -> f32 {
+        if time_diff <= 0.05 || clk_tck <= 0.0 || num_cpus <= 0.0 {
+            return 0.0;
+        }
+        let raw_cpu = ((tick_diff as f32 / clk_tck) / time_diff) * 100.0;
+        (raw_cpu / num_cpus).clamp(0.0, 100.0)
     }
 }
 
@@ -825,6 +851,32 @@ mod tests {
         // None
         let procs = vec![make_proc("bash", "/bin/bash")];
         assert_eq!(MetricsCollector::detect_active_game(&procs), None);
+    }
+
+    #[test]
+    fn test_process_cpu_percent_normalized_to_core_count() {
+        let clk_tck = 100.0;
+        let time_diff = 1.0; // 1 second
+        let num_cpus = 4.0;  // 4 cores on RK3326
+
+        // 100 ticks in 1s on clk_tck=100 means 100% of 1 core
+        // Normalized by 4 cores, this should equal 25.0%
+        let cpu_one_core = MetricsCollector::calculate_process_cpu_percent(100, time_diff, clk_tck, num_cpus);
+        assert!((cpu_one_core - 25.0).abs() < 0.01, "Expected ~25.0%, got {}", cpu_one_core);
+
+        // 400 ticks in 1s means all 4 cores saturated (400% in Irix mode)
+        // Normalized by 4 cores, this should equal 100.0%
+        let cpu_all_cores = MetricsCollector::calculate_process_cpu_percent(400, time_diff, clk_tck, num_cpus);
+        assert!((cpu_all_cores - 100.0).abs() < 0.01, "Expected 100.0%, got {}", cpu_all_cores);
+
+        // Clamping to 100.0% max
+        let cpu_clamped = MetricsCollector::calculate_process_cpu_percent(800, time_diff, clk_tck, num_cpus);
+        assert_eq!(cpu_clamped, 100.0);
+
+        // Handling edge cases (zero time, zero clk_tck, zero cpus)
+        assert_eq!(MetricsCollector::calculate_process_cpu_percent(100, 0.01, clk_tck, num_cpus), 0.0);
+        assert_eq!(MetricsCollector::calculate_process_cpu_percent(100, time_diff, 0.0, num_cpus), 0.0);
+        assert_eq!(MetricsCollector::calculate_process_cpu_percent(100, time_diff, clk_tck, 0.0), 0.0);
     }
 
     #[test]

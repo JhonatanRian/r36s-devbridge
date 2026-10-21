@@ -517,6 +517,7 @@ impl AgentServer {
                         let mut work_ewma_ms = 0.0f64;
                         let mut last_adaptation = Instant::now();
                         let mut frame_index: u32 = 0;
+                        let mut unchanged_streak: u32 = 0;
                         let send_buffer: libc::c_int = 64 * 1024;
                         unsafe {
                             libc::setsockopt(
@@ -567,14 +568,13 @@ impl AgentServer {
                                     _ => {}
                                 }
 
+                                unchanged_streak = 0;
                                 thread::sleep(Duration::from_millis(60));
                                 next_deadline = Instant::now();
                                 continue;
                             }
 
                             let requested_fps = target_fps_cl.load(Ordering::Relaxed).clamp(5, 60);
-                            let fps = requested_fps.min(adaptive_fps);
-                            let frame_duration = Duration::from_micros(1_000_000 / fps as u64);
 
                             // Controle anti-buffer-bloat TCP: se a fila de saída do socket tiver mais de 64KB pendentes,
                             // o receptor ou a rede ainda estão drenando o frame anterior. Pulamos o envio deste ciclo para
@@ -620,6 +620,14 @@ impl AgentServer {
                                     diag_unchanged += 1;
                                 }
                             }
+
+                            if flags == FRAME_FLAG_UNCHANGED {
+                                unchanged_streak = unchanged_streak.saturating_add(1);
+                            } else {
+                                unchanged_streak = 0;
+                            }
+                            let fps = calculate_pacing_fps(requested_fps, adaptive_fps, unchanged_streak);
+                            let frame_duration = Duration::from_micros(1_000_000 / fps as u64);
 
                             frame_index = frame_index.wrapping_add(1);
 
@@ -780,6 +788,18 @@ fn base64_decode(input: &str) -> Result<Vec<u8>, &'static str> {
     Ok(out)
 }
 
+/// Calcula a taxa de quadros efetiva considerando cadência adaptativa e tela estática (Idle Frame Pacing).
+/// Se 5 ou mais quadros consecutivos forem inalterados, reduz para 15 FPS para economizar CPU e barramento DDR.
+/// Na primeira alteração de imagem (streak = 0), restaura instantaneamente a taxa solicitada.
+pub fn calculate_pacing_fps(requested_fps: u32, adaptive_fps: u32, unchanged_streak: u32) -> u32 {
+    let effective_target = if unchanged_streak >= 5 {
+        15.min(requested_fps)
+    } else {
+        requested_fps
+    };
+    effective_target.min(adaptive_fps).clamp(5, 60)
+}
+
 /// Bound the entire frame, including partial writes. A failed frame requires a fresh TCP session.
 pub fn write_before(
     stream: &mut TcpStream,
@@ -822,6 +842,31 @@ pub fn write_before(
 #[cfg(test)]
 mod transport_tests {
     use super::*;
+
+    #[test]
+    fn test_calculate_pacing_fps_idle_and_active_recovery() {
+        // Quando streak < 5, mantém requested_fps respeitando adaptive_fps
+        assert_eq!(calculate_pacing_fps(60, 60, 0), 60);
+        assert_eq!(calculate_pacing_fps(60, 60, 1), 60);
+        assert_eq!(calculate_pacing_fps(60, 60, 4), 60);
+
+        // Quando streak >= 5, ativa idle pacing em 15 FPS
+        assert_eq!(calculate_pacing_fps(60, 60, 5), 15);
+        assert_eq!(calculate_pacing_fps(60, 60, 6), 15);
+        assert_eq!(calculate_pacing_fps(60, 60, 100), 15);
+
+        // Ao detectar qualquer movimento (streak = 0), volta instantaneamente para 60 FPS
+        assert_eq!(calculate_pacing_fps(60, 60, 0), 60);
+
+        // Se o cliente solicitou FPS baixo (< 15), o idle pacing não aumenta a taxa
+        assert_eq!(calculate_pacing_fps(10, 60, 0), 10);
+        assert_eq!(calculate_pacing_fps(10, 60, 5), 10);
+
+        // Respeita adaptive_fps caso a rede/capacidade imponha limite menor
+        assert_eq!(calculate_pacing_fps(60, 12, 0), 12);
+        assert_eq!(calculate_pacing_fps(60, 12, 5), 12);
+    }
+
     #[test]
     fn stalled_receiver_cannot_extend_frame_deadline() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();

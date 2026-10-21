@@ -739,8 +739,8 @@ impl FramebufferReader {
     }
 }
 
-// Converte BGRA8888 para RGB565 em tempo de cópia descartando canal Alpha
-pub fn downpack_bgra8888_to_rgb565(
+// Converte BGRA8888 para RGB565 em tempo de cópia descartando canal Alpha (implementação escalar de referência)
+pub fn downpack_bgra8888_to_rgb565_scalar(
     src: &[u8],
     pitch: usize,
     width: usize,
@@ -766,6 +766,68 @@ pub fn downpack_bgra8888_to_rgb565(
                 dst_row[x * 2 + 1] = (p >> 8) as u8;
             }
         }
+    }
+}
+
+// Converte BGRA8888 para RGB565 em tempo de cópia descartando canal Alpha
+// Vetorizado com ARM NEON (vld4_u8) em blocos de 8 pixels (32 bytes em burst) no AArch64
+pub fn downpack_bgra8888_to_rgb565(
+    src: &[u8],
+    pitch: usize,
+    width: usize,
+    height: usize,
+    dst: &mut [u8],
+) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let row_bytes = width * 4;
+        let out_row_bytes = width * 2;
+        let r_mask = unsafe { vdupq_n_u16(0x00F8) };
+        let g_mask = unsafe { vdupq_n_u16(0x00FC) };
+
+        for y in 0..height {
+            let src_row_off = y * pitch;
+            let dst_row_off = y * out_row_bytes;
+            if src_row_off + row_bytes <= src.len() && dst_row_off + out_row_bytes <= dst.len() {
+                let src_row = &src[src_row_off..src_row_off + row_bytes];
+                let dst_row = &mut dst[dst_row_off..dst_row_off + out_row_bytes];
+                let mut x = 0;
+                while x + 8 <= width {
+                    unsafe {
+                        let chunk = vld4_u8(src_row.as_ptr().add(x * 4));
+                        // chunk.0 = B, chunk.1 = G, chunk.2 = R, chunk.3 = A
+                        let b16 = vmovl_u8(chunk.0);
+                        let g16 = vmovl_u8(chunk.1);
+                        let r16 = vmovl_u8(chunk.2);
+
+                        let r_part = vshlq_n_u16(vandq_u16(r16, r_mask), 8);
+                        let g_part = vshlq_n_u16(vandq_u16(g16, g_mask), 3);
+                        let b_part = vshrq_n_u16(b16, 3);
+
+                        let rgb565 = vorrq_u16(vorrq_u16(r_part, g_part), b_part);
+                        vst1q_u8(dst_row.as_mut_ptr().add(x * 2), vreinterpretq_u8_u16(rgb565));
+                    }
+                    x += 8;
+                }
+                for rem_x in x..width {
+                    let b = src_row[rem_x * 4];
+                    let g = src_row[rem_x * 4 + 1];
+                    let r = src_row[rem_x * 4 + 2];
+                    let p = (((r as u16) & 0xF8) << 8)
+                        | (((g as u16) & 0xFC) << 3)
+                        | (((b as u16) & 0xF8) >> 3);
+                    dst_row[rem_x * 2] = p as u8;
+                    dst_row[rem_x * 2 + 1] = (p >> 8) as u8;
+                }
+            }
+        }
+        return;
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        downpack_bgra8888_to_rgb565_scalar(src, pitch, width, height, dst);
     }
 }
 
@@ -861,6 +923,41 @@ mod regression_tests {
         // Pixel 3 (White)
         assert_eq!(rgb565[6], 0xFF);
         assert_eq!(rgb565[7], 0xFF);
+    }
+
+    #[test]
+    fn test_downpack_bgra8888_to_rgb565_parity_and_boundaries() {
+        // Testa larguras variadas: menores que 8, múltiplos exatos de 8, e com sobras
+        let test_widths = [1, 2, 7, 8, 9, 15, 16, 23, 32, 640];
+        let height = 3;
+
+        for &width in &test_widths {
+            let pitch = width * 4 + 16; // Pitch com padding para testar strides reais
+            let mut bgra = vec![0u8; pitch * height];
+
+            for y in 0..height {
+                for x in 0..width {
+                    let offset = y * pitch + x * 4;
+                    // Variação determinística cobrindo todos os canais e testando descarte de Alpha
+                    bgra[offset] = ((x * 37 + y * 13) % 256) as u8;     // B
+                    bgra[offset + 1] = ((x * 59 + y * 29) % 256) as u8; // G
+                    bgra[offset + 2] = ((x * 83 + y * 47) % 256) as u8; // R
+                    bgra[offset + 3] = ((x * 101 + y) % 256) as u8;     // A (deve ser ignorado)
+                }
+            }
+
+            let mut out_prod = vec![0u8; width * height * 2];
+            let mut out_scalar = vec![0u8; width * height * 2];
+
+            downpack_bgra8888_to_rgb565(&bgra, pitch, width, height, &mut out_prod);
+            downpack_bgra8888_to_rgb565_scalar(&bgra, pitch, width, height, &mut out_scalar);
+
+            assert_eq!(
+                out_prod, out_scalar,
+                "Paridade falhou para width={} height={}",
+                width, height
+            );
+        }
     }
 
     #[test]
